@@ -1,0 +1,61 @@
+{
+  "ui": {
+    "theme": "dark",
+    "language": "fa",
+    "font_scale": 1.0,
+    "window_geometry": {
+      "x": 0,
+      "y": 69,
+      "width": 1280,
+      "height": 731
+    },
+    "splitter_sizes": [
+      300,
+      1000
+    ],
+    "toolbar_visible": true,
+    "statusbar_visible": true,
+    "auto_save": true,
+    "auto_save_interval": 300
+  },
+  "architecture": {
+    "default_mass_unit": "kg",
+    "default_power_unit": "W",
+    "default_voltage_unit": "V",
+    "default_current_unit": "A",
+    "show_totals": true,
+    "auto_expand_tree": false,
+    "highlight_modified": true,
+    "backup_on_save": true
+  },
+  "schematic": {
+    "grid_size": 20,
+    "snap_to_grid": true,
+    "show_grid": true,
+    "auto_layout": false,
+    "connection_style": "curved",
+    "node_size": "medium",
+    "show_labels": true,
+    "show_statistics": true
+  },
+  "export": {
+    "csv_delimiter": ",",
+    "csv_encoding": "utf-8",
+    "excel_format": "xlsx",
+    "include_hierarchy": true,
+    "export_path": "exports",
+    "filename_timestamp": true
+  },
+  "database": {
+    "auto_backup": true,
+    "backup_interval": 24,
+    "max_backups": 10,
+    "vacuum_on_startup": false
+  },
+  "performance": {
+    "max_undo_steps": 50,
+    "cache_size": 100,
+    "lazy_loading": true,
+    "animation_duration": 200
+  }
+}
