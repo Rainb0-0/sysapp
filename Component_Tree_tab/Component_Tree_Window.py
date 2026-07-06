@@ -4,7 +4,7 @@ import json
 import tempfile
 import shutil
 import base64
-from PIL import Image
+from PIL import Image, ImageQt
 from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -23,12 +23,14 @@ from PyQt5.QtWebChannel import QWebChannel
 from PyQt5.QtCore import (
     QObject,
     pyqtSignal,
+    QSize,
     QSizeF,
     pyqtSlot,
     QUrl,
     QTimer,
     QMarginsF,
     QByteArray,
+    QBuffer,
 )
 from PyQt5.QtGui import (
     QPixmap,
@@ -464,12 +466,16 @@ class ComponentTreeTab(QWidget):
             }}
             
             #tree-container {{
+                position: absolute;
+                inset: 0;
                 width: 100%;
-                height: calc(100vh - 16px);
+                height: 100%;
                 background: {primary_dark};
                 border-radius: 12px;
                 border: 1px solid {primary_light};
-                overflow: hidden;  // NEW: Hide scrollbars for container
+                overflow: hidden;
+                margin: 0;
+                padding: 0;
             }}
             
             svg {{
@@ -543,6 +549,10 @@ class ComponentTreeTab(QWidget):
                 padding: 5px 10px;
                 border-radius: 5px;
                 border: 1px solid {primary_light};
+            }}
+
+            @media print {{
+                .zoom-info {{ display: none !important; }}
             }}
         </style>
     </head>
@@ -1019,6 +1029,23 @@ class ComponentTreeTab(QWidget):
                 }}
             }}
             
+            function setExportOverlayVisible(visible) {{
+                const overlay = document.getElementById('zoom-info');
+                if (overlay) overlay.style.display = visible ? 'block' : 'none';
+            }}
+
+            function getExportBounds() {{
+                if (!g || !g.node()) {{
+                    return JSON.stringify({{ widthPx: 1200, heightPx: 800 }});
+                }}
+
+                const bbox = g.node().getBBox();
+                const padding = 40;
+                const widthPx = Math.max(320, Math.ceil(bbox.width + padding));
+                const heightPx = Math.max(240, Math.ceil(bbox.height + padding));
+                return JSON.stringify({{ widthPx, heightPx }});
+            }}
+
             function fitView() {{
                 if (!g.node()) return;
                 try {{
@@ -1036,9 +1063,9 @@ class ComponentTreeTab(QWidget):
                         return;
                     }}
 
-                    // پدینگ مناسب (نسبتی از اندازهٔ نما)
-                    const padX = Math.max(32, width  * 0.06);
-                    const padY = Math.max(24, height * 0.06);
+                    // Minimal padding so the graph uses the available area tightly.
+                    const padX = Math.max(8, width  * 0.01);
+                    const padY = Math.max(8, height * 0.01);
 
                     const scaleX = (width  - 2 * padX) / bbox.width;
                     const scaleY = (height - 2 * padY) / bbox.height;
@@ -1095,6 +1122,8 @@ class ComponentTreeTab(QWidget):
             window.toggleExpandCollapse = toggleExpandCollapse;
             window.fitView = fitView;
             window.refreshTree = refreshTree;
+            window.setExportOverlayVisible = setExportOverlayVisible;
+            window.getExportBounds = getExportBounds;
             
             let nodeWidth = 200;  // Increased to 200 for longer labels
             let nodeHeight = 40;
@@ -1266,8 +1295,19 @@ class ComponentTreeTab(QWidget):
         else:
             super().keyPressEvent(event)
 
+    def _get_png_export_size(self, bounds):
+        """Return a larger export size so text stays readable in the PNG."""
+        width_px = max(320, int(bounds.get("widthPx", 1200)))
+        height_px = max(240, int(bounds.get("heightPx", 800)))
+
+        scale_factor = 2.4
+        padding = 120
+        target_width = max(1600, int(round(width_px * scale_factor + padding)))
+        target_height = max(1100, int(round(height_px * scale_factor + padding)))
+        return target_width, target_height
+
     def export_to_png(self):
-        """Export current view to high-quality PNG (no fit, exact current view)"""
+        """Export a cropped, high-quality PNG of the currently fitted tree view."""
         try:
             file_path, _ = QFileDialog.getSaveFileName(
                 self,
@@ -1281,28 +1321,90 @@ class ComponentTreeTab(QWidget):
             progress = QProgressDialog("Creating PNG...", "Cancel", 0, 100, self)
             progress.setWindowModality(Qt.WindowModal)
             progress.show()
-            progress.setValue(30)
+            progress.setValue(20)
 
-            # Capture EXACT current view at 4x resolution
-            pixmap = self.web_view.grab()
+            self._pending_png_path = file_path
+            self._pending_png_progress = progress
+            self._pending_png_original_size = self.web_view.size()
 
-            progress.setValue(60)
-
-            # Scale up for high quality (4x)
-            high_res_pixmap = pixmap.scaled(
-                pixmap.width() * 4,
-                pixmap.height() * 4,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
+            self.web_view.page().runJavaScript(
+                """
+                if (typeof fitView === 'function') fitView();
+                if (typeof setExportOverlayVisible === 'function') setExportOverlayVisible(false);
+                if (typeof getExportBounds === 'function') return getExportBounds();
+                return JSON.stringify({widthPx: 1200, heightPx: 800});
+                """,
+                self._on_png_export_bounds_ready,
             )
+            progress.setValue(50)
+
+        except Exception as e:
+            if "progress" in locals():
+                progress.close()
+            QMessageBox.critical(
+                self, "PNG Export Error", f"Failed to export: {str(e)}"
+            )
+
+    def _on_png_export_bounds_ready(self, result):
+        """Resize the web view to the fitted tree viewport and capture a cropped PNG."""
+        progress = getattr(self, "_pending_png_progress", None)
+        file_path = getattr(self, "_pending_png_path", None)
+        original_size = getattr(self, "_pending_png_original_size", None)
+
+        try:
+            if isinstance(result, str):
+                bounds = json.loads(result)
+            else:
+                bounds = json.loads(result or "{}")
+
+            width_px, height_px = self._get_png_export_size(bounds)
+
+            self.web_view.resize(width_px, height_px)
+            self.web_view.page().runJavaScript(
+                "if (typeof fitView === 'function') fitView();"
+            )
+            QTimer.singleShot(
+                1000,
+                lambda: self._capture_png_from_view(file_path, progress, original_size),
+            )
+        except Exception as e:
+            if progress is not None:
+                progress.close()
+            QMessageBox.critical(
+                self, "PNG Export Error", f"Failed to prepare PNG export: {str(e)}"
+            )
+            self._pending_png_path = None
+            self._pending_png_progress = None
+            self._pending_png_original_size = None
+
+    def _capture_png_from_view(self, file_path, progress, original_size):
+        """Capture the current web view as a cropped PNG and restore the original size."""
+        try:
+            pixmap = self.web_view.grab()
+            self.web_view.resize(original_size)
+            self.web_view.page().runJavaScript(
+                "if (typeof setExportOverlayVisible === 'function') setExportOverlayVisible(true);"
+            )
+
+            if pixmap.isNull():
+                raise RuntimeError("Capture produced an empty pixmap")
 
             progress.setValue(80)
 
-            # Save with maximum quality
-            if not high_res_pixmap.save(file_path, "PNG", 100):
+            try:
+                byte_array = QByteArray()
+                buffer = QBuffer(byte_array)
+                buffer.open(QBuffer.WriteOnly)
+                pixmap.save(buffer, "PNG")
+                buffer.close()
+                with open(file_path, "wb") as f:
+                    f.write(byte_array.data())
+            except Exception as save_error:
                 progress.close()
                 QMessageBox.critical(
-                    self, "PNG Export Error", "Failed to save PNG file."
+                    self,
+                    "PNG Export Error",
+                    f"Failed to save PNG file: {str(save_error)}",
                 )
                 return
 
@@ -1316,17 +1418,20 @@ class ComponentTreeTab(QWidget):
                 "PNG Export Successful",
                 f"PNG saved successfully!\n\n"
                 f"File: {os.path.basename(file_path)}\n"
-                f"Resolution: {high_res_pixmap.width()} x {high_res_pixmap.height()} pixels\n"
+                f"Resolution: {pixmap.width()} x {pixmap.height()} pixels\n"
                 f"Size: {file_size:.2f} MB\n\n"
-                f"High quality 4x scaled image.",
+                f"Cropped to the fitted tree view for compact output.",
             )
-
         except Exception as e:
-            if "progress" in locals():
+            if progress is not None:
                 progress.close()
             QMessageBox.critical(
-                self, "PNG Export Error", f"Failed to export: {str(e)}"
+                self, "PNG Capture Error", f"Failed to capture PNG: {str(e)}"
             )
+        finally:
+            self._pending_png_path = None
+            self._pending_png_progress = None
+            self._pending_png_original_size = None
 
     def export_to_pdf(self):
         """Export the current web view as a vector PDF using WebEngine's native print pipeline."""
@@ -1345,17 +1450,19 @@ class ComponentTreeTab(QWidget):
             progress.show()
             progress.setValue(20)
 
-            page_layout = QPageLayout(
-                QPageSize(QPageSize.A4),
-                QPageLayout.Portrait,
-                QMarginsF(12, 12, 12, 12),
-            )
-
             self._pending_pdf_path = file_path
             self._pending_pdf_progress = progress
-            self.web_view.page().printToPdf(
-                self._handle_pdf_export_finished,
-                page_layout,
+            self._pending_pdf_original_size = self.web_view.size()
+            self.web_view.page().runJavaScript("""
+                if (typeof setExportOverlayVisible === 'function') setExportOverlayVisible(false);
+                if (typeof fitView === 'function') fitView();
+                """)
+            QTimer.singleShot(
+                800,
+                lambda: self.web_view.page().runJavaScript(
+                    "if (typeof getExportBounds === 'function') { return getExportBounds(); } return JSON.stringify({widthPx: 1200, heightPx: 800});",
+                    self._on_pdf_export_bounds_ready,
+                ),
             )
             progress.setValue(60)
 
@@ -1367,6 +1474,50 @@ class ComponentTreeTab(QWidget):
                 "PDF Export Error",
                 f"Failed to export: {str(e)}\n\nDetails: {type(e).__name__}",
             )
+
+    def _on_pdf_export_bounds_ready(self, result):
+        """Create a custom page layout sized to the fitted tree bounds."""
+        progress = getattr(self, "_pending_pdf_progress", None)
+        file_path = getattr(self, "_pending_pdf_path", None)
+
+        try:
+            if isinstance(result, str):
+                bounds = json.loads(result)
+            else:
+                bounds = json.loads(result or "{}")
+
+            width_px = max(320, int(bounds.get("widthPx", 1200)))
+            height_px = max(240, int(bounds.get("heightPx", 800)))
+            width_mm = max(120, int(width_px * 25.4 / 96))
+            height_mm = max(120, int(height_px * 25.4 / 96))
+
+            page_layout = QPageLayout(
+                QPageSize(QSizeF(width_mm, height_mm), QPageSize.Unit.Millimeter),
+                QPageLayout.Portrait,
+                QMarginsF(0, 0, 0, 0),
+            )
+
+            self.web_view.resize(width_px, height_px)
+            self.web_view.page().runJavaScript(
+                "if (typeof fitView === 'function') fitView();"
+            )
+            QTimer.singleShot(
+                400,
+                lambda: self.web_view.page().printToPdf(
+                    self._handle_pdf_export_finished,
+                    page_layout,
+                ),
+            )
+        except Exception as e:
+            if progress is not None:
+                progress.close()
+            QMessageBox.critical(
+                self,
+                "PDF Export Error",
+                f"Failed to size PDF page: {str(e)}\n\nDetails: {type(e).__name__}",
+            )
+            self._pending_pdf_path = None
+            self._pending_pdf_progress = None
 
     def _handle_pdf_export_finished(self, data):
         """Write the vector PDF bytes returned by WebEngine to disk."""
@@ -1384,6 +1535,13 @@ class ComponentTreeTab(QWidget):
 
             with open(file_path, "wb") as f:
                 f.write(pdf_bytes)
+
+            self.web_view.resize(
+                getattr(self, "_pending_pdf_original_size", self.web_view.size())
+            )
+            self.web_view.page().runJavaScript(
+                "if (typeof setExportOverlayVisible === 'function') setExportOverlayVisible(true);"
+            )
 
             if progress is not None:
                 progress.setValue(100)
