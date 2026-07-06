@@ -20,7 +20,16 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtWebChannel import QWebChannel
-from PyQt5.QtCore import QObject, pyqtSignal, QSizeF, pyqtSlot, QUrl, QTimer, QMarginsF
+from PyQt5.QtCore import (
+    QObject,
+    pyqtSignal,
+    QSizeF,
+    pyqtSlot,
+    QUrl,
+    QTimer,
+    QMarginsF,
+    QByteArray,
+)
 from PyQt5.QtGui import (
     QPixmap,
     QPainter,
@@ -1320,7 +1329,7 @@ class ComponentTreeTab(QWidget):
             )
 
     def export_to_pdf(self):
-        """Export current view to PDF"""
+        """Export the current web view as a vector PDF using WebEngine's native print pipeline."""
         try:
             file_path, _ = QFileDialog.getSaveFileName(
                 self,
@@ -1336,68 +1345,19 @@ class ComponentTreeTab(QWidget):
             progress.show()
             progress.setValue(20)
 
-            # Capture current view
-            pixmap = self.web_view.grab()
+            page_layout = QPageLayout(
+                QPageSize(QPageSize.A4),
+                QPageLayout.Portrait,
+                QMarginsF(12, 12, 12, 12),
+            )
 
-            progress.setValue(40)
-
-            # Create printer - FIXED constructor
-            printer = QPrinter(QPrinter.HighResolution)
-            printer.setOutputFormat(QPrinter.PdfFormat)
-            printer.setOutputFileName(file_path)
-
-            # Set page orientation based on aspect ratio
-            img_width = pixmap.width()
-            img_height = pixmap.height()
-
-            if img_width > img_height:
-                printer.setPageOrientation(QPageLayout.Landscape)
-            else:
-                printer.setPageOrientation(QPageLayout.Portrait)
-
-            printer.setPageSize(QPageSize(QPageSize.A4))
-
+            self._pending_pdf_path = file_path
+            self._pending_pdf_progress = progress
+            self.web_view.page().printToPdf(
+                self._handle_pdf_export_finished,
+                page_layout,
+            )
             progress.setValue(60)
-
-            # Create painter
-            painter = QPainter()
-            if not painter.begin(printer):
-                progress.close()
-                QMessageBox.critical(self, "PDF Error", "Failed to create PDF.")
-                return
-
-            # Get page size in pixels
-            page_rect = printer.pageRect(QPrinter.DevicePixel)
-
-            # Scale image to fit page
-            scaled_pixmap = pixmap.scaled(
-                int(page_rect.width() * 0.95),
-                int(page_rect.height() * 0.95),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-
-            progress.setValue(80)
-
-            # Center image on page
-            x = (page_rect.width() - scaled_pixmap.width()) / 2
-            y = (page_rect.height() - scaled_pixmap.height()) / 2
-
-            painter.drawPixmap(int(x), int(y), scaled_pixmap)
-            painter.end()
-
-            progress.setValue(100)
-            progress.close()
-
-            file_size = os.path.getsize(file_path) / (1024 * 1024)
-
-            QMessageBox.information(
-                self,
-                "PDF Export Successful",
-                f"PDF created successfully!\n\n"
-                f"File: {os.path.basename(file_path)}\n"
-                f"Size: {file_size:.2f} MB",
-            )
 
         except Exception as e:
             if "progress" in locals():
@@ -1407,6 +1367,47 @@ class ComponentTreeTab(QWidget):
                 "PDF Export Error",
                 f"Failed to export: {str(e)}\n\nDetails: {type(e).__name__}",
             )
+
+    def _handle_pdf_export_finished(self, data):
+        """Write the vector PDF bytes returned by WebEngine to disk."""
+        progress = getattr(self, "_pending_pdf_progress", None)
+        file_path = getattr(self, "_pending_pdf_path", None)
+
+        try:
+            if isinstance(data, QByteArray):
+                pdf_bytes = bytes(data)
+            else:
+                pdf_bytes = bytes(data) if data is not None else b""
+
+            if not file_path:
+                raise RuntimeError("No output path available for PDF export")
+
+            with open(file_path, "wb") as f:
+                f.write(pdf_bytes)
+
+            if progress is not None:
+                progress.setValue(100)
+                progress.close()
+
+            file_size = os.path.getsize(file_path) / (1024 * 1024)
+            QMessageBox.information(
+                self,
+                "PDF Export Successful",
+                f"Vector PDF created successfully!\n\n"
+                f"File: {os.path.basename(file_path)}\n"
+                f"Size: {file_size:.2f} MB",
+            )
+        except Exception as e:
+            if progress is not None:
+                progress.close()
+            QMessageBox.critical(
+                self,
+                "PDF Export Error",
+                f"Failed to write PDF: {str(e)}\n\nDetails: {type(e).__name__}",
+            )
+        finally:
+            self._pending_pdf_path = None
+            self._pending_pdf_progress = None
 
     def _capture_png(self, file_path, progress):
         """Capture PNG from web view"""
