@@ -756,6 +756,25 @@ class ComponentTreeTab(QWidget):
                     }});
                 }}
             }}
+            
+            function setExportMode(enabled) {{
+                const container = document.getElementById("tree-container");
+
+                if (enabled) {{
+                    container.dataset.oldBorder = container.style.border;
+                    container.style.border = "none";
+                    document.body.style.overflow = "hidden";
+                    document.documentElement.style.overflow = "hidden";
+                    document.body.style.margin = "0";
+                    document.body.style.height = "auto";
+                }} else {{
+                    container.style.border = "";
+                    document.body.style.overflow = "";
+                    document.documentElement.style.overflow = "";
+                    document.body.style.margin = "";
+                    document.body.style.height = "";
+                }}
+            }}
 
             function update(source) {{
                 console.log('Running update function');
@@ -1076,7 +1095,7 @@ class ComponentTreeTab(QWidget):
                     scale = Math.max(minK, Math.min(maxK, scale));
 
                     // مرکز کردن محتوا
-                    const tx = (width  / 2) - scale * (bbox.x + bbox.width  / 2);
+                    const tx = (width  / 2) - scale * (bbox.x + bbox.width  / 2) - 150;
                     const ty = (height / 2) - scale * (bbox.y + bbox.height / 2);
 
                     svg.transition()
@@ -1124,6 +1143,7 @@ class ComponentTreeTab(QWidget):
             window.refreshTree = refreshTree;
             window.setExportOverlayVisible = setExportOverlayVisible;
             window.getExportBounds = getExportBounds;
+            window.setExportMode = setExportMode;
             
             let nodeWidth = 200;  // Increased to 200 for longer labels
             let nodeHeight = 40;
@@ -1177,6 +1197,7 @@ class ComponentTreeTab(QWidget):
         self.fit_btn.clicked.connect(lambda: QTimer.singleShot(100, self.fit_view))
 
         # Export buttons
+        # self.export_pdf_btn.clicked.connect(self.export_to_pdf)
         self.export_pdf_btn.clicked.connect(self.export_to_pdf)
         self.export_png_btn.clicked.connect(self.export_to_png)
 
@@ -1187,7 +1208,7 @@ class ComponentTreeTab(QWidget):
             try:
                 self.bridge.get_tree_data()
                 # Add delay to ensure data is processed and fitView can be called
-                QTimer.singleShot(100, self.fit_view)
+                QTimer.singleShot(300, self.fit_view)
             except Exception as e:
                 print(f"Error initializing tree: {e}")
 
@@ -1453,9 +1474,12 @@ class ComponentTreeTab(QWidget):
             self._pending_pdf_path = file_path
             self._pending_pdf_progress = progress
             self._pending_pdf_original_size = self.web_view.size()
+            # self.web_view.page().runJavaScript("""
+            #     if (typeof setExportOverlayVisible === 'function') setExportOverlayVisible(false);
+            #     if (typeof fitView === 'function') fitView();
+            #     """)
             self.web_view.page().runJavaScript("""
                 if (typeof setExportOverlayVisible === 'function') setExportOverlayVisible(false);
-                if (typeof fitView === 'function') fitView();
                 """)
             QTimer.singleShot(
                 800,
@@ -1486,8 +1510,8 @@ class ComponentTreeTab(QWidget):
             else:
                 bounds = json.loads(result or "{}")
 
-            width_px = max(320, int(bounds.get("widthPx", 1200)))
-            height_px = max(240, int(bounds.get("heightPx", 800)))
+            width_px = max(320, int(bounds.get("widthPx", 1200))) - 250
+            height_px = max(240, int(bounds.get("heightPx", 800))) - 50
             width_mm = max(120, int(width_px * 25.4 / 96))
             height_mm = max(120, int(height_px * 25.4 / 96))
 
@@ -1498,9 +1522,13 @@ class ComponentTreeTab(QWidget):
             )
 
             self.web_view.resize(width_px, height_px)
+            # self.web_view.page().runJavaScript(
+            #     "if (typeof fitView === 'function') fitView();"
+            # )
             self.web_view.page().runJavaScript(
-                "if (typeof fitView === 'function') fitView();"
+                "if(typeof setExportMode==='function') setExportMode(true);"
             )
+
             QTimer.singleShot(
                 400,
                 lambda: self.web_view.page().printToPdf(
