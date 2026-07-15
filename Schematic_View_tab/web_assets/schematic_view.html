@@ -1,70 +1,220 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Schematic View</title>
 <style>
   :root {
-    /* Fallback colors -- overwritten live once the bridge's theme_changed
-       signal fires (see updateThemeColors() in schematic_render.js), same
-       pattern Component_Tree_Window.py already uses. */
+    /* Fallback colors - overwritten live by bridge.theme_changed signal */
     --primary-dark: #1e1e2e;
     --primary-light: #3a3a52;
     --accent: #5b8def;
     --text-primary: #e8e8f0;
+    --toast-success: #27ae60;
+    --toast-error: #e74c3c;
   }
+
+  *, *::before, *::after { box-sizing: border-box; }
 
   html, body {
     margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
     background: var(--primary-dark);
-    font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
   }
 
-  #scene-container { width: 100%; height: 100%; position: relative; }
+  /* ========= Scene Container ========= */
+  #scene-container {
+    width: 100%; height: 100%; position: relative;
+    -webkit-user-select: none;
+    user-select: none;
+  }
 
-  svg { width: 100%; height: 100%; display: block; cursor: grab; }
+  svg {
+    width: 100%; height: 100%; display: block; cursor: grab;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  svg text {
+    -webkit-user-select: none;
+    user-select: none;
+  }
   svg:active { cursor: grabbing; }
 
+  /* ========= Module Styles ========= */
   .module-box { cursor: move; }
-  .module-rect { stroke: var(--primary-light); stroke-width: 1.5; }
-  .module-box.selected .module-rect { stroke: var(--accent); stroke-width: 2.5; }
+  .module-rect {
+    stroke: var(--primary-light); stroke-width: 1.5;
+    transition: stroke-width 0.15s ease, stroke 0.15s ease;
+  }
+  .module-box.selected .module-rect {
+    stroke: var(--accent); stroke-width: 2.5;
+    filter: drop-shadow(0 0 6px rgba(91, 141, 239, 0.3));
+  }
   .module-label {
     fill: var(--text-primary); font-size: 13px; font-weight: 600;
     pointer-events: none; text-anchor: middle; dominant-baseline: middle;
   }
 
+  /* ========= Connector Styles ========= */
+  .connector-group { cursor: default; }
   .connector-line {
     stroke: var(--primary-light); stroke-width: 1.5; fill: none;
     cursor: context-menu; pointer-events: stroke;
+    transition: stroke-width 0.15s ease;
   }
+  .connector-line:hover { stroke-width: 2.5; }
 
   .connector-drag-handle {
-    fill: #4a9eff;
-    opacity: 0.5;
-    cursor: grab;
-    stroke: none;
-}
-.connector-drag-handle:hover { opacity: 0.9; }
-.connector-group { cursor: default; }
-
-
-  .pin-circle { fill: var(--accent); stroke: var(--primary-dark); stroke-width: 1; cursor: crosshair; }
-  .pin-circle:hover { stroke: var(--accent); stroke-width: 2; r: 6; }
-  .pin-label {
-    fill: var(--text-primary); font-size: 9px; pointer-events: none;
+    fill: var(--accent); opacity: 0.7; cursor: grab; stroke: none;
+    transition: opacity 0.15s ease, r 0.15s ease;
+  }
+  .connector-drag-handle:hover { opacity: 1; r: 7; }
+  .connector-interactive {
+    cursor: context-menu;
   }
 
+  /* ========= Pin Styles ========= */
+  .pin-circle {
+    fill: var(--accent); stroke: var(--primary-dark); stroke-width: 1.5;
+    cursor: crosshair; transition: r 0.12s ease, stroke-width 0.12s ease;
+  }
+  .pin-circle:hover {
+    stroke: var(--accent); stroke-width: 2.5; r: 11;
+    filter: drop-shadow(0 0 4px rgba(91, 141, 239, 0.5));
+  }
+  .pin-label {
+    fill: var(--text-primary); font-size: 9px; pointer-events: none;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* ========= Pin Connector Halo ========= */
+  .pin-connector-halo {
+    fill: rgba(255, 255, 255, 0.04);
+    stroke: rgba(255, 255, 255, 0.08);
+    stroke-width: 0.5;
+    pointer-events: none;
+  }
+
+  /* ========= Interface / Wire Styles ========= */
   .interface-path {
     fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0.85;
     cursor: pointer; pointer-events: stroke;
+    transition: stroke-width 0.15s ease, opacity 0.15s ease;
   }
-  .interface-path.selected { stroke-width: 3.5; opacity: 1; }
+  .interface-path:hover { stroke-width: 3; opacity: 1; }
+  .interface-path.selected {
+    stroke-width: 3.5; opacity: 1;
+    filter: drop-shadow(0 0 4px rgba(91, 141, 239, 0.4));
+  }
 
+  /* Temporary drag line (dashed while creating a connection) */
+  .interface-path.temp-drag {
+    stroke-dasharray: 6,4;
+    animation: dash-flow 0.5s linear infinite;
+  }
+  @keyframes dash-flow {
+    to { stroke-dashoffset: -10; }
+  }
+
+  /* ======= Zoom Indicator ======= */
   #zoom-info {
-    position: absolute; top: 8px; right: 12px;
-    color: var(--text-primary); background: rgba(0, 0, 0, 0.35);
-    padding: 4px 10px; border-radius: 6px; font-size: 12px;
+    position: absolute; top: 10px; right: 12px;
+    color: var(--text-primary);
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    padding: 4px 12px; border-radius: 8px; font-size: 11px;
+    pointer-events: none; user-select: none;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ======= Loading Overlay ======= */
+  #loading-overlay {
+    position: absolute; inset: 0; z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--primary-dark);
+    transition: opacity 0.4s ease;
     pointer-events: none;
+  }
+  #loading-overlay.hidden { opacity: 0; }
+  .spinner {
+    width: 36px; height: 36px;
+    border: 3px solid var(--primary-light);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ======= Toast Notification — Compact corner style ======= */
+  #toast-container {
+    position: fixed; bottom: 12px; right: 12px;
+    z-index: 9999; display: flex; flex-direction: column; gap: 6px;
+    pointer-events: none;
+    max-width: 280px;
+  }
+  .toast {
+    padding: 6px 12px; border-radius: 6px;
+    font-size: 11px; font-weight: 500;
+    color: #ffffff; pointer-events: auto;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    opacity: 0; transform: translateX(12px);
+    transition: opacity 0.2s ease, transform 0.2s ease;
+    display: flex; align-items: center; gap: 6px;
+    line-height: 1.3;
+  }
+  .toast.show { opacity: 1; transform: translateX(0); }
+  .toast.toast-success {
+    background: rgba(39, 174, 96, 0.8);
+    border: 1px solid rgba(39, 174, 96, 0.3);
+  }
+  .toast.toast-error {
+    background: rgba(231, 76, 60, 0.8);
+    border: 1px solid rgba(231, 76, 60, 0.3);
+  }
+  .toast-icon { font-size: 12px; }
+
+  /* ======= Context Menu ======= */
+  #schematic-context-menu {
+    position: fixed; z-index: 10000;
+    background: rgba(30, 30, 46, 0.95);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid var(--primary-light);
+    border-radius: 10px; padding: 4px 0;
+    box-shadow: 0 8px 28px rgba(0,0,0,0.5);
+    font-size: 13px; min-width: 170px;
+    overflow: hidden;
+    animation: menu-in 0.12s ease-out;
+  }
+  @keyframes menu-in {
+    from { opacity: 0; transform: scale(0.95) translateY(-4px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+  }
+  #schematic-context-menu .menu-item {
+    padding: 8px 16px; cursor: pointer;
+    color: var(--text-primary);
+    display: flex; align-items: center; gap: 8px;
+    transition: background 0.1s ease;
+  }
+  #schematic-context-menu .menu-item:hover {
+    background: rgba(91, 141, 239, 0.25);
+  }
+  #schematic-context-menu .menu-item .shortcut {
+    margin-left: auto; font-size: 11px; opacity: 0.5;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+  }
+  #schematic-context-menu .menu-divider {
+    height: 1px; background: rgba(255,255,255,0.08);
+    margin: 4px 0;
   }
 </style>
 </head>
@@ -72,7 +222,10 @@
   <div id="scene-container">
     <svg id="schematic-svg"></svg>
     <div id="zoom-info">Zoom: 100%</div>
+    <div id="loading-overlay"><div class="spinner"></div></div>
   </div>
+
+  <div id="toast-container"></div>
 
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <script src="d3.min.js"></script>

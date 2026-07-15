@@ -52,10 +52,14 @@ class SchematicBridge(QObject):
     """Bridge between Python and JavaScript for the schematic scene."""
 
     # ---- Signals to JavaScript ----
-    scene_data_ready = pyqtSignal(str)      # JSON scene data
-    theme_changed = pyqtSignal(str)         # JSON theme colors
-    save_finished = pyqtSignal(bool, str)   # (success, message) -> JS can show a toast/status
-    pin_reorder_requested = pyqtSignal(int, str, str)  # (connector_id, connector_name, pin_names_json)
+    scene_data_ready = pyqtSignal(str)  # JSON scene data
+    theme_changed = pyqtSignal(str)  # JSON theme colors
+    save_finished = pyqtSignal(
+        bool, str
+    )  # (success, message) -> JS can show a toast/status
+    pin_reorder_requested = pyqtSignal(
+        int, str, str
+    )  # (connector_id, connector_name, pin_names_json)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -73,7 +77,7 @@ class SchematicBridge(QObject):
     def get_scene_data(self):
         """Send the current schematic scene to JavaScript."""
         if get_current_project_id() is None:
-            empty_scene = {"modules": [], "connectors": [], "interfaces": []}
+            empty_scene = {"subsystems": [], "modules": [], "connectors": [], "interfaces": []}
             self.scene_data_ready.emit(json.dumps(empty_scene))
             return
 
@@ -81,11 +85,17 @@ class SchematicBridge(QObject):
             scene = load_schematic_scene(self._selected_module_ids)
             self.scene_data_ready.emit(json.dumps(scene))
         except Exception as e:
-            print(f"[SchematicBridge] Error loading scene: {e}")
-            self.scene_data_ready.emit(json.dumps({
-                "modules": [], "connectors": [], "interfaces": [],
-                "error": str(e),
-            }))
+            self.scene_data_ready.emit(
+                json.dumps(
+                    {
+                        "subsystems": [],
+                        "modules": [],
+                        "connectors": [],
+                        "interfaces": [],
+                        "error": str(e),
+                    }
+                )
+            )
 
     @pyqtSlot()
     def refresh_scene_data(self):
@@ -102,8 +112,7 @@ class SchematicBridge(QObject):
         try:
             ids = json.loads(module_ids_json) if module_ids_json else []
             self._selected_module_ids = [int(i) for i in ids] if ids else None
-        except (ValueError, TypeError) as e:
-            print(f"[SchematicBridge] Invalid module selection payload: {e}")
+        except (ValueError, TypeError):
             self._selected_module_ids = None
         self.get_scene_data()
 
@@ -127,12 +136,15 @@ class SchematicBridge(QObject):
 
     @pyqtSlot(str)
     def save_connector_positions(self, positions_json: str):
-        """Same shape as save_module_positions, keyed by connector id."""
+        """Save connector positions. Each entry can include x, y, and optionally side.
+        Example: '{"1": {"x": 100, "y": 50, "side": "right"}}'"""
         try:
             raw: Dict[str, Any] = json.loads(positions_json)
             positions = {int(conn_id): pos for conn_id, pos in raw.items()}
             persist_connector_positions(positions)
-            self.save_finished.emit(True, f"{len(positions)} connector position(s) saved")
+            self.save_finished.emit(
+                True, f"{len(positions)} connector position(s) saved"
+            )
         except Exception as e:
             self.save_finished.emit(False, f"Failed to save connector positions: {e}")
 
@@ -315,7 +327,9 @@ class SchematicBridge(QObject):
         self._host_widget = widget
 
     @pyqtSlot(int, str, str)
-    def request_pin_order_dialog(self, connector_id: int, connector_name: str, pin_names_json: str):
+    def request_pin_order_dialog(
+        self, connector_id: int, connector_name: str, pin_names_json: str
+    ):
         try:
             pin_names = json.loads(pin_names_json)
         except Exception:

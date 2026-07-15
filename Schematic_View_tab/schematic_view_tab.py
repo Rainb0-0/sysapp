@@ -128,6 +128,7 @@ class SchematicViewTab(QWidget):
         SchematicBridge.set_module_selection).
         """
         import json
+
         module_ids = checked_ids.get("modules", [])
         self.bridge.set_module_selection(json.dumps(module_ids))
 
@@ -135,7 +136,8 @@ class SchematicViewTab(QWidget):
         html_path = os.path.join(self.assets_dir, "schematic_view.html")
         if not os.path.exists(html_path):
             QMessageBox.critical(
-                self, "Error",
+                self,
+                "Error",
                 f"schematic_view.html not found at:\n{html_path}\n\n"
                 "Build the web_assets/ folder before using this tab.",
             )
@@ -185,8 +187,13 @@ class SchematicViewTab(QWidget):
         main_layout.addWidget(self.toolbar)
 
         # Disabled until the page finishes loading
-        for btn in (self.add_module_btn, self.refresh_btn, self.save_layout_btn,
-                    self.export_pdf_btn, self.export_png_btn):
+        for btn in (
+            self.add_module_btn,
+            self.refresh_btn,
+            self.save_layout_btn,
+            self.export_pdf_btn,
+            self.export_png_btn,
+        ):
             btn.setEnabled(False)
 
     def update_toolbar_style(self):
@@ -238,8 +245,12 @@ class SchematicViewTab(QWidget):
     # ------------------------------------------------------------------
     def load_scene_html(self):
         self.temp_dir = tempfile.mkdtemp()
-        for filename in ("schematic_view.html", "schematic_render.js",
-                          "schematic_routing.js", "d3.min.js"):
+        for filename in (
+            "schematic_view.html",
+            "schematic_render.js",
+            "schematic_routing.js",
+            "d3.min.js",
+        ):
             src = os.path.join(self.assets_dir, filename)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(self.temp_dir, filename))
@@ -250,17 +261,20 @@ class SchematicViewTab(QWidget):
 
     def _on_page_loaded(self, ok: bool):
         self.page_ready = bool(ok)
-        for btn in (self.add_module_btn, self.refresh_btn, self.save_layout_btn,
-                    self.export_pdf_btn, self.export_png_btn):
+        for btn in (
+            self.add_module_btn,
+            self.refresh_btn,
+            self.save_layout_btn,
+            self.export_pdf_btn,
+            self.export_png_btn,
+        ):
             btn.setEnabled(self.page_ready)
         if self.page_ready:
             self.bridge.get_scene_data()
 
     def _on_save_finished(self, success: bool, message: str):
-        if success:
-            QMessageBox.information(self, "Save", message)
-        else:
-            QMessageBox.critical(self, "Save Error", message)
+        # Silent save — the JS side already shows a toast notification
+        pass
 
     # ------------------------------------------------------------------
     # Toolbar actions
@@ -270,6 +284,7 @@ class SchematicViewTab(QWidget):
 
     def add_module(self):
         from PyQt5.QtWidgets import QInputDialog
+
         name, ok = QInputDialog.getText(self, "New Module", "Module name:")
         if ok and name.strip():
             self.bridge.create_module(name.strip())
@@ -282,6 +297,7 @@ class SchematicViewTab(QWidget):
 
     def _get_timestamp(self):
         from datetime import datetime
+
         return datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # ------------------------------------------------------------------
@@ -294,7 +310,8 @@ class SchematicViewTab(QWidget):
     def export_to_pdf(self):
         try:
             file_path, _ = QFileDialog.getSaveFileName(
-                self, "Export Schematic to PDF",
+                self,
+                "Export Schematic to PDF",
                 f"schematic_{self._get_timestamp()}.pdf",
                 "PDF Files (*.pdf);;All Files (*)",
             )
@@ -329,11 +346,16 @@ class SchematicViewTab(QWidget):
 
     def _on_pdf_export_bounds_ready(self, result):
         import json
+
         progress = getattr(self, "_pending_pdf_progress", None)
         file_path = getattr(self, "_pending_pdf_path", None)
 
         try:
-            bounds = json.loads(result) if isinstance(result, str) else json.loads(result or "{}")
+            bounds = (
+                json.loads(result)
+                if isinstance(result, str)
+                else json.loads(result or "{}")
+            )
 
             width_px = max(320, int(bounds.get("widthPx", 1200)))
             height_px = max(240, int(bounds.get("heightPx", 800)))
@@ -353,13 +375,16 @@ class SchematicViewTab(QWidget):
             QTimer.singleShot(
                 800,
                 lambda: self.web_view.page().printToPdf(
-                    self._handle_pdf_export_finished, page_layout,
+                    self._handle_pdf_export_finished,
+                    page_layout,
                 ),
             )
         except Exception as e:
             if progress is not None:
                 progress.close()
-            QMessageBox.critical(self, "PDF Export Error", f"Failed to size PDF page: {e}")
+            QMessageBox.critical(
+                self, "PDF Export Error", f"Failed to size PDF page: {e}"
+            )
             self._pending_pdf_path = None
             self._pending_pdf_progress = None
 
@@ -375,7 +400,9 @@ class SchematicViewTab(QWidget):
             with open(file_path, "wb") as f:
                 f.write(pdf_bytes)
 
-            self.web_view.resize(getattr(self, "_pending_pdf_original_size", self.web_view.size()))
+            self.web_view.resize(
+                getattr(self, "_pending_pdf_original_size", self.web_view.size())
+            )
             self.web_view.page().runJavaScript(
                 "if (typeof setExportOverlayVisible === 'function') setExportOverlayVisible(true);"
             )
@@ -386,7 +413,8 @@ class SchematicViewTab(QWidget):
 
             file_size = os.path.getsize(file_path) / (1024 * 1024)
             QMessageBox.information(
-                self, "PDF Export Successful",
+                self,
+                "PDF Export Successful",
                 f"File: {os.path.basename(file_path)}\nSize: {file_size:.2f} MB",
             )
         except Exception as e:
@@ -402,7 +430,8 @@ class SchematicViewTab(QWidget):
     # ------------------------------------------------------------------
     def export_to_png(self):
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Export Schematic to PNG",
+            self,
+            "Export Schematic to PNG",
             f"schematic_{self._get_timestamp()}.png",
             "PNG Files (*.png);;All Files (*)",
         )
@@ -426,9 +455,15 @@ class SchematicViewTab(QWidget):
         progress.close()
         file_size = os.path.getsize(file_path) / (1024 * 1024)
         QMessageBox.information(
-            self, "PNG Export Successful",
+            self,
+            "PNG Export Successful",
             f"File: {os.path.basename(file_path)}\nSize: {file_size:.2f} MB",
         )
+
+    def refresh_all(self):
+        """Refresh the scene data in the web view."""
+        if self.page_ready:
+            self.bridge.get_scene_data()
 
     # ------------------------------------------------------------------
     def closeEvent(self, event):

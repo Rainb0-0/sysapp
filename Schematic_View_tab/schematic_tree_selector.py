@@ -400,6 +400,10 @@ class SchematicTreeSelector(QWidget):
 
         self.tree.blockSignals(False)
         self._rebuild_index()
+        # Emit empty selection to reset the bridge on tab switch
+        self.selectionChanged.emit(self.get_checked_ids())
+        self.update_selection_button()
+        self.update_expand_button()
 
     def _on_item_changed(self, item, column):
         """Handle check propagation and emit selectionChanged signal"""

@@ -21,45 +21,20 @@ let sceneData = { modules: [], connectors: [], interfaces: [] };
 let selectedModuleId = null;
 let selectedInterfaceId = null;
 let connectDrag = null; // { fromPinId, tempPath }
+let toastCount = 0;
 
-const MODULE_MIN_WIDTH = 140;
-const MODULE_MIN_HEIGHT = 80;
-const PIN_RADIUS = 4;
-const CONNECTOR_STUB = 18; // how far a connector's pin row sticks out from the module edge
+const MODULE_MIN_WIDTH = 120;
+const MODULE_MIN_HEIGHT = 60;
+const PIN_RADIUS = 7;      // larger hitbox for easier pin-to-pin dragging
+const PIN_HOVER_RADIUS = 11;
+const CONNECTOR_STUB = 30;  // length of connector stub from module edge to tip
 
-
-const EDGE_THRESHOLD   = 0.12;   // fraction از طول edge که trigger می‌کنه side switch
-const SIDE_SWITCH_DELAY_MS = 400;
-const CORNER_OFFSET    = 0.08;   // حداقل فاصله از گوشه (fraction)
-const CONNECTOR_MARGIN = 20;     // px بیرون از edge برای tip
-
-
-// داخل forEach connector، به‌جای append مستقیم line:
-const cg = parent.append('g')
-    .attr('class', 'connector-group')
-    .attr('data-connector-id', c.id);
-
-cg.append('line')
-    .attr('class', 'connector-line')
-    .attr('data-connector-id', c.id)
-    .attr('x1', edge.x).attr('y1', edge.y)
-    .attr('x2', c.x)   .attr('y2', c.y)
-    .on('dblclick', function (event) {
-        event.stopPropagation();
-        openPinOrderDialog(c);
-    })
-    .on('contextmenu', function (event) {
-        event.preventDefault();
-        event.stopPropagation();
-        showConnectorContextMenu(event, c);
-    });
-
-cg.append('circle')
-    .attr('class', 'connector-drag-handle')
-    .attr('cx', c.x).attr('cy', c.y)
-    .attr('r', 6);
-
-enableConnectorSideDrag(cg, c, module);
+// Corner offset to avoid placing connectors too close to corners
+const CORNER_OFFSET = 0.08;
+const CONNECTOR_MARGIN = 34; // distance from module edge to connector tip (pins live here)
+const PIN_HALF_STEP = 10;  // half the distance between adjacent pins (full step = 20px)
+const CONNECTOR_GAP = 12;  // minimum gap between connector edges on same side
+const CONNECTOR_BBOX_PAD = 8; // extra padding around connector bounding box
 
 
 // Real DB side values are 'left' | 'right' | 'top' | 'bottom' (default 'top').
@@ -137,9 +112,17 @@ function initializeWebChannel() {
 
         bridge.save_finished.connect(function (success, message) {
             console.log('[schematic] save_finished:', success, message);
+            showToast(message, success ? 'success' : 'error');
         });
 
-        setTimeout(() => bridge.get_scene_data(), 100);
+        setTimeout(function () {
+            bridge.get_scene_data();
+        }, 100);
+
+        // Safety timeout: hide loading overlay if data never arrives
+        setTimeout(function () {
+            hideLoading();
+        }, 10000);
     });
 }
 
@@ -225,16 +208,131 @@ function render(scene) {
     assignFallbackConnectorPositions(scene);
     const pinLookup = buildPinLookup(scene);
 
+    // Draw subsystem halos first (behind everything)
+    renderSubsystemHalos(scene);
+
     renderInterfaces(scene, pinLookup, false);
     renderModules(scene);
+
+    // Hide loading overlay once we have rendered content
+    hideLoading();
 
     if (!render.hasFitOnce) {
         setTimeout(() => { fitView(); render.hasFitOnce = true; }, 300);
     }
 }
+render.hasFitOnce = false;
 
-// If a connector/pin has never been saved with an explicit x/y, stack it
-// evenly along its module's edge (whichever side it's assigned to).
+// ---------------------------------------------------------------------
+// Subsystem halos — draw a colored bounding box behind modules grouped
+// by subsystem_id, with a label indicating the subsystem name.
+// ---------------------------------------------------------------------
+function renderSubsystemHalos(scene) {
+    if (!scene.subsystems || !scene.subsystems.length) return;
+    if (!scene.modules || !scene.modules.length) return;
+
+    // Group modules by subsystem_id
+    const groups = {};
+    scene.modules.forEach(function (m) {
+        const ssId = m.subsystem_id || 0;
+        if (!groups[ssId]) {
+            groups[ssId] = { modules: [], name: 'Ungrouped', color: 'rgba(128,128,128,0.06)', haloColor: 'rgba(128,128,128,0.06)' };
+        }
+        groups[ssId].modules.push(m);
+    });
+
+    // Match subsystem names and colors
+    scene.subsystems.forEach(function (ss) {
+        if (groups[ss.id]) {
+            groups[ss.id].name = ss.name;
+            groups[ss.id].color = ss.color;
+            groups[ss.id].haloColor = ss.halo_color;
+        }
+    });
+
+    const haloGroup = g.append('g').attr('class', 'subsystem-halos');
+    const padding = 24;
+
+    Object.keys(groups).forEach(function (ssId) {
+        const group = groups[ssId];
+        if (group.modules.length < 2) return;
+
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        group.modules.forEach(function (m) {
+            const right = m.x + m.width;
+            const bottom = m.y + m.height;
+            if (m.x < minX) minX = m.x;
+            if (m.y < minY) minY = m.y;
+            if (right > maxX) maxX = right;
+            if (bottom > maxY) maxY = bottom;
+        });
+
+        minX -= padding;
+        minY -= padding;
+        maxX += padding;
+        maxY += padding;
+
+        const boxW = maxX - minX;
+        const boxH = maxY - minY;
+
+        // Background bounding box with dashed border
+        haloGroup.append('rect')
+            .attr('x', minX)
+            .attr('y', minY)
+            .attr('width', boxW)
+            .attr('height', boxH)
+            .attr('rx', 12)
+            .attr('ry', 12)
+            .attr('fill', group.haloColor)
+            .attr('stroke', group.color || '#555')
+            .attr('stroke-width', 1)
+            .attr('stroke-dasharray', '6,3')
+            .attr('opacity', 0.85)
+            .attr('pointer-events', 'none');
+
+        // Subsystem label at top-left
+        const labelX = minX + 10;
+        const labelY = minY + 16;
+        const textLength = group.name.length * 8 + 20;
+
+        haloGroup.append('rect')
+            .attr('x', labelX - 4)
+            .attr('y', labelY - 11)
+            .attr('width', Math.max(textLength, 30))
+            .attr('height', 18)
+            .attr('rx', 4)
+            .attr('ry', 4)
+            .attr('fill', group.color || '#555')
+            .attr('opacity', 0.7);
+
+        haloGroup.append('text')
+            .attr('x', labelX + 2)
+            .attr('y', labelY)
+            .attr('fill', '#ffffff')
+            .attr('font-size', 11)
+            .attr('font-weight', '600')
+            .attr('font-family', '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif')
+            .text(group.name);
+    });
+}
+
+
+
+// Compute the full extent a connector needs along the module edge.
+// For a connector with N pins, the pin spread is (N-1)*PIN_HALF_STEP*2
+// centered on the connector's center along the edge.
+function connectorEdgeExtent(c, side) {
+    const count = c.pins.length;
+    const pinSpan = Math.max(0, (count - 1)) * PIN_HALF_STEP + PIN_HALF_STEP;
+    // Full extent = 2 * pinSpan (pins spread equally in both directions)
+    return pinSpan * 2 + CONNECTOR_BBOX_PAD * 2;
+}
+
+// Distribute connectors along a module edge so they never overlap.
+// For each side of each module, compute the total space needed for all
+// connectors (pin spreads + gaps), then distribute them evenly.
+// Connectors with saved positions keep their position; unsaved ones are
+// placed to fill gaps without overlapping saved ones.
 function assignFallbackConnectorPositions(scene) {
     const bySideModule = {};
     scene.connectors.forEach(function (c) {
@@ -248,20 +346,84 @@ function assignFallbackConnectorPositions(scene) {
         if (!module) return;
 
         const group = bySideModule[key];
-        const count = group.length;
-        group.forEach(function (c, i) {
-            if (c.x !== null && c.x !== undefined && c.y !== null && c.y !== undefined) return;
-            const t = (i + 1) / (count + 1);
-            const edge = edgePoint(module, side, t);
-            const normal = SIDE_AXIS[side].normal;
-            c.x = edge.x + normal.x * CONNECTOR_STUB;
-            c.y = edge.y + normal.y * CONNECTOR_STUB;
+        const w = Math.max(MODULE_MIN_WIDTH, module.width);
+        const h = Math.max(MODULE_MIN_HEIGHT, module.height);
+        const edgeSize = (side === 'top' || side === 'bottom') ? w : h;
+        const edgeMargin = 14; // min distance from edge corners
+
+        // Build entries with extents for ALL connectors
+        const entries = group.map(function (c) {
+            const extent = connectorEdgeExtent(c, side);
+            const hasSaved = c.x !== null && c.x !== undefined && c.y !== null && c.y !== undefined;
+            return { c: c, extent: extent, hasSaved: hasSaved };
+        });
+
+        if (entries.every(function (e) { return e.hasSaved; })) return;
+
+        if (entries.length === 1) {
+            // Single connector: center it on the edge
+            const e = entries[0];
+            if (!e.hasSaved) {
+                const t = 0.5;
+                const edge = edgePoint(module, side, t);
+                const normal = SIDE_AXIS[side].normal;
+                e.c.x = edge.x + normal.x * CONNECTOR_MARGIN;
+                e.c.y = edge.y + normal.y * CONNECTOR_MARGIN;
+            }
+            return;
+        }
+
+        // Multi-connector: compute total space needed
+        const totalExtents = entries.reduce(function (s, e) { return s + e.extents; }, 0);
+        const totalGaps = (entries.length - 1) * CONNECTOR_GAP;
+        const totalNeeded = totalExtents + totalGaps + edgeMargin * 2;
+
+        // If we need more space than the edge, shrink gap proportionally
+        let actualGap = CONNECTOR_GAP;
+        if (totalNeeded > edgeSize) {
+            const availableForGaps = Math.max(0, edgeSize - totalExtents - edgeMargin * 2);
+            actualGap = entries.length > 1 ? availableForGaps / (entries.length - 1) : 0;
+        }
+
+        // Compute starting position: center the whole group if total fits,
+        // otherwise start at margin
+        const actualTotal = totalExtents + actualGap * (entries.length - 1) + edgeMargin * 2;
+        let startOffset = (edgeSize - actualTotal) / 2 + edgeMargin;
+        if (startOffset < edgeMargin) startOffset = edgeMargin;
+
+        let cursor = startOffset;
+        entries.forEach(function (entry) {
+            // Center of this connector along the edge
+            const center = cursor + entry.extent / 2;
+
+            if (!entry.hasSaved) {
+                const t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, center / edgeSize));
+                const edge = edgePoint(module, side, t);
+                const normal = SIDE_AXIS[side].normal;
+                entry.c.x = edge.x + normal.x * CONNECTOR_MARGIN;
+                entry.c.y = edge.y + normal.y * CONNECTOR_MARGIN;
+            }
+
+            cursor += entry.extent + actualGap;
         });
     });
+}// Compute the midpoint of a connector body (where pins sit), in module-local coords.
+// For a connector on side S, the body midpoint is halfway between the module edge
+// and the stub tip, along the normal direction.
+function connectorBodyMidpoint(module, c) {
+    const side = normalizeSide(c.side);
+    const normal = SIDE_AXIS[side].normal;
+    const edge = connectorEdgeAnchor(module, c);
+    // Midpoint is halfway from edge to tip along the normal
+    return {
+        x: edge.x + normal.x * (CONNECTOR_MARGIN / 2),
+        y: edge.y + normal.y * (CONNECTOR_MARGIN / 2),
+    };
 }
 
 function buildPinLookup(scene) {
-    // pin_id -> absolute {x, y, side} in scene coordinates, used to draw interfaces
+    // pin_id -> absolute {x, y, side} in scene coordinates, used to draw interfaces.
+    // Pins sit at the connector body midpoint, spread along the tangent direction.
     const lookup = {};
     scene.connectors.forEach(function (c) {
         const module = scene.modules.find(m => String(m.id) === String(c.module_id));
@@ -269,11 +431,12 @@ function buildPinLookup(scene) {
         const side = normalizeSide(c.side);
         const tangent = SIDE_AXIS[side].tangent;
         const count = c.pins.length;
+        const mid = connectorBodyMidpoint(module, c);
         c.pins.forEach(function (p, i) {
-            const offset = -(count - 1) * 6 + i * 12;
+            const offset = -(count - 1) * PIN_HALF_STEP + i * (PIN_HALF_STEP * 2);
             lookup[p.id] = {
-                x: module.x + c.x + tangent.x * offset,
-                y: module.y + c.y + tangent.y * offset,
+                x: module.x + mid.x + tangent.x * offset,
+                y: module.y + mid.y + tangent.y * offset,
                 side: side,
             };
         });
@@ -307,7 +470,7 @@ function renderModules(scene) {
         .attr('width', d => Math.max(MODULE_MIN_WIDTH, d.width))
         .attr('height', d => Math.max(MODULE_MIN_HEIGHT, d.height))
         .attr('rx', 6).attr('ry', 6)
-        .attr('fill', d => d.color || 'var(--primary-light)');
+        .attr('fill', d => d.color || '#e67e22');
 
     moduleSel.append('text')
         .attr('class', 'module-label')
@@ -325,30 +488,94 @@ function renderModules(scene) {
         const count = c.pins.length;
         const edge = connectorEdgeAnchor(module, c);
 
-        parent.append('line')
+        // Use tree-view colors: orange for module fill, green for connector strokes, red for pins
+        const connectorColor = '#27ae60';   // tree view connector color
+        const pinColor = '#e74c3c';         // tree view pin color
+
+        // Connector interactive group — contains visible line, handle, hitbox
+        var connGroup = parent.append('g').attr('class', 'connector-interactive');
+
+        // --- Connector bounding box (visible background rect) ---
+        const bbox = connectorBBox(module, c);
+        connGroup.append('rect')
+            .attr('class', 'connector-bbox')
+            .attr('data-connector-id', c.id)
+            .attr('x', bbox.x).attr('y', bbox.y)
+            .attr('width', bbox.w).attr('height', bbox.h)
+            .attr('rx', 6).attr('ry', 6)
+            .attr('fill', 'rgba(39, 174, 96, 0.08)')
+            .attr('stroke', 'rgba(39, 174, 96, 0.25)')
+            .attr('stroke-width', 1.5)
+            .attr('pointer-events', 'none');
+
+        // Visible connector line from module edge OUT to the stub tip
+        connGroup.append('line')
             .attr('class', 'connector-line')
             .attr('data-connector-id', c.id)
             .attr('x1', edge.x).attr('y1', edge.y)
             .attr('x2', c.x).attr('y2', c.y)
-            .on('dblclick', function (event) {
-                event.stopPropagation();
-                openPinOrderDialog(c);
-            })
-            .on('contextmenu', function (event) {
-                event.preventDefault();
-                event.stopPropagation();
-                showConnectorContextMenu(event, c);
-            });
+            .attr('stroke', connectorColor)
+            .attr('stroke-width', 2);
+
+        // Visible drag handle at the stub tip
+        connGroup.append('circle')
+            .attr('class', 'connector-drag-handle')
+            .attr('cx', c.x).attr('cy', c.y)
+            .attr('r', 5);
+
+        // Connector name label near the drag handle
+        const isHorizSide = (side === 'top' || side === 'bottom');
+        const labelOffset = isHorizSide ? { x: 10, y: -6 } :
+            (side === 'left' ? { x: -8, y: -6 } : { x: 8, y: -6 });
+        connGroup.append('text')
+            .attr('class', 'connector-label')
+            .attr('x', c.x + labelOffset.x)
+            .attr('y', c.y + labelOffset.y)
+            .attr('text-anchor', isHorizSide ? 'start' : (side === 'left' ? 'end' : 'start'))
+            .attr('dominant-baseline', 'auto')
+            .attr('fill', connectorColor)
+            .attr('font-size', 9)
+            .attr('font-weight', '600')
+            .attr('font-family', '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif')
+            .attr('pointer-events', 'none')
+            .text(c.name);
+
+        // Invisible wider hitbox ON TOP for easy connector interaction (covers bounding box area)
+        connGroup.append('rect')
+            .attr('class', 'connector-hitbox')
+            .attr('data-connector-id', c.id)
+            .attr('x', bbox.x).attr('y', bbox.y)
+            .attr('width', bbox.w).attr('height', bbox.h)
+            .attr('fill', 'transparent')
+            .attr('pointer-events', 'all')
+            .attr('cursor', 'context-menu');
+
+        // Enable drag-to-reposition along the module edge
+        enableConnectorSideDrag(connGroup, c, module);
+
+        // Context menu on dblclick (via hitbox)
+        connGroup.on('dblclick', function (event) {
+            event.stopPropagation();
+            openPinOrderDialog(c);
+        });
+        connGroup.on('contextmenu', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            showConnectorContextMenu(event, c);
+        });
 
         c.pins.forEach(function (p, i) {
-            const offset = -(count - 1) * 6 + i * 12;
-            const px = c.x + tangent.x * offset;
-            const py = c.y + tangent.y * offset;
+            const offset = -(count - 1) * PIN_HALF_STEP + i * (PIN_HALF_STEP * 2);
+            // Pins sit at the connector BODY MIDPOINT, spread along the tangent
+            const mid = connectorBodyMidpoint(module, c);
+            const px = mid.x + tangent.x * offset;
+            const py = mid.y + tangent.y * offset;
 
             parent.append('circle')
                 .attr('class', 'pin-circle')
                 .attr('data-pin-id', p.id)
                 .attr('cx', px).attr('cy', py)
+                .attr('fill', pinColor)
                 .attr('r', PIN_RADIUS)
                 .on('mousedown', function (event) {
                     event.stopPropagation();
@@ -381,6 +608,53 @@ function renderModules(scene) {
 }
 
 // ---------------------------------------------------------------------
+// Connector bounding box computation
+// ---------------------------------------------------------------------
+// Compute the bounding box for a connector's pins in module-local coords.
+// Returns {x, y, w, h} for a rect that encloses all pins plus the stub.
+function connectorBBox(module, c) {
+    const side = normalizeSide(c.side);
+    const tangent = SIDE_AXIS[side].tangent;
+    const normal = SIDE_AXIS[side].normal;
+    const count = c.pins.length;
+    const w = Math.max(MODULE_MIN_WIDTH, module.width);
+    const h = Math.max(MODULE_MIN_HEIGHT, module.height);
+
+    // The body midpoint (where pins sit) in module-local coords
+    const mid = connectorBodyMidpoint(module, c);
+    // The edge anchor
+    const edge = connectorEdgeAnchor(module, c);
+
+    let minX, minY, maxX, maxY;
+    if (count === 0) {
+        // No pins: bbox spans from edge to stub tip
+        minX = Math.min(edge.x, c.x) - CONNECTOR_BBOX_PAD;
+        minY = Math.min(edge.y, c.y) - CONNECTOR_BBOX_PAD;
+        maxX = Math.max(edge.x, c.x) + CONNECTOR_BBOX_PAD;
+        maxY = Math.max(edge.y, c.y) + CONNECTOR_BBOX_PAD;
+    } else {
+        const pinSpread = (count - 1) * PIN_HALF_STEP;
+        // Pin positions along the tangent at the body midpoint
+        const firstPx = mid.x + tangent.x * (-pinSpread);
+        const firstPy = mid.y + tangent.y * (-pinSpread);
+        const lastPx = mid.x + tangent.x * pinSpread;
+        const lastPy = mid.y + tangent.y * pinSpread;
+        // Bounding box covers edge + body + pins + tip
+        minX = Math.min(edge.x, firstPx, lastPx, c.x) - CONNECTOR_BBOX_PAD;
+        minY = Math.min(edge.y, firstPy, lastPy, c.y) - CONNECTOR_BBOX_PAD;
+        maxX = Math.max(edge.x, firstPx, lastPx, c.x) + CONNECTOR_BBOX_PAD;
+        maxY = Math.max(edge.y, firstPy, lastPy, c.y) + CONNECTOR_BBOX_PAD;
+    }
+
+    return {
+        x: minX,
+        y: minY,
+        w: maxX - minX,
+        h: maxY - minY,
+    };
+}
+
+// ---------------------------------------------------------------------
 // Pin-to-pin drag to create a new connection
 // ---------------------------------------------------------------------
 function startConnectDrag(pinId, localX, localY, moduleSelection) {
@@ -390,8 +664,7 @@ function startConnectDrag(pinId, localX, localY, moduleSelection) {
     const startAbs = { x: d.x + localX, y: d.y + localY };
 
     const tempPath = g.append('path')
-        .attr('class', 'interface-path')
-        .attr('stroke-dasharray', '4,3')
+        .attr('class', 'interface-path temp-drag')
         .attr('d', `M${startAbs.x},${startAbs.y} L${startAbs.x},${startAbs.y}`);
 
     connectDrag = { fromPinId: pinId, fromPoint: startAbs, tempPath: tempPath };
@@ -430,25 +703,106 @@ function cancelConnectDrag() {
 // ---------------------------------------------------------------------
 // Generic context menu (Rename / Delete / etc.) for modules, connectors, pins
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// Toast notification system
+// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// Toast notification system
+// ---------------------------------------------------------------------
+// Small, non-invasive toast notifications — bottom-right corner, max 2
+// visible at a time, auto-dismiss after 2 seconds.
+function showToast(message, type) {
+    var container = document.getElementById('toast-container');
+    if (!container) return;
+
+    // Enforce max 2 visible toasts — remove oldest if at limit
+    while (container.children.length >= 2) {
+        var oldest = container.firstChild;
+        if (oldest) container.removeChild(oldest);
+    }
+
+    var toast = document.createElement('div');
+    toast.className = 'toast toast-' + (type || 'info');
+
+    var icon = document.createElement('span');
+    icon.className = 'toast-icon';
+    icon.textContent = type === 'success' ? '\u2713' : type === 'error' ? '\u2717' : '\u2139';
+    toast.appendChild(icon);
+
+    var msg = document.createElement('span');
+    msg.textContent = message;
+    toast.appendChild(msg);
+
+    container.appendChild(toast);
+
+    // Trigger CSS transition
+    requestAnimationFrame(function () {
+        toast.classList.add('show');
+    });
+
+    toastCount++;
+
+    // Auto-dismiss after 2 seconds
+    setTimeout(function () { removeToast(toast); }, 2000);
+}
+
+function removeToast(toast) {
+    if (!toast) return;
+    toast.classList.remove('show');
+    setTimeout(function () {
+        if (toast.parentNode) toast.parentNode.removeChild(toast);
+    }, 200);
+}
+
+// ---------------------------------------------------------------------
+// Loading overlay control
+// ---------------------------------------------------------------------
+function hideLoading() {
+    const overlay = document.getElementById('loading-overlay');
+    if (overlay) overlay.classList.add('hidden');
+}
+
+// ---------------------------------------------------------------------
+// Context menu
+// ---------------------------------------------------------------------
 function showContextMenu(event, items) {
     removeContextMenu();
 
     const menu = document.createElement('div');
     menu.id = 'schematic-context-menu';
-    menu.style.cssText = `
-        position: fixed; left: ${event.clientX}px; top: ${event.clientY}px;
-        background: var(--primary-dark); border: 1px solid var(--primary-light);
-        border-radius: 6px; padding: 4px 0; z-index: 1000;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.4); font-size: 13px; min-width: 150px;
-    `;
+    menu.style.left = event.clientX + 'px';
+    menu.style.top = event.clientY + 'px';
 
     items.forEach(function (item) {
+        if (item.divider) {
+            const divider = document.createElement('div');
+            divider.className = 'menu-divider';
+            menu.appendChild(divider);
+            return;
+        }
+
         const el = document.createElement('div');
-        el.textContent = item.label;
-        el.style.cssText = 'padding: 6px 14px; cursor: pointer; color: var(--text-primary);';
-        el.addEventListener('mouseenter', () => el.style.background = 'var(--primary-light)');
-        el.addEventListener('mouseleave', () => el.style.background = 'transparent');
-        el.addEventListener('click', function () {
+        el.className = 'menu-item';
+
+        if (item.icon) {
+            const iconSpan = document.createElement('span');
+            iconSpan.textContent = item.icon;
+            el.appendChild(iconSpan);
+        }
+
+        const textSpan = document.createElement('span');
+        textSpan.textContent = item.label;
+        el.appendChild(textSpan);
+
+        if (item.shortcut) {
+            const scSpan = document.createElement('span');
+            scSpan.className = 'shortcut';
+            scSpan.textContent = item.shortcut;
+            el.appendChild(scSpan);
+        }
+
+        el.addEventListener('click', function (e) {
+            e.stopPropagation();
             item.action();
             removeContextMenu();
         });
@@ -456,7 +810,15 @@ function showContextMenu(event, items) {
     });
 
     document.body.appendChild(menu);
-    setTimeout(() => document.addEventListener('click', removeContextMenu, { once: true }), 0);
+
+    // Dismiss on any click outside
+    setTimeout(function () {
+        document.addEventListener('click', function dismiss(e) {
+            if (!document.getElementById('schematic-context-menu')) return;
+            removeContextMenu();
+            document.removeEventListener('click', dismiss);
+        }, { once: true });
+    }, 0);
 }
 
 function removeContextMenu() {
@@ -466,25 +828,25 @@ function removeContextMenu() {
 
 function showModuleContextMenu(event, moduleDatum) {
     showContextMenu(event, [
-        { label: 'Add Connector', action: () => addConnectorPrompt(moduleDatum) },
-        { label: 'Rename', action: () => renameModulePrompt(moduleDatum) },
-        { label: 'Delete', action: () => deleteModuleConfirm(moduleDatum) },
+        { icon: '\u2795', label: 'Add Connector', action: function () { addConnectorPrompt(moduleDatum); }, shortcut: 'N' },
+        { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renameModulePrompt(moduleDatum); } },
+        { icon: '\u274C', label: 'Delete', action: function () { deleteModuleConfirm(moduleDatum); }, shortcut: 'Del' },
     ]);
 }
 
 function showConnectorContextMenu(event, connectorDatum) {
     showContextMenu(event, [
-        { label: 'Reorder Pins', action: () => openPinOrderDialog(connectorDatum) },
-        { label: 'Add Pin', action: () => addPinPrompt(connectorDatum) },
-        { label: 'Rename', action: () => renameConnectorPrompt(connectorDatum) },
-        { label: 'Delete', action: () => deleteConnectorConfirm(connectorDatum) },
+        { icon: '\uD83D\uDD04', label: 'Reorder Pins', action: function () { openPinOrderDialog(connectorDatum); } },
+        { icon: '\u2795', label: 'Add Pin', action: function () { addPinPrompt(connectorDatum); }, shortcut: 'N' },
+        { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renameConnectorPrompt(connectorDatum); } },
+        { icon: '\u274C', label: 'Delete', action: function () { deleteConnectorConfirm(connectorDatum); }, shortcut: 'Del' },
     ]);
 }
 
 function showPinContextMenu(event, pinDatum, connectorDatum) {
     showContextMenu(event, [
-        { label: 'Rename', action: () => renamePinPrompt(pinDatum) },
-        { label: 'Delete', action: () => deletePinConfirm(pinDatum) },
+        { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renamePinPrompt(pinDatum); } },
+        { icon: '\u274C', label: 'Delete', action: function () { deletePinConfirm(pinDatum); }, shortcut: 'Del' },
     ]);
 }
 
@@ -657,6 +1019,9 @@ function redrawConnectorsFor(movedModule) {
     const pinLookup = buildPinLookup(sceneData);
     g.select('.interfaces-layer').remove();
     renderInterfaces(sceneData, pinLookup, true);
+    // Also update subsystem halos dynamically
+    g.select('.subsystem-halos').remove();
+    renderSubsystemHalos(sceneData);
 }
 
 // ---------------------------------------------------------------------
@@ -735,145 +1100,85 @@ function triggerSaveLayout() {
     bridge.save_connector_positions(JSON.stringify(connectorPositions));
 }
 
-
-
-function getConnectorBounds(side, moduleRect, connW, connH, cornerOffset = CORNER_OFFSET) {
-  if (side === 'top' || side === 'bottom') {
-    return [moduleRect.x + cornerOffset,
-            moduleRect.x + moduleRect.width - connW - cornerOffset];
-  }
-  return [moduleRect.y + cornerOffset,
-          moduleRect.y + moduleRect.height - connH - cornerOffset];
-}
-
-function getFixedPosition(side, axisVal, moduleRect, connW, connH, margin = CONNECTOR_MARGIN) {
-  switch (side) {
-    case 'top':    return { x: axisVal, y: moduleRect.y - connH - margin };
-    case 'bottom': return { x: axisVal, y: moduleRect.y + moduleRect.height + margin };
-    case 'left':   return { x: moduleRect.x - connW - margin, y: axisVal };
-    case 'right':  return { x: moduleRect.x + moduleRect.width + margin, y: axisVal };
-  }
-}
-
-function getNeighborSide(side, atMax) {
-  const map = {
-    top:    atMax ? 'right' : 'left',
-    bottom: atMax ? 'right' : 'left',
-    left:   atMax ? 'bottom' : 'top',
-    right:  atMax ? 'bottom' : 'top',
-  };
-  return map[side];
-}
-
-
 function enableConnectorSideDrag(group, c, module) {
-    let switchTimer = null;
+    const dragState = { currentSide: normalizeSide(c.side) };
 
     group.call(d3.drag()
         .on('start', function (event) {
             event.sourceEvent.stopPropagation();
-            clearTimeout(switchTimer);
+            dragState.currentSide = normalizeSide(c.side);
         })
         .on('drag', function (event) {
-            clearTimeout(switchTimer);
-
             const w = Math.max(MODULE_MIN_WIDTH, module.width);
             const h = Math.max(MODULE_MIN_HEIGHT, module.height);
-            const side = normalizeSide(c.side);
-            const isHoriz = (side === 'top' || side === 'bottom');
 
-            // محاسبه fraction و clamp
-            let t = isHoriz
-                ? Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, event.x / w))
-                : Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, event.y / h));
+            // event.sourceEvent gives us the raw pointer event.
+            // We need the pointer position in MODULE-LOCAL coordinates.
+            // The module group has transform translate(module.x, module.y),
+            // and the SVG has a zoom transform. Use d3.pointer with the
+            // module's parent group (scene-root) to get scene coords,
+            // then subtract module position to get module-local coords.
+            const sceneCoords = d3.pointer(event.sourceEvent, g.node());
+            const mx = sceneCoords[0] - module.x; // module-local X
+            const my = sceneCoords[1] - module.y; // module-local Y
 
-            const fraction = isHoriz ? event.x / w : event.y / h;
+            // Determine closest side based on which edge the pointer is nearest to
+            let newSide;
+            const dx = mx - w / 2;
+            const dy = my - h / 2;
+            const absDx = Math.abs(dx);
+            const absDy = Math.abs(dy);
 
-            // بررسی نزدیکی به گوشه → side switch
-            if (fraction < EDGE_THRESHOLD || fraction > 1 - EDGE_THRESHOLD) {
-                const newSide = NEIGHBOR[side];
-                switchTimer = setTimeout(() => performSideSwitch(c, newSide), SIDE_SWITCH_DELAY_MS);
+            if (absDx / w > absDy / h) {
+                newSide = dx > 0 ? 'right' : 'left';
+            } else {
+                newSide = dy > 0 ? 'bottom' : 'top';
             }
 
-            // به‌روزرسانی مختصات روی edge فعلی
-            const ep = edgePoint(module, side, t);
-            const n  = SIDE_AXIS[side].normal;
+            // Compute fraction along the new edge, clamped to avoid corners
+            let t;
+            if (newSide === 'top' || newSide === 'bottom') {
+                t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, mx / w));
+            } else {
+                t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, my / h));
+            }
+
+            // Update connector side and position
+            c.side = newSide;
+            dragState.currentSide = newSide;
+
+            const ep = edgePoint(module, newSide, t);
+            const n = SIDE_AXIS[newSide].normal;
             c.x = ep.x + n.x * CONNECTOR_MARGIN;
             c.y = ep.y + n.y * CONNECTOR_MARGIN;
 
-            // آپدیت مستقیم SVG (بدون re-render کامل)
+            // Update SVG directly (no full re-render)
+            const edge = connectorEdgeAnchor(module, c);
             group.select('.connector-line')
-                .attr('x1', connectorEdgeAnchor(module, c).x)
-                .attr('y1', connectorEdgeAnchor(module, c).y)
+                .attr('x1', edge.x).attr('y1', edge.y)
                 .attr('x2', c.x).attr('y2', c.y);
             group.select('.connector-drag-handle')
                 .attr('cx', c.x).attr('cy', c.y);
 
-            // آپدیت wire‌ها
+            // Update bounding box
+            const bbox = connectorBBox(module, c);
+            group.select('.connector-bbox')
+                .attr('x', bbox.x).attr('y', bbox.y)
+                .attr('width', bbox.w).attr('height', bbox.h);
+
+            // Update wires
             redrawConnectorsFor(module);
         })
         .on('end', function () {
-            clearTimeout(switchTimer);
-            if (bridge)
-                bridge.save_connector_positions(JSON.stringify({ [c.id]: { x: c.x, y: c.y } }));
+            if (bridge) {
+                // save_connector_positions now persists both x, y AND side in one call
+                bridge.save_connector_positions(JSON.stringify(
+                    { [c.id]: { x: c.x, y: c.y, side: dragState.currentSide } }
+                ));
+            }
             render(sceneData);
         })
     );
-}
-
-
-// schematic_render.js — اضافه کردن به انتهای فایل
-
-function performSideSwitch(c, newSide) {
-    const module = sceneData.modules.find(m => String(m.id) === String(c.module_id));
-    if (!module) return;
-
-    const w = Math.max(MODULE_MIN_WIDTH, module.width);
-    const h = Math.max(MODULE_MIN_HEIGHT, module.height);
-    const oldSide = normalizeSide(c.side);
-
-    // محاسبه fraction روی edge قدیمی
-    let t;
-    if (oldSide === 'left' || oldSide === 'right') t = c.y / h;
-    else t = c.x / w;
-    t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, t));
-
-    const newSideNorm = normalizeSide(newSide);
-    const ep = edgePoint(module, newSideNorm, t);
-    const n  = SIDE_AXIS[newSideNorm].normal;
-
-    c.side = newSideNorm;
-    c.x = ep.x + n.x * CONNECTOR_MARGIN;
-    c.y = ep.y + n.y * CONNECTOR_MARGIN;
-
-    render(sceneData);
-    persistCurrentRoutes();
-
-    if (bridge) {
-        bridge.set_connector_side(c.id, newSideNorm);
-        bridge.save_connector_positions(JSON.stringify({ [c.id]: { x: c.x, y: c.y } }));
-    }
-}
-
-function computeConnectorFraction(c, module, side) {
-    const w = Math.max(MODULE_MIN_WIDTH, module.width || 0);
-    const h = Math.max(MODULE_MIN_HEIGHT, module.height || 0);
-    if (side === 'top' || side === 'bottom') {
-        return w > 0 ? Math.min(1, Math.max(0, c.x / w)) : 0.5;
-    } else {
-        return h > 0 ? Math.min(1, Math.max(0, c.y / h)) : 0.5;
-    }
-}
-
-function computeConnectorTip(module, side, fraction) {
-    const w = Math.max(MODULE_MIN_WIDTH, module.width || 0);
-    const h = Math.max(MODULE_MIN_HEIGHT, module.height || 0);
-    const normal = SIDE_AXIS[side].normal;
-    const ep = edgePoint(module, side, fraction);  // نقطه روی مرز module
-    return {
-        x: ep.x + normal.x * CONNECTOR_STUB,
-        y: ep.y + normal.y * CONNECTOR_STUB
-    };
 }
 
 

@@ -34,12 +34,46 @@ from typing import Dict, List, Any, Optional, Tuple
 from database import get_connection, get_current_project_id, get_complete_layout
 
 # Matches the defaults actually used in schematic_graphics.py's ModuleGraphics(...)
-DEFAULT_MODULE_WIDTH = 300.0
-DEFAULT_MODULE_HEIGHT = 200.0
+DEFAULT_MODULE_WIDTH = 160.0
+DEFAULT_MODULE_HEIGHT = 100.0
 GRID_MARGIN = 40.0
-GRID_CELL_W = 360.0
-GRID_CELL_H = 260.0
+GRID_CELL_W = 380.0
+GRID_CELL_H = 280.0
 GRID_COLUMNS = 4
+
+
+
+# Distinct colors for subsystems (matches tree view visual hierarchy)
+SUBSYSTEM_COLORS = [
+    "#e67e22",  # orange (matches tree view module color)
+    "#3a7bd5",  # blue
+    "#27ae60",  # green
+    "#9b59b6",  # purple
+    "#e74c3c",  # red
+    "#1abc9c",  # teal
+    "#f39c12",  # amber
+    "#3498db",  # sky blue
+    "#2ecc71",  # emerald
+    "#8e44ad",  # dark purple
+    "#d35400",  # burnt orange
+    "#16a085",  # dark teal
+]
+
+# Semi-transparent versions for subsystem halos
+SUBSYSTEM_HALO_COLORS = [
+    "rgba(230, 126, 34, 0.08)",   # orange (matches tree view module color)
+    "rgba(58, 123, 213, 0.08)",   # blue
+    "rgba(39, 174, 96, 0.08)",    # green
+    "rgba(155, 89, 182, 0.08)",   # purple
+    "rgba(231, 76, 60, 0.08)",    # red
+    "rgba(26, 188, 156, 0.08)",   # teal
+    "rgba(243, 156, 18, 0.08)",   # amber
+    "rgba(52, 152, 219, 0.08)",   # sky blue
+    "rgba(46, 204, 113, 0.08)",   # emerald
+    "rgba(142, 68, 173, 0.08)",   # dark purple
+    "rgba(211, 84, 0, 0.08)",     # burnt orange
+    "rgba(22, 160, 133, 0.08)",   # dark teal
+]
 
 
 def _grid_fallback_position(index: int) -> Tuple[float, float]:
@@ -55,30 +89,26 @@ def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, An
     for the current project and return a JSON-serializable dict:
 
     {
+      "subsystems": [
+        {"id": 1, "name": "OBC", "color_index": 0},
+        ...
+      ],
       "modules": [
         {"id": 1, "name": "OBC", "x": 40.0, "y": 40.0,
          "width": 300.0, "height": 200.0,
-         "color": "#3a7bd5", "mass": 1.2, "power": 5.0},
+         "color": "#3a7bd5", "subsystem_id": 1,
+         "mass": 1.2, "power": 5.0},
         ...
       ],
-      "connectors": [
-        {"id": 10, "module_id": 1, "name": "J1", "side": "left",
-         "color": "#5b8def",
-         "pins": [{"id": 100, "name": "PIN1"}, ...]},
-        ...
-      ],
-      "interfaces": [
-        {"id": 500, "from_pin": 100, "to_pin": 200, "color": "#5b8def",
-         "points": [[x1, y1], [x2, y2]], "manual_override": true, "locked": false},
-        ...
-      ]
+      "connectors": [ ... ],
+      "interfaces": [ ... ]
     }
 
     If module_ids is given, only those modules (and their connectors/pins/
     interfaces between them) are included; otherwise the whole project
     scene is loaded.
     """
-    scene: Dict[str, Any] = {"modules": [], "connectors": [], "interfaces": []}
+    scene: Dict[str, Any] = {"subsystems": [], "modules": [], "connectors": [], "interfaces": []}
 
     project_id = get_current_project_id()
     if project_id is None:
@@ -87,9 +117,26 @@ def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, An
     with get_connection() as conn:
         cur = conn.cursor()
 
+        # ---------------- Subsystems ----------------
+        cur.execute(
+            "SELECT id, name FROM subsystems WHERE project_id = %s ORDER BY name",
+            (project_id,),
+        )
+        subsystem_rows = cur.fetchall()
+        subsystem_map = {}  # subsystem_id -> index into color list
+        for idx, (ss_id, ss_name) in enumerate(subsystem_rows):
+            color_idx = idx % len(SUBSYSTEM_COLORS)
+            subsystem_map[ss_id] = color_idx
+            scene["subsystems"].append({
+                "id": ss_id,
+                "name": ss_name,
+                "color": SUBSYSTEM_COLORS[color_idx],
+                "halo_color": SUBSYSTEM_HALO_COLORS[color_idx],
+            })
+
         # ---------------- Modules ----------------
         query = (
-            "SELECT id, name, color, mass, power, pos_x, pos_y, width, height "
+            "SELECT id, name, color, mass, power, pos_x, pos_y, width, height, subsystem_id "
             "FROM modules WHERE project_id = %s"
         )
         params: tuple = (project_id,)
@@ -104,7 +151,7 @@ def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, An
         if not module_id_list:
             return scene
 
-        # ---------------- Connectors (needed before get_complete_layout) ----------------
+        # ---------------- Connectors ---------------
         placeholders = ",".join(["%s"] * len(module_id_list))
         cur.execute(
             f"SELECT id, module_id, name, color, side FROM connectors "
@@ -113,6 +160,21 @@ def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, An
         )
         connector_rows = cur.fetchall()
         connector_id_list = [row[0] for row in connector_rows]
+
+        # Fetch pins for all these connectors
+        pin_data_by_connector = {}
+        if connector_id_list:
+            conn_ph = ",".join(["%s"] * len(connector_id_list))
+            cur.execute(
+                f"SELECT id, connector_id, name FROM pins "
+                f"WHERE connector_id IN ({conn_ph}) AND project_id = %s ORDER BY pin_number",
+                (*connector_id_list, project_id),
+            )
+            for pin_id, conn_id, pin_name in cur.fetchall():
+                pin_data_by_connector.setdefault(conn_id, []).append({
+                    "id": pin_id,
+                    "name": pin_name,
+                })
 
         # ---------------- Interfaces between the visible modules ----------------
         interface_id_list: List[int] = []
@@ -142,38 +204,60 @@ def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, An
 
         # ---------------- Assemble modules ----------------
         for idx, row in enumerate(module_rows):
-            mod_id, name, color, mass, power, pos_x, pos_y, width, height = row
+            mod_id, name, color, mass, power, pos_x, pos_y, width, height, subsystem_id = row
 
-            saved_pos = saved_module_positions.get(mod_id) if saved_module_positions else None
-            if saved_pos:
-                x, y = float(saved_pos[0]), float(saved_pos[1])
-                width = saved_pos[2] or width
-                height = saved_pos[3] or height
-            elif pos_x is not None and pos_y is not None:
+            # Use DB width/height directly — no auto-sizing from connectors.
+            # Connector sizes are determined purely by pin count in the JS renderer.
+            effective_w = float(width) if width else DEFAULT_MODULE_WIDTH
+            effective_h = float(height) if height else DEFAULT_MODULE_HEIGHT
+
+            # Determine position: prefer raw DB pos_x/pos_y (these are set on
+            # creation AND updated on every drag). Only fall back to grid when
+            # pos_x IS NULL (module never explicitly positioned).
+            if pos_x is not None and pos_y is not None:
                 x, y = float(pos_x), float(pos_y)
+                # If raw DB says (0,0), check saved_layout for a non-zero
+                # override — user could have dragged to (0,0) but it's rare.
+                if x == 0.0 and y == 0.0 and saved_module_positions:
+                    sp = saved_module_positions.get(mod_id)
+                    if sp and (float(sp[0]) != 0.0 or float(sp[1]) != 0.0):
+                        x, y = float(sp[0]), float(sp[1])
+                # Also use saved_layout width/height if present
+                if saved_module_positions:
+                    sp = saved_module_positions.get(mod_id)
+                    if sp:
+                        if sp[2]:
+                            effective_w = float(sp[2])
+                        if sp[3]:
+                            effective_h = float(sp[3])
             else:
+                # pos_x IS NULL — never explicitly positioned, use grid
                 x, y = _grid_fallback_position(idx)
+
+            # Choose a color: use DB color if set, otherwise derive from subsystem
+            if color and color != "#C8C8FF":
+                module_color = color
+            elif subsystem_id and subsystem_id in subsystem_map:
+                module_color = SUBSYSTEM_COLORS[subsystem_map[subsystem_id]]
+            else:
+                module_color = SUBSYSTEM_COLORS[idx % len(SUBSYSTEM_COLORS)]
 
             scene["modules"].append({
                 "id": mod_id,
                 "name": name,
                 "x": x,
                 "y": y,
-                "width": float(width) if width else DEFAULT_MODULE_WIDTH,
-                "height": float(height) if height else DEFAULT_MODULE_HEIGHT,
-                "color": color,
+                "width": effective_w,
+                "height": effective_h,
+                "color": module_color,
+                "subsystem_id": subsystem_id,
                 "mass": mass,
                 "power": power,
             })
 
         # ---------------- Assemble connectors + pins ----------------
         for conn_id, mod_id, name, color, side in connector_rows:
-            cur.execute(
-                "SELECT id, name FROM pins "
-                "WHERE connector_id = %s AND project_id = %s ORDER BY pin_number",
-                (conn_id, project_id),
-            )
-            pin_rows = cur.fetchall()
+            pins = pin_data_by_connector.get(conn_id, [])
 
             saved = saved_connector_positions.get(conn_id) if saved_connector_positions else None
             final_side = (saved[4] if saved and len(saved) > 4 else side) or "top"
@@ -186,15 +270,11 @@ def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, An
                 "side": final_side,
                 "x": float(saved[0]) if saved else None,
                 "y": float(saved[1]) if saved else None,
-                "pins": [{"id": pin_id, "name": pin_name} for pin_id, pin_name in pin_rows],
+                "pins": pins,
             })
 
         # ---------------- Assemble interfaces ----------------
         if interface_id_list:
-            routing_points = saved_interface_points or {}
-            # routing_persistence.load_enhanced_interface_data() gives us
-            # manual_override/locked/version metadata on top of raw points;
-            # reuse it instead of duplicating that parsing here.
             from Schematic_View_tab.routing_persistence import load_enhanced_interface_data
             routing_data = load_enhanced_interface_data(interface_id_list)
 
@@ -245,15 +325,8 @@ def save_module_positions(positions: Dict[int, Dict[str, float]]) -> None:
 def save_connector_positions(positions: Dict[int, Dict[str, float]]) -> None:
     """
     Persist connector positions after a drag in the frontend.
-
-    NOTE: schematic_graphics.py reads connector position/size/side through
-    get_complete_layout()'s connector_positions dict, which is a *separate*
-    saved-layout table (not columns directly on `connectors`), the same way
-    interface routing lives in interface_points rather than on Interfaces.
-    This function assumes a parallel helper already exists for writing that
-    table (mirroring how routing_persistence.py writes interface_points).
-    TODO verify: point this at the real connector-layout persistence
-    function/table used by get_complete_layout() instead of a raw UPDATE.
+    Each entry can include x, y, and optionally side.
+    Example: {1: {'x': 100, 'y': 50, 'side': 'right'}}
     """
     project_id = get_current_project_id()
     if project_id is None or not positions:
@@ -262,28 +335,30 @@ def save_connector_positions(positions: Dict[int, Dict[str, float]]) -> None:
     with get_connection() as conn:
         cur = conn.cursor()
         for conn_id, pos in positions.items():
-            cur.execute(
-                "UPDATE connectors SET pos_x = %s, pos_y = %s "
-                "WHERE id = %s AND project_id = %s",
-                (pos["x"], pos["y"], conn_id, project_id),
-            )
+            side = pos.get("side")
+            if side:
+                cur.execute(
+                    "UPDATE connectors SET pos_x = %s, pos_y = %s, side = %s "
+                    "WHERE id = %s AND project_id = %s",
+                    (pos["x"], pos["y"], side, conn_id, project_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE connectors SET pos_x = %s, pos_y = %s "
+                    "WHERE id = %s AND project_id = %s",
+                    (pos["x"], pos["y"], conn_id, project_id),
+                )
         conn.commit()
 
 
 def create_interface(pin1_id: int, pin2_id: int, color: Optional[str] = None) -> Optional[int]:
-    """
-    Create a new Interfaces row connecting two pins. Returns the new
-    interface id, or None if the project context is missing or the pins
-    are already connected.
-    """
+    """Create a new Interfaces row connecting two pins."""
     project_id = get_current_project_id()
     if project_id is None or pin1_id == pin2_id:
         return None
 
     with get_connection() as conn:
         cur = conn.cursor()
-
-        # Avoid duplicate connections between the same two pins (either order).
         cur.execute(
             "SELECT id FROM Interfaces WHERE project_id = %s "
             "AND ((pin1_id = %s AND pin2_id = %s) OR (pin1_id = %s AND pin2_id = %s))",
@@ -323,17 +398,13 @@ def delete_interface(interface_id: int) -> None:
 
 
 def delete_module(module_id: int) -> None:
-    """
-    Delete a module and everything that hangs off it: its connectors, their
-    pins, and any interface touching those pins.
-    """
+    """Delete a module and everything that hangs off it."""
     project_id = get_current_project_id()
     if project_id is None:
         return
 
     with get_connection() as conn:
         cur = conn.cursor()
-
         cur.execute(
             "SELECT id FROM pins WHERE connector_id IN "
             "(SELECT id FROM connectors WHERE module_id = %s AND project_id = %s)",
@@ -407,6 +478,7 @@ def create_connector(module_id: int, name: str, side: str = "top",
     project_id = get_current_project_id()
     if project_id is None or not name.strip():
         return None
+    VALID_SIDES = {"left", "right", "top", "bottom"}
     if side not in VALID_SIDES:
         side = "top"
 
@@ -436,6 +508,7 @@ def rename_connector(connector_id: int, new_name: str) -> None:
 
 
 def set_connector_side(connector_id: int, side: str) -> None:
+    VALID_SIDES = {"left", "right", "top", "bottom"}
     project_id = get_current_project_id()
     if project_id is None or side not in VALID_SIDES:
         return
@@ -550,12 +623,7 @@ def delete_pin(pin_id: int) -> None:
 
 
 def reorder_pins(connector_id: int, new_order: List[str]) -> None:
-    """
-    Renumber a connector's pins to match new_order (a list of pin *names*
-    in their new display order). Direct port of
-    EditablePinOrderMixin._update_pin_order_in_database() from
-    connector_pin_graphics.py -- same matching-by-name, same query.
-    """
+    """Renumber a connector's pins to match new_order (a list of pin *names*)."""
     project_id = get_current_project_id()
     if project_id is None or not new_order:
         return
