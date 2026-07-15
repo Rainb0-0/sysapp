@@ -26,24 +26,26 @@ let toastCount = 0;
 const MODULE_MIN_WIDTH = 120;
 const MODULE_MIN_HEIGHT = 60;
 const PIN_RADIUS = 7;      // larger hitbox for easier pin-to-pin dragging
-const PIN_HOVER_RADIUS = 11;
-const CONNECTOR_STUB = 30;  // length of connector stub from module edge to tip
+// const PIN_HOVER_RADIUS = 11;
+const CONNECTOR_STUB = 8;  // distance from module edge to connector tip (diamond)
+const PIN_EDGE_OFFSET = 24;  // distance from module edge to pin body midpoint
 
 // Corner offset to avoid placing connectors too close to corners
 const CORNER_OFFSET = 0.08;
-const CONNECTOR_MARGIN = 34; // distance from module edge to connector tip (pins live here)
-const PIN_HALF_STEP = 10;  // half the distance between adjacent pins (full step = 20px)
+const CONNECTOR_MARGIN = CONNECTOR_STUB; // alias (kept for backward compat, use CONNECTOR_STUB or PIN_EDGE_OFFSET directly)
+const PIN_HALF_STEP = 14;  // half-step between adjacent pins (full step = 28px) — increase to space out pin labels more
 const CONNECTOR_GAP = 12;  // minimum gap between connector edges on same side
 const CONNECTOR_BBOX_PAD = 8; // extra padding around connector bounding box
+const EDGE_MARGIN = 8; // min distance from edge corners for connector placement
 
 
 // Real DB side values are 'left' | 'right' | 'top' | 'bottom' (default 'top').
 // normal = direction the stub sticks out; tangent = direction pins spread along the stub.
 const SIDE_AXIS = {
-    left:   { normal: { x: -1, y: 0 }, tangent: { x: 0, y: 1 } },
-    right:  { normal: { x: 1, y: 0 },  tangent: { x: 0, y: 1 } },
-    top:    { normal: { x: 0, y: -1 }, tangent: { x: 1, y: 0 } },
-    bottom: { normal: { x: 0, y: 1 },  tangent: { x: 1, y: 0 } },
+    left: { normal: { x: -1, y: 0 }, tangent: { x: 0, y: 1 } },
+    right: { normal: { x: 1, y: 0 }, tangent: { x: 0, y: 1 } },
+    top: { normal: { x: 0, y: -1 }, tangent: { x: 1, y: 0 } },
+    bottom: { normal: { x: 0, y: 1 }, tangent: { x: 1, y: 0 } },
 };
 
 function normalizeSide(side) {
@@ -56,11 +58,11 @@ function edgePoint(module, side, t) {
     const w = Math.max(MODULE_MIN_WIDTH, module.width);
     const h = Math.max(MODULE_MIN_HEIGHT, module.height);
     switch (normalizeSide(side)) {
-        case 'right':  return { x: w, y: t * h };
-        case 'top':    return { x: t * w, y: 0 };
+        case 'right': return { x: w, y: t * h };
+        case 'top': return { x: t * w, y: 0 };
         case 'bottom': return { x: t * w, y: h };
         case 'left':
-        default:       return { x: 0, y: t * h };
+        default: return { x: 0, y: t * h };
     }
 }
 
@@ -72,11 +74,11 @@ function connectorEdgeAnchor(module, c) {
     const w = Math.max(MODULE_MIN_WIDTH, module.width);
     const h = Math.max(MODULE_MIN_HEIGHT, module.height);
     switch (normalizeSide(c.side)) {
-        case 'right':  return { x: w, y: c.y };
-        case 'top':    return { x: c.x, y: 0 };
+        case 'right': return { x: w, y: c.y };
+        case 'top': return { x: c.x, y: 0 };
         case 'bottom': return { x: c.x, y: h };
         case 'left':
-        default:       return { x: 0, y: c.y };
+        default: return { x: 0, y: c.y };
     }
 }
 
@@ -205,13 +207,54 @@ function clearSelection() {
 function render(scene) {
     g.selectAll('*').remove();
 
+    // Normalize module dimensions once to prevent NaN from null/undefined DB values.
+    // Use Number() coercion to catch truthy-but-non-numeric values (e.g. strings).
+    scene.modules.forEach(function (m) {
+        var nw = Number(m.width);
+        m.width = (!isNaN(nw) && nw > 0) ? nw : MODULE_MIN_WIDTH;
+        var nh = Number(m.height);
+        m.height = (!isNaN(nh) && nh > 0) ? nh : MODULE_MIN_HEIGHT;
+        if (typeof m.x !== 'number' || isNaN(m.x)) m.x = 0;
+        if (typeof m.y !== 'number' || isNaN(m.y)) m.y = 0;
+    });
+    // Also normalize connector positions — null from DB becomes a default
+    scene.connectors.forEach(function (c) {
+        if (typeof c.x !== 'number' || isNaN(c.x)) c.x = 0;
+        if (typeof c.y !== 'number' || isNaN(c.y)) c.y = 0;
+    });
+
+    // Auto-grow modules so all connectors fit without overlap
+    autoSizeModules(scene);
+
     assignFallbackConnectorPositions(scene);
+
+    // Second-pass safety net: catch any connector that still has NaN after
+    // assignFallbackConnectorPositions (e.g. orphaned connectors whose module
+    // was filtered out). These would otherwise produce SVG NaN errors.
+    scene.connectors.forEach(function (c) {
+        if (typeof c.x !== 'number' || isNaN(c.x) || typeof c.y !== 'number' || isNaN(c.y)) {
+            if (c.module_id != null) {
+                // Try to find the module and put the connector at a default position
+                var m = scene.modules.find(function (m) { return String(m.id) === String(c.module_id); });
+                if (m) {
+                    var normSide = normalizeSide(c.side);
+                    var ep = edgePoint(m, normSide, 0.5);
+                    var nml = SIDE_AXIS[normSide].normal;
+                    c.x = ep.x + nml.x * CONNECTOR_STUB;
+                    c.y = ep.y + nml.y * CONNECTOR_STUB;
+                }
+            }
+        }
+        if (typeof c.x !== 'number' || isNaN(c.x)) c.x = 0;
+        if (typeof c.y !== 'number' || isNaN(c.y)) c.y = 0;
+    });
+
     const pinLookup = buildPinLookup(scene);
 
     // Draw subsystem halos first (behind everything)
     renderSubsystemHalos(scene);
 
-    renderInterfaces(scene, pinLookup, false);
+    renderInterfaces(scene, pinLookup, null); // null = recompute all routes on full render
     renderModules(scene);
 
     // Hide loading overlay once we have rendered content
@@ -328,11 +371,67 @@ function connectorEdgeExtent(c, side) {
     return pinSpan * 2 + CONNECTOR_BBOX_PAD * 2;
 }
 
+// Before distributing connectors, auto-grow each module's width/height so
+// all of its connectors fit without overlapping or being squished.
+// Only expands — never shrinks a module below its DB-stored dimension.
+function autoSizeModules(scene) {
+    // Group connectors by module_id
+    var byModule = {};
+    scene.connectors.forEach(function (c) {
+        var key = String(c.module_id);
+        (byModule[key] = byModule[key] || []).push(c);
+    });
+
+    Object.keys(byModule).forEach(function (modId) {
+        var module = scene.modules.find(function (m) { return String(m.id) === modId; });
+        if (!module) return;
+
+        var conns = byModule[modId];
+        var minW = MODULE_MIN_WIDTH;
+        var minH = MODULE_MIN_HEIGHT;
+
+        // Group connectors by side for this module
+        var top = [], bottom = [], left = [], right = [];
+        conns.forEach(function (c) {
+            var side = normalizeSide(c.side);
+            if (side === 'top') top.push(c);
+            else if (side === 'bottom') bottom.push(c);
+            else if (side === 'left') left.push(c);
+            else right.push(c);
+        });
+
+        // Compute minimum width needed for top/bottom connectors
+        [top, bottom].forEach(function (group) {
+            if (group.length < 2) return; // single connector always fits
+            var totalExtents = group.reduce(function (s, c) {
+                return s + connectorEdgeExtent(c, 'top');
+            }, 0);
+            var totalGaps = (group.length - 1) * CONNECTOR_GAP;
+            var needed = totalExtents + totalGaps + EDGE_MARGIN * 2;
+            minW = Math.max(minW, needed);
+        });
+
+        // Compute minimum height needed for left/right connectors
+        [left, right].forEach(function (group) {
+            if (group.length < 2) return;
+            var totalExtents = group.reduce(function (s, c) {
+                return s + connectorEdgeExtent(c, 'left');
+            }, 0);
+            var totalGaps = (group.length - 1) * CONNECTOR_GAP;
+            var needed = totalExtents + totalGaps + EDGE_MARGIN * 2;
+            minH = Math.max(minH, needed);
+        });
+
+        // Set module dimensions to fit connectors (grows AND shrinks as needed)
+        module.width = Math.max(MODULE_MIN_WIDTH, minW);
+        module.height = Math.max(MODULE_MIN_HEIGHT, minH);
+    });
+}
+
 // Distribute connectors along a module edge so they never overlap.
-// For each side of each module, compute the total space needed for all
-// connectors (pin spreads + gaps), then distribute them evenly.
-// Connectors with saved positions keep their position; unsaved ones are
-// placed to fill gaps without overlapping saved ones.
+// ALL connectors are always redistributed — saved positions are cleared
+// when they would cause overlap (e.g. zero/zero from DB or stale after
+// pin add/remove). This ensures proper spacing at all times.
 function assignFallbackConnectorPositions(scene) {
     const bySideModule = {};
     scene.connectors.forEach(function (c) {
@@ -349,32 +448,30 @@ function assignFallbackConnectorPositions(scene) {
         const w = Math.max(MODULE_MIN_WIDTH, module.width);
         const h = Math.max(MODULE_MIN_HEIGHT, module.height);
         const edgeSize = (side === 'top' || side === 'bottom') ? w : h;
-        const edgeMargin = 14; // min distance from edge corners
+        const edgeMargin = EDGE_MARGIN;
 
-        // Build entries with extents for ALL connectors
+        // All connectors are redistributed on every render to ensure
+        // proper spacing. Zero/zero positions from DB are treated as unsaved.
         const entries = group.map(function (c) {
             const extent = connectorEdgeExtent(c, side);
-            const hasSaved = c.x !== null && c.x !== undefined && c.y !== null && c.y !== undefined;
-            return { c: c, extent: extent, hasSaved: hasSaved };
+            return { c: c, extent: extent };
         });
-
-        if (entries.every(function (e) { return e.hasSaved; })) return;
 
         if (entries.length === 1) {
             // Single connector: center it on the edge
             const e = entries[0];
-            if (!e.hasSaved) {
-                const t = 0.5;
-                const edge = edgePoint(module, side, t);
-                const normal = SIDE_AXIS[side].normal;
-                e.c.x = edge.x + normal.x * CONNECTOR_MARGIN;
-                e.c.y = edge.y + normal.y * CONNECTOR_MARGIN;
-            }
+            const t = 0.5;
+            const edge = edgePoint(module, side, t);
+            const normal = SIDE_AXIS[side].normal;
+            e.c.x = edge.x + normal.x * CONNECTOR_STUB;
+            e.c.y = edge.y + normal.y * CONNECTOR_STUB;
             return;
         }
 
-        // Multi-connector: compute total space needed
-        const totalExtents = entries.reduce(function (s, e) { return s + e.extents; }, 0);
+        // Multi-connector: ALWAYS distribute all connectors evenly.
+        // Even connectors with saved positions get repositioned if the
+        // group has changed (pins added/removed).
+        const totalExtents = entries.reduce(function (s, e) { return s + e.extent; }, 0);
         const totalGaps = (entries.length - 1) * CONNECTOR_GAP;
         const totalNeeded = totalExtents + totalGaps + edgeMargin * 2;
 
@@ -396,13 +493,13 @@ function assignFallbackConnectorPositions(scene) {
             // Center of this connector along the edge
             const center = cursor + entry.extent / 2;
 
-            if (!entry.hasSaved) {
-                const t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, center / edgeSize));
-                const edge = edgePoint(module, side, t);
-                const normal = SIDE_AXIS[side].normal;
-                entry.c.x = edge.x + normal.x * CONNECTOR_MARGIN;
-                entry.c.y = edge.y + normal.y * CONNECTOR_MARGIN;
-            }
+            // Always reposition — this handles initial zero/zero positions
+            // AND redistribution after pin add/remove
+            const t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, center / edgeSize));
+            const edge = edgePoint(module, side, t);
+            const normal = SIDE_AXIS[side].normal;
+            entry.c.x = edge.x + normal.x * CONNECTOR_STUB;
+            entry.c.y = edge.y + normal.y * CONNECTOR_STUB;
 
             cursor += entry.extent + actualGap;
         });
@@ -414,10 +511,10 @@ function connectorBodyMidpoint(module, c) {
     const side = normalizeSide(c.side);
     const normal = SIDE_AXIS[side].normal;
     const edge = connectorEdgeAnchor(module, c);
-    // Midpoint is halfway from edge to tip along the normal
+    // Midpoint is at PIN_EDGE_OFFSET from edge along the normal
     return {
-        x: edge.x + normal.x * (CONNECTOR_MARGIN / 2),
-        y: edge.y + normal.y * (CONNECTOR_MARGIN / 2),
+        x: edge.x + normal.x * PIN_EDGE_OFFSET,
+        y: edge.y + normal.y * PIN_EDGE_OFFSET,
     };
 }
 
@@ -517,11 +614,14 @@ function renderModules(scene) {
             .attr('stroke', connectorColor)
             .attr('stroke-width', 2);
 
-        // Visible drag handle at the stub tip
-        connGroup.append('circle')
+        // Visible drag handle at the stub tip — diamond shape to distinguish from pin circles
+        const handleSize = 6;
+        connGroup.append('path')
             .attr('class', 'connector-drag-handle')
-            .attr('cx', c.x).attr('cy', c.y)
-            .attr('r', 5);
+            .attr('d', `M${c.x},${c.y - handleSize} L${c.x + handleSize},${c.y} L${c.x},${c.y + handleSize} L${c.x - handleSize},${c.y} Z`)
+            .attr('fill', '#f39c12')
+            .attr('stroke', '#e67e22')
+            .attr('stroke-width', 1.5);
 
         // Connector name label near the drag handle
         const isHorizSide = (side === 'top' || side === 'bottom');
@@ -548,7 +648,7 @@ function renderModules(scene) {
             .attr('width', bbox.w).attr('height', bbox.h)
             .attr('fill', 'transparent')
             .attr('pointer-events', 'all')
-            .attr('cursor', 'context-menu');
+            .attr('cursor', 'pointer');
 
         // Enable drag-to-reposition along the module edge
         enableConnectorSideDrag(connGroup, c, module);
@@ -683,14 +783,35 @@ function startConnectDrag(pinId, localX, localY, moduleSelection) {
 function finishConnectDrag(toPinId) {
     if (!connectDrag) return;
     const fromPinId = connectDrag.fromPinId;
+    const fromPoint = connectDrag.fromPoint;
     cancelConnectDrag();
 
     if (!bridge || toPinId === fromPinId) return;
-    bridge.create_interface(fromPinId, toPinId, '');
-    // The bridge's create_interface() already triggers get_scene_data()
-    // indirectly via save_finished handling on the Python side is not
-    // required here -- ask explicitly so the new wire shows up immediately.
-    setTimeout(() => bridge.get_scene_data(), 100);
+    const newId = bridge.create_interface(fromPinId, toPinId, '');
+    if (newId > 0) {
+        // Immediately render the new interface so the user sees it right away
+        const pinLookup = buildPinLookup(sceneData);
+        const a = pinLookup[fromPinId];
+        const b = pinLookup[toPinId];
+        if (a && b) {
+            const obstacleRects = sceneData.modules.map(function (m) {
+                return { x: m.x, y: m.y, width: m.width, height: m.height };
+            });
+            const points = computeRoutePoints(a, b, obstacleRects);
+            sceneData.interfaces.push({
+                id: newId,
+                from_pin: fromPinId,
+                to_pin: toPinId,
+                color: '',
+                points: points.slice(),
+            });
+            // Re-render just the interface layer (no full scene rebuild)
+            g.select('.interfaces-layer').remove();
+            renderInterfaces(sceneData, pinLookup, new Set()); // don't reroute anything, use cached points
+        }
+    }
+    // Refresh from DB in background to ensure routing persistence is consistent
+    setTimeout(function () { bridge.get_scene_data(); }, 50);
 }
 
 function cancelConnectDrag() {
@@ -918,16 +1039,27 @@ function openPinOrderDialog(connectorDatum) {
 const ROUTE_MARGIN = 14; // must stay < CONNECTOR_STUB so pins sit outside inflated obstacle rects
 const ROUTE_LEAD = 16;
 
-function renderInterfaces(scene, pinLookup, forceRecompute) {
+// Render interfaces (wires between pins).
+//   movedPinIds: null    → recompute ALL routes (full scene render)
+//   movedPinIds: Set     → only recompute routes touching these pin IDs;
+//                           ALL other interfaces use their cached points.
+//   movedPinIds: empty Set → use cached points for everything.
+function renderInterfaces(scene, pinLookup, movedPinIds) {
     const interfaceGroup = g.append('g').attr('class', 'interfaces-layer');
     const obstacleRects = scene.modules.map(m => ({ x: m.x, y: m.y, width: m.width, height: m.height }));
 
     scene.interfaces.forEach(function (iface) {
-        let points = (!forceRecompute && iface.points && iface.points.length >= 2) ? iface.points : null;
+        // Decide if this interface needs fresh A* routing
+        var needsRecompute = !movedPinIds; // null → full recompute
+        if (movedPinIds && movedPinIds.size > 0) {
+            needsRecompute = movedPinIds.has(iface.from_pin) || movedPinIds.has(iface.to_pin);
+        }
+
+        var points = (!needsRecompute && iface.points && iface.points.length >= 2) ? iface.points : null;
 
         if (!points && iface.from_pin && iface.to_pin) {
-            const a = pinLookup[iface.from_pin];
-            const b = pinLookup[iface.to_pin];
+            var a = pinLookup[iface.from_pin];
+            var b = pinLookup[iface.to_pin];
             if (a && b) {
                 points = computeRoutePoints(a, b, obstacleRects);
             }
@@ -1011,14 +1143,22 @@ function persistCurrentRoutes() {
     }
 }
 
-// Cheap redraw during drag: interface paths that touch this module's pins
-// are re-rendered from the current (in-memory) pin positions. This is a
-// straight-line placeholder -- real orthogonal re-routing during drag is
-// the next increment (schematic_routing.js, ported from smart_connection.py).
+// Redraw interfaces during drag. Only re-routes wires connected to the
+// moved module via A*; all other interfaces keep their cached points.
+// This avoids running expensive A* routing for every wire on every frame.
 function redrawConnectorsFor(movedModule) {
     const pinLookup = buildPinLookup(sceneData);
+
+    // Collect all pin IDs belonging to the module being dragged
+    var movedPinIds = new Set();
+    sceneData.connectors.forEach(function (c) {
+        if (String(c.module_id) === String(movedModule.id)) {
+            c.pins.forEach(function (p) { movedPinIds.add(p.id); });
+        }
+    });
+
     g.select('.interfaces-layer').remove();
-    renderInterfaces(sceneData, pinLookup, true);
+    renderInterfaces(sceneData, pinLookup, movedPinIds);
     // Also update subsystem halos dynamically
     g.select('.subsystem-halos').remove();
     renderSubsystemHalos(sceneData);
@@ -1149,16 +1289,17 @@ function enableConnectorSideDrag(group, c, module) {
 
             const ep = edgePoint(module, newSide, t);
             const n = SIDE_AXIS[newSide].normal;
-            c.x = ep.x + n.x * CONNECTOR_MARGIN;
-            c.y = ep.y + n.y * CONNECTOR_MARGIN;
+            c.x = ep.x + n.x * CONNECTOR_STUB;
+            c.y = ep.y + n.y * CONNECTOR_STUB;
 
             // Update SVG directly (no full re-render)
             const edge = connectorEdgeAnchor(module, c);
             group.select('.connector-line')
                 .attr('x1', edge.x).attr('y1', edge.y)
                 .attr('x2', c.x).attr('y2', c.y);
+            const hs = 6;
             group.select('.connector-drag-handle')
-                .attr('cx', c.x).attr('cy', c.y);
+                .attr('d', `M${c.x},${c.y - hs} L${c.x + hs},${c.y} L${c.x},${c.y + hs} L${c.x - hs},${c.y} Z`);
 
             // Update bounding box
             const bbox = connectorBBox(module, c);
@@ -1177,6 +1318,8 @@ function enableConnectorSideDrag(group, c, module) {
                 ));
             }
             render(sceneData);
+            // Persist fresh route points so wires stay correct until next recompute
+            persistCurrentRoutes();
         })
     );
 }

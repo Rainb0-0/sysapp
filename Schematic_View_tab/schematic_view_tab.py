@@ -164,6 +164,12 @@ class SchematicViewTab(QWidget):
         layout.addWidget(self.add_module_btn)
         layout.addSpacing(30)
 
+        self.fit_view_btn = create_styled_button("Fit View", "normal")
+        self.fit_view_btn.setToolTip("Fit the schematic view to show all content")
+        self.fit_view_btn.clicked.connect(self.fit_view)
+        layout.addWidget(self.fit_view_btn)
+        layout.addSpacing(8)
+
         self.refresh_btn = create_styled_button("Refresh", "normal")
         self.save_layout_btn = create_styled_button("Save Layout", "normal")
         self.refresh_btn.setToolTip("Reload scene from database")
@@ -189,6 +195,7 @@ class SchematicViewTab(QWidget):
         # Disabled until the page finishes loading
         for btn in (
             self.add_module_btn,
+            self.fit_view_btn,
             self.refresh_btn,
             self.save_layout_btn,
             self.export_pdf_btn,
@@ -263,6 +270,7 @@ class SchematicViewTab(QWidget):
         self.page_ready = bool(ok)
         for btn in (
             self.add_module_btn,
+            self.fit_view_btn,
             self.refresh_btn,
             self.save_layout_btn,
             self.export_pdf_btn,
@@ -293,6 +301,12 @@ class SchematicViewTab(QWidget):
         """Ask the page to gather positions and push them through the bridge."""
         self.web_view.page().runJavaScript(
             "if (typeof triggerSaveLayout === 'function') triggerSaveLayout();"
+        )
+
+    def fit_view(self):
+        """Fit the schematic view to show all content."""
+        self.web_view.page().runJavaScript(
+            "if (typeof fitView === 'function') fitView();"
         )
 
     def _get_timestamp(self):
@@ -426,7 +440,9 @@ class SchematicViewTab(QWidget):
             self._pending_pdf_progress = None
 
     # ------------------------------------------------------------------
-    # PNG export (simple grab, same approach as Component_Tree_Window.py)
+    # PNG export — grab the web view, scale down to a sane resolution to
+    # avoid multi-MB files from high-DPI screen grabs, then save with
+    # maximum zlib compression (quality=100 for lossless PNG).
     # ------------------------------------------------------------------
     def export_to_png(self):
         file_path, _ = QFileDialog.getSaveFileName(
@@ -444,8 +460,20 @@ class SchematicViewTab(QWidget):
         progress.setValue(30)
 
         pixmap = self.web_view.grab()
+        progress.setValue(60)
+
+        # Scale down if the grab is very large (happens on high-DPI displays)
+        # Limit longest side to 2400px — enough for crisp text, much smaller files.
+        MAX_DIM = 2400
+        if pixmap.width() > MAX_DIM or pixmap.height() > MAX_DIM:
+            pixmap = pixmap.scaled(
+                MAX_DIM, MAX_DIM,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
         progress.setValue(80)
 
+        # For PNG in Qt, higher quality = better zlib compression (smaller file)
         if not pixmap.save(file_path, "PNG", 100):
             progress.close()
             QMessageBox.critical(self, "PNG Export Error", "Failed to save PNG file.")

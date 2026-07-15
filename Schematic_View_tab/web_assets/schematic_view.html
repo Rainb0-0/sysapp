@@ -68,10 +68,12 @@
   .connector-line:hover { stroke-width: 2.5; }
 
   .connector-drag-handle {
-    fill: var(--accent); opacity: 0.7; cursor: grab; stroke: none;
-    transition: opacity 0.15s ease, r 0.15s ease;
+    opacity: 0.85; cursor: grab;
+    transition: opacity 0.15s ease, transform 0.15s ease;
+    transform-box: fill-box;
+    transform-origin: center;
   }
-  .connector-drag-handle:hover { opacity: 1; r: 7; }
+  .connector-drag-handle:hover { opacity: 1; }
   .connector-interactive {
     cursor: context-menu;
   }
@@ -79,11 +81,7 @@
   /* ========= Pin Styles ========= */
   .pin-circle {
     fill: var(--accent); stroke: var(--primary-dark); stroke-width: 1.5;
-    cursor: crosshair; transition: r 0.12s ease, stroke-width 0.12s ease;
-  }
-  .pin-circle:hover {
-    stroke: var(--accent); stroke-width: 2.5; r: 11;
-    filter: drop-shadow(0 0 4px rgba(91, 141, 239, 0.5));
+    cursor: crosshair;
   }
   .pin-label {
     fill: var(--text-primary); font-size: 9px; pointer-events: none;
