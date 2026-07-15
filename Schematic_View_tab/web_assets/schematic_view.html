@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Schematic View</title>
+<style>
+  :root {
+    /* Fallback colors -- overwritten live once the bridge's theme_changed
+       signal fires (see updateThemeColors() in schematic_render.js), same
+       pattern Component_Tree_Window.py already uses. */
+    --primary-dark: #1e1e2e;
+    --primary-light: #3a3a52;
+    --accent: #5b8def;
+    --text-primary: #e8e8f0;
+  }
+
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
+    background: var(--primary-dark);
+    font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+  }
+
+  #scene-container { width: 100%; height: 100%; position: relative; }
+
+  svg { width: 100%; height: 100%; display: block; cursor: grab; }
+  svg:active { cursor: grabbing; }
+
+  .module-box { cursor: move; }
+  .module-rect { stroke: var(--primary-light); stroke-width: 1.5; }
+  .module-box.selected .module-rect { stroke: var(--accent); stroke-width: 2.5; }
+  .module-label {
+    fill: var(--text-primary); font-size: 13px; font-weight: 600;
+    pointer-events: none; text-anchor: middle; dominant-baseline: middle;
+  }
+
+  .connector-line {
+    stroke: var(--primary-light); stroke-width: 1.5; fill: none;
+    cursor: context-menu; pointer-events: stroke;
+  }
+
+  .connector-drag-handle {
+    fill: #4a9eff;
+    opacity: 0.5;
+    cursor: grab;
+    stroke: none;
+}
+.connector-drag-handle:hover { opacity: 0.9; }
+.connector-group { cursor: default; }
+
+
+  .pin-circle { fill: var(--accent); stroke: var(--primary-dark); stroke-width: 1; cursor: crosshair; }
+  .pin-circle:hover { stroke: var(--accent); stroke-width: 2; r: 6; }
+  .pin-label {
+    fill: var(--text-primary); font-size: 9px; pointer-events: none;
+  }
+
+  .interface-path {
+    fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0.85;
+    cursor: pointer; pointer-events: stroke;
+  }
+  .interface-path.selected { stroke-width: 3.5; opacity: 1; }
+
+  #zoom-info {
+    position: absolute; top: 8px; right: 12px;
+    color: var(--text-primary); background: rgba(0, 0, 0, 0.35);
+    padding: 4px 10px; border-radius: 6px; font-size: 12px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <div id="scene-container">
+    <svg id="schematic-svg"></svg>
+    <div id="zoom-info">Zoom: 100%</div>
+  </div>
+
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="d3.min.js"></script>
+  <script src="schematic_routing.js"></script>
+  <script src="schematic_render.js"></script>
+</body>
+</html>
