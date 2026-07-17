@@ -356,6 +356,15 @@ class ModuleGraphics(QGraphicsPathItem):
             self.updatePath()
             self._update_connectors_during_resize()
             
+            # Save module size to database after resize
+            if hasattr(self, 'db_id') and self.db_id is not None:
+                from Schematic_View_tab.schematic_scene_model import save_module_size
+                save_module_size(
+                    self.db_id,
+                    round(self._rect.width(), 1),
+                    round(self._rect.height(), 1)
+                )
+            
             self.setCursor(Qt.ArrowCursor)
             event.accept()
             

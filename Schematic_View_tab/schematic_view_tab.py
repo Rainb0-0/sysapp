@@ -54,6 +54,86 @@ from styles.theme_manager import theme_manager
 from Schematic_View_tab.schematic_bridge import SchematicBridge
 from Schematic_View_tab.schematic_tree_selector import SchematicTreeSelector
 
+# ---------------------------------------------------------------------------
+# Grid layout constants for auto-positioning new modules (mirrors
+# schematic_scene_model.py to avoid circular imports).
+# ---------------------------------------------------------------------------
+_GRID_MARGIN = 40.0
+_GRID_CELL_W = 380.0
+_GRID_CELL_H = 280.0
+_GRID_COLUMNS = 4
+_DEFAULT_MODULE_W = 160.0
+_DEFAULT_MODULE_H = 100.0
+
+
+def _place_module_without_overlap(module_id: int, module_name: str):
+    """
+    Find a grid-aligned position that does NOT overlap any existing module
+    in the current project, then update the module's pos_x/pos_y in the DB.
+    Uses the same grid layout as _grid_fallback_position() in
+    schematic_scene_model.py.
+    """
+    from database import get_connection, get_current_project_id
+
+    project_id = get_current_project_id()
+    if project_id is None:
+        return
+
+    # Load bounding boxes of all existing modules
+    existing = []  # list of (x, y, w, h)
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT pos_x, pos_y, width, height FROM modules "
+                "WHERE project_id = %s AND id != %s AND pos_x IS NOT NULL",
+                (project_id, module_id),
+            )
+            for row in cur.fetchall():
+                rx, ry, rw, rh = row
+                if rx is not None and ry is not None:
+                    existing.append((float(rx), float(ry), float(rw or _DEFAULT_MODULE_W), float(rh or _DEFAULT_MODULE_H)))
+    except Exception:
+        existing = []
+
+    def _rects_overlap(ax, ay, aw, ah, bx, by, bw, bh):
+        """Return True if two axis-aligned rectangles overlap (with 10px margin)."""
+        M = 10
+        return not (ax + aw + M <= bx or bx + bw + M <= ax or ay + ah + M <= by or by + bh + M <= ay)
+
+    # Try grid positions in order
+    best_x, best_y = _GRID_MARGIN, _GRID_MARGIN
+    found = False
+    for row in range(50):  # limit to 50 rows
+        for col in range(_GRID_COLUMNS):
+            cx = _GRID_MARGIN + col * _GRID_CELL_W
+            cy = _GRID_MARGIN + row * _GRID_CELL_H
+
+            # Check against all existing modules
+            overlap = False
+            for ex, ey, ew, eh in existing:
+                if _rects_overlap(cx, cy, _DEFAULT_MODULE_W, _DEFAULT_MODULE_H, ex, ey, ew, eh):
+                    overlap = True
+                    break
+
+            if not overlap:
+                best_x, best_y = cx, cy
+                found = True
+                break
+        if found:
+            break
+
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE modules SET pos_x = %s, pos_y = %s WHERE id = %s AND project_id = %s",
+                (best_x, best_y, module_id, project_id),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
 
 class SchematicViewTab(QWidget):
     """New web-based schematic view tab (Python data + JS/SVG rendering)."""
@@ -124,13 +204,16 @@ class SchematicViewTab(QWidget):
         """
         checked_ids comes from SchematicTreeSelector.get_checked_ids():
           {'subsystems': [...], 'modules': [...], 'connectors': [...], 'pins': [...]}
-        An empty 'modules' list means "show everything" (see
-        SchematicBridge.set_module_selection).
+        Passes the full selection to the bridge so it can filter modules,
+        connectors, and pins in the scene.
         """
         import json
 
-        module_ids = checked_ids.get("modules", [])
-        self.bridge.set_module_selection(json.dumps(module_ids))
+        self.bridge.set_selection(
+            modules=checked_ids.get("modules", []),
+            connectors=checked_ids.get("connectors", []),
+            pins=checked_ids.get("pins", []),
+        )
 
     def _check_assets_available(self):
         html_path = os.path.join(self.assets_dir, "schematic_view.html")
@@ -291,11 +374,82 @@ class SchematicViewTab(QWidget):
         self.bridge.refresh_scene_data()
 
     def add_module(self):
-        from PyQt5.QtWidgets import QInputDialog
+        from PyQt5.QtWidgets import QInputDialog, QComboBox, QDialog, QVBoxLayout, QLabel, QDialogButtonBox
+        from database import get_connection, get_current_project_id
 
+        # First, ask for the module name
         name, ok = QInputDialog.getText(self, "New Module", "Module name:")
-        if ok and name.strip():
-            self.bridge.create_module(name.strip())
+        if not ok or not name.strip():
+            return
+
+        # Then, ask which subsystem the module should belong to
+        project_id = get_current_project_id()
+        subsystems = []
+        selected_subsystem_id = None
+        if project_id is not None:
+            try:
+                with get_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT id, name FROM subsystems WHERE project_id = %s ORDER BY name",
+                        (project_id,),
+                    )
+                    subsystems = cur.fetchall()
+            except Exception:
+                pass
+
+        if subsystems:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Select Subsystem")
+            layout = QVBoxLayout(dialog)
+
+            label = QLabel('Choose a subsystem for module "' + name.strip() + '":')
+            layout.addWidget(label)
+
+            combo = QComboBox()
+            combo.addItem("-- None --", None)
+            for ss_id, ss_name in subsystems:
+                combo.addItem(ss_name, ss_id)
+            layout.addWidget(combo)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+
+            if dialog.exec_() != QDialog.Accepted:
+                return  # User cancelled - abort entirely
+            selected_subsystem_id = combo.currentData()
+
+        # Create module via bridge with just name (matches @pyqtSlot(str))
+        new_id = self.bridge.create_module(name.strip())
+
+        # If a subsystem was selected, update it directly in the DB
+        if new_id > 0 and selected_subsystem_id is not None:
+            try:
+                with get_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE modules SET subsystem_id = %s WHERE id = %s AND project_id = %s",
+                        (selected_subsystem_id, new_id, project_id),
+                    )
+                    conn.commit()
+            except Exception:
+                pass
+
+        # Position the new module to avoid overlapping existing modules
+        if new_id > 0:
+            _place_module_without_overlap(new_id, name.strip())
+
+        # Force refresh the scene immediately
+        self.bridge.get_scene_data()
+
+        # Refresh the tree selector preserving current selection state
+        if hasattr(self, "tree_selector") and hasattr(self.tree_selector, "refresh_tree"):
+            saved_selection = self.tree_selector.get_checked_ids()
+            self.tree_selector.refresh_tree()
+            # Restore the previous selection so the sidebar doesn't reset
+            self.tree_selector.apply_selection(saved_selection)
 
     def save_layout(self):
         """Ask the page to gather positions and push them through the bridge."""

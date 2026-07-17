@@ -2,7 +2,7 @@
 # connector_utils.py - Connector Layout and Management Utilities
 # -----------------------------------------------------------------------------
 from PyQt5.QtWidgets import QGraphicsItem
-from PyQt5.QtCore import QTimer, QPointF
+from PyQt5.QtCore import QTimer, QPointF, QRectF
 from Schematic_View_tab.shapes.connector_pin_graphics import ConnectorFactory, LEFT_MARGIN, MID_MARGIN, build_pin_uid
 
 def suggest_module_size(connectors_info, min_width=130, min_height=90, spacing=16, padding=36):
@@ -263,6 +263,10 @@ def enable_side_drag(connector, side, module_rect, margin=10, corner_offset=14,
         switch_timer.stop()
         connector.ungrabMouse()
         scene = connector.scene()
+        
+        # --- Reorder connectors on the same side after drag ---
+        _reorder_connectors_after_drag(connector, side, module_rect)
+        
         if hasattr(scene, "refresh_connections_and_pins"):
             QTimer.singleShot(0, scene.refresh_connections_and_pins)
         event.accept()
@@ -303,12 +307,20 @@ def enable_side_drag(connector, side, module_rect, margin=10, corner_offset=14,
         new_conn_x, new_conn_y = get_fixed_position(constrained_pos)
         connector.setPos(new_conn_x, new_conn_y)
         
-        # آپدیت فوری کانکشن ها در حین حرکت
+        # Force immediate repaint of connector and its children (pins)
+        connector.update()
+        
+        # آپدیت فوری کانکشن ها در حین حرکت - only update edges connected to this connector's pins
         scene = connector.scene()
-        if hasattr(scene, '_connection_edges'):
+        if scene and hasattr(scene, '_connection_edges'):
             for edge in scene._connection_edges:
                 if hasattr(edge, 'update_path'):
-                    edge.update_path()
+                    start_item = getattr(edge, 'start_item', None)
+                    end_item = getattr(edge, 'end_item', None)
+                    # Check if either endpoint is a child of this connector
+                    if (start_item is not None and start_item.parentItem() == connector) or \
+                       (end_item is not None and end_item.parentItem() == connector):
+                        edge.update_path()
         
         event.accept()
 
@@ -511,6 +523,94 @@ def validate_connector_layout(connectors, module_rect, margin=20):
                 return False
     
     return True
+
+def _reorder_connectors_after_drag(connector, side, module_rect):
+    """
+    After a connector drag ends, reorder the connectors list in the parent module
+    based on the new visual position of the dragged connector. Also saves the
+    connector's new position to the database.
+    """
+    parent = connector.parentItem()
+    if not parent or not hasattr(parent, 'connectors'):
+        return
+    
+    # Get all connectors on the same side (excluding the dragged one)
+    same_side_connectors = [
+        c for c in parent.connectors 
+        if getattr(c, 'side', None) == side and c is not connector
+    ]
+    
+    if not same_side_connectors:
+        return
+    
+    # Determine position of dragged connector along the side axis
+    if side in ('top', 'bottom'):
+        dragged_pos = connector.pos().x()
+        other_connectors_with_pos = [(c, c.pos().x()) for c in same_side_connectors]
+    else:
+        dragged_pos = connector.pos().y()
+        other_connectors_with_pos = [(c, c.pos().y()) for c in same_side_connectors]
+    
+    # Sort other connectors by their position
+    other_connectors_with_pos.sort(key=lambda x: x[1])
+    
+    # Find where the dragged connector should be inserted
+    insert_before_idx = len(other_connectors_with_pos)
+    for i, (_, pos) in enumerate(other_connectors_with_pos):
+        if dragged_pos < pos:
+            insert_before_idx = i
+            break
+    
+    # Remove connector from current position in parent's list
+    if connector in parent.connectors:
+        parent.connectors.remove(connector)
+    
+    # Insert at the correct position to maintain order
+    if insert_before_idx < len(other_connectors_with_pos):
+        ref_connector = other_connectors_with_pos[insert_before_idx][0]
+        if ref_connector in parent.connectors:
+            ref_idx = parent.connectors.index(ref_connector)
+            parent.connectors.insert(ref_idx, connector)
+        else:
+            parent.connectors.append(connector)
+    else:
+        parent.connectors.append(connector)
+    
+    # Re-layout connectors on this side to distribute evenly
+    # Only pass connectors on the same side to avoid misplacing other sides
+    same_side_after = [c for c in parent.connectors if getattr(c, 'side', None) == side]
+    layout_side(same_side_after, side, parent._rect, spacing=14)
+    
+    # Save connector positions to database for persistence
+    if hasattr(connector, 'db_id') and connector.db_id is not None:
+        _save_connector_drag_position(connector)
+    
+    # Save positions for all other connectors on this side too
+    for c in same_side_connectors:
+        if hasattr(c, 'db_id') and c.db_id is not None:
+            _save_connector_drag_position(c)
+
+
+def _save_connector_drag_position(connector):
+    """Save a single connector's position to the database."""
+    from Schematic_View_tab.schematic_scene_model import save_connector_positions
+    
+    parent = connector.parentItem()
+    if not parent:
+        return
+        
+    # Position is relative to parent module, which is what save_connector_positions expects
+    local_pos = connector.pos()
+    side = getattr(connector, 'side', 'top')
+    
+    save_connector_positions({
+        connector.db_id: {
+            'x': round(local_pos.x(), 1),
+            'y': round(local_pos.y(), 1),
+            'side': side
+        }
+    })
+
 
 def calculate_side_minimum_size(connectors_by_side, margin=36, spacing=14, title_height=28):
     """

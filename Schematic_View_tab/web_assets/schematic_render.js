@@ -144,6 +144,32 @@ function setupScene() {
 
     zoom = d3.zoom()
         .scaleExtent([0.1, 6])
+        .filter(function (event) {
+            // Allow standard zoom/pan interactions (scroll wheel, etc.)
+            if (event.type === 'wheel' || event.type === 'dblclick' ||
+                event.type === 'mousedown' && (event.button === 1 || event.ctrlKey || event.metaKey)) {
+                return true;
+            }
+            // Don't start pan on elements that have their own drag behavior:
+            // interface paths, interface drag handles, pin circles, connector hitboxes,
+            // resize handles, connector drag handles, connector interactive groups.
+            var target = event.target;
+            if (target) {
+                var cls = target.getAttribute && target.getAttribute('class');
+                if (cls && typeof cls === 'string') {
+                    if (cls.indexOf('interface-path') >= 0 ||
+                        cls.indexOf('interface-drag-handle') >= 0 ||
+                        cls.indexOf('pin-circle') >= 0 ||
+                        cls.indexOf('connector-hitbox') >= 0 ||
+                        cls.indexOf('connector-drag-handle') >= 0 ||
+                        cls.indexOf('resize-handle') >= 0 ||
+                        cls.indexOf('connector-interactive') >= 0) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        })
         .on('zoom', function (event) {
             g.attr('transform', event.transform);
             currentZoom = event.transform.k;
@@ -211,9 +237,9 @@ function render(scene) {
     // Use Number() coercion to catch truthy-but-non-numeric values (e.g. strings).
     scene.modules.forEach(function (m) {
         var nw = Number(m.width);
-        m.width = (!isNaN(nw) && nw > 0) ? nw : MODULE_MIN_WIDTH;
+        m.width = (!isNaN(nw) && nw > 0) ? Math.max(nw, MODULE_MIN_WIDTH) : MODULE_MIN_WIDTH;
         var nh = Number(m.height);
-        m.height = (!isNaN(nh) && nh > 0) ? nh : MODULE_MIN_HEIGHT;
+        m.height = (!isNaN(nh) && nh > 0) ? Math.max(nh, MODULE_MIN_HEIGHT) : MODULE_MIN_HEIGHT;
         if (typeof m.x !== 'number' || isNaN(m.x)) m.x = 0;
         if (typeof m.y !== 'number' || isNaN(m.y)) m.y = 0;
     });
@@ -223,8 +249,21 @@ function render(scene) {
         if (typeof c.y !== 'number' || isNaN(c.y)) c.y = 0;
     });
 
-    // Auto-grow modules so all connectors fit without overlap
+    // Only run autoSizeModules fully on the very first render (from data load),
+    // not on subsequent renders (e.g. tab switch back). The module dimensions
+    // saved to DB by resize or creation are authoritative. On subsequent
+    // renders autoSizeModules still runs but skips all modules because they
+    // have _sized = true (set below).
+    if (!render.hasAutoSizedOnce) {
+        render.hasAutoSizedOnce = true;
+    }
     autoSizeModules(scene);
+
+    // Mark all modules as explicitly sized so resizeBehavior.on('end')
+    // doesn't need to set this — we track it via hasAutoSizedOnce.
+    scene.modules.forEach(function (m) {
+        m._sized = true;
+    });
 
     assignFallbackConnectorPositions(scene);
 
@@ -267,9 +306,75 @@ function render(scene) {
 render.hasFitOnce = false;
 
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // Subsystem halos — draw a colored bounding box behind modules grouped
 // by subsystem_id, with a label indicating the subsystem name.
+// Also encompasses interface (wire) paths so wires don't poke out of the halo.
 // ---------------------------------------------------------------------
+
+// Build a lookup: pin_id -> subsystem_id (or 0 for ungrouped)
+function _buildPinToSubsystem(scene) {
+    var pinModMap = {};
+    scene.connectors.forEach(function (c) {
+        var mod = scene.modules.find(function (m) { return String(m.id) === String(c.module_id); });
+        if (!mod) return;
+        var ssId = mod.subsystem_id || 0;
+        c.pins.forEach(function (p) { pinModMap[p.id] = ssId; });
+    });
+    return pinModMap;
+}
+
+// Extend (minX,minY,maxX,maxY) to encompass all points of interfaces whose
+// pins belong to the given subsystem.
+// pinModMap is a pre-built pin_id -> subsystem_id lookup (built once per frame).
+function _extendBoundsWithInterfaces(scene, ssId, bounds, pinModMap) {
+    scene.interfaces.forEach(function (iface) {
+        var aSs = pinModMap[iface.from_pin];
+        var bSs = pinModMap[iface.to_pin];
+        // Include interface if either pin belongs to this subsystem
+        if (aSs !== ssId && bSs !== ssId) return;
+        if (!iface.points || !iface.points.length) return;
+        iface.points.forEach(function (pt) {
+            var x = pt[0] !== undefined ? pt[0] : pt.x;
+            var y = pt[1] !== undefined ? pt[1] : pt.y;
+            if (x < bounds.minX) bounds.minX = x;
+            if (y < bounds.minY) bounds.minY = y;
+            if (x > bounds.maxX) bounds.maxX = x;
+            if (y > bounds.maxY) bounds.maxY = y;
+        });
+    });
+}
+
+// Compute the enlarged halo bounding box for a subsystem, including wiring.
+// pinModMap is a pre-built pin_id -> subsystem_id lookup.
+function _computeHaloBounds(scene, group, pinModMap) {
+    var padding = 24;
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    
+    // Start from module positions
+    group.modules.forEach(function (m) {
+        var right = m.x + m.width;
+        var bottom = m.y + m.height;
+        if (m.x < minX) minX = m.x;
+        if (m.y < minY) minY = m.y;
+        if (right > maxX) maxX = right;
+        if (bottom > maxY) maxY = bottom;
+    });
+    
+    // Extend with interface wiring — find which ssId this group represents
+    var ssId = group.modules.length > 0 ? (group.modules[0].subsystem_id || 0) : 0;
+    
+    var bounds = { minX: minX, minY: minY, maxX: maxX, maxY: maxY };
+    _extendBoundsWithInterfaces(scene, ssId, bounds, pinModMap);
+    
+    bounds.minX -= padding;
+    bounds.minY -= padding;
+    bounds.maxX += padding;
+    bounds.maxY += padding;
+    
+    return bounds;
+}
+
 function renderSubsystemHalos(scene) {
     if (!scene.subsystems || !scene.subsystems.length) return;
     if (!scene.modules || !scene.modules.length) return;
@@ -293,35 +398,25 @@ function renderSubsystemHalos(scene) {
         }
     });
 
+    // Build pin->subsystem lookup ONCE for all groups (performance)
+    var pinModMap = _buildPinToSubsystem(scene);
     const haloGroup = g.append('g').attr('class', 'subsystem-halos');
-    const padding = 24;
 
     Object.keys(groups).forEach(function (ssId) {
         const group = groups[ssId];
         if (group.modules.length < 2) return;
 
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        group.modules.forEach(function (m) {
-            const right = m.x + m.width;
-            const bottom = m.y + m.height;
-            if (m.x < minX) minX = m.x;
-            if (m.y < minY) minY = m.y;
-            if (right > maxX) maxX = right;
-            if (bottom > maxY) maxY = bottom;
-        });
+        // Compute bounds including wiring
+        var bounds = _computeHaloBounds(scene, group, pinModMap);
+        var boxW = bounds.maxX - bounds.minX;
+        var boxH = bounds.maxY - bounds.minY;
 
-        minX -= padding;
-        minY -= padding;
-        maxX += padding;
-        maxY += padding;
-
-        const boxW = maxX - minX;
-        const boxH = maxY - minY;
-
-        // Background bounding box with dashed border
+        // Background bounding box with dashed border — store data-subsystem-id for in-place updates
         haloGroup.append('rect')
-            .attr('x', minX)
-            .attr('y', minY)
+            .attr('class', 'halo-bg')
+            .attr('data-subsystem-id', ssId)
+            .attr('x', bounds.minX)
+            .attr('y', bounds.minY)
             .attr('width', boxW)
             .attr('height', boxH)
             .attr('rx', 12)
@@ -334,11 +429,13 @@ function renderSubsystemHalos(scene) {
             .attr('pointer-events', 'none');
 
         // Subsystem label at top-left
-        const labelX = minX + 10;
-        const labelY = minY + 16;
+        const labelX = bounds.minX + 10;
+        const labelY = bounds.minY + 16;
         const textLength = group.name.length * 8 + 20;
 
         haloGroup.append('rect')
+            .attr('class', 'halo-label-bg')
+            .attr('data-subsystem-id', ssId)
             .attr('x', labelX - 4)
             .attr('y', labelY - 11)
             .attr('width', Math.max(textLength, 30))
@@ -349,6 +446,8 @@ function renderSubsystemHalos(scene) {
             .attr('opacity', 0.7);
 
         haloGroup.append('text')
+            .attr('class', 'halo-label')
+            .attr('data-subsystem-id', ssId)
             .attr('x', labelX + 2)
             .attr('y', labelY)
             .attr('fill', '#ffffff')
@@ -356,6 +455,58 @@ function renderSubsystemHalos(scene) {
             .attr('font-weight', '600')
             .attr('font-family', '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif')
             .text(group.name);
+    });
+}
+
+// Update subsystem halos in-place during drag — no DOM remove/recreate.
+// Also updates for wiring positions.
+function updateSubsystemHalosInPlace(scene) {
+    if (!scene.subsystems || !scene.subsystems.length) return;
+    if (!scene.modules || !scene.modules.length) return;
+
+    const groups = {};
+    scene.modules.forEach(function (m) {
+        const ssId = m.subsystem_id || 0;
+        if (!groups[ssId]) {
+            groups[ssId] = { modules: [], name: 'Ungrouped', color: 'rgba(128,128,128,0.06)', haloColor: 'rgba(128,128,128,0.06)' };
+        }
+        groups[ssId].modules.push(m);
+    });
+
+    scene.subsystems.forEach(function (ss) {
+        if (groups[ss.id]) {
+            groups[ss.id].name = ss.name;
+            groups[ss.id].color = ss.color;
+            groups[ss.id].haloColor = ss.halo_color;
+        }
+    });
+
+    // Build pin->subsystem lookup ONCE for all groups (performance)
+    var pinModMap = _buildPinToSubsystem(scene);
+
+    Object.keys(groups).forEach(function (ssId) {
+        const group = groups[ssId];
+        if (group.modules.length < 2) return;
+
+        // Compute bounds including wiring
+        var bounds = _computeHaloBounds(scene, group, pinModMap);
+        var boxW = bounds.maxX - bounds.minX;
+        var boxH = bounds.maxY - bounds.minY;
+
+        // Update background rect in-place
+        g.select('.halo-bg[data-subsystem-id="' + ssId + '"]')
+            .attr('x', bounds.minX).attr('y', bounds.minY)
+            .attr('width', Math.max(boxW, 10)).attr('height', Math.max(boxH, 10));
+
+        // Update label background rect in-place
+        g.select('.halo-label-bg[data-subsystem-id="' + ssId + '"]')
+            .attr('x', bounds.minX + 6)
+            .attr('y', bounds.minY + 5);
+
+        // Update label text position
+        g.select('.halo-label[data-subsystem-id="' + ssId + '"]')
+            .attr('x', bounds.minX + 12)
+            .attr('y', bounds.minY + 16);
     });
 }
 
@@ -373,7 +524,7 @@ function connectorEdgeExtent(c, side) {
 
 // Before distributing connectors, auto-grow each module's width/height so
 // all of its connectors fit without overlapping or being squished.
-// Only expands — never shrinks a module below its DB-stored dimension.
+// Preserves saved dimensions — only expands if connectors need more room.
 function autoSizeModules(scene) {
     // Group connectors by module_id
     var byModule = {};
@@ -386,9 +537,18 @@ function autoSizeModules(scene) {
         var module = scene.modules.find(function (m) { return String(m.id) === modId; });
         if (!module) return;
 
+        // Skip auto-sizing if module was explicitly sized (saved to DB).
+        // A module is considered "explicitly sized" if its loaded dimensions
+        // differ from the Python create_module defaults (160x100).
+        // This prevents autoSizeModules from resizing back on tab switch.
+        if (module._sized) return;
+
         var conns = byModule[modId];
-        var minW = MODULE_MIN_WIDTH;
-        var minH = MODULE_MIN_HEIGHT;
+        // Start from the EXISTING module dimensions (which may have been
+        // loaded from DB or set by user resize), NOT from constants.
+        // This ensures saved/user-set dimensions are never discarded.
+        var minW = module.width;
+        var minH = module.height;
 
         // Group connectors by side for this module
         var top = [], bottom = [], left = [], right = [];
@@ -422,9 +582,10 @@ function autoSizeModules(scene) {
             minH = Math.max(minH, needed);
         });
 
-        // Set module dimensions to fit connectors (grows AND shrinks as needed)
-        module.width = Math.max(MODULE_MIN_WIDTH, minW);
-        module.height = Math.max(MODULE_MIN_HEIGHT, minH);
+        // Apply: expands if needed, but never shrinks below existing/saved dimensions.
+        // Ensure minimum constants are respected too.
+        module.width = Math.max(minW, MODULE_MIN_WIDTH);
+        module.height = Math.max(minH, MODULE_MIN_HEIGHT);
     });
 }
 
@@ -450,8 +611,7 @@ function assignFallbackConnectorPositions(scene) {
         const edgeSize = (side === 'top' || side === 'bottom') ? w : h;
         const edgeMargin = EDGE_MARGIN;
 
-        // All connectors are redistributed on every render to ensure
-        // proper spacing. Zero/zero positions from DB are treated as unsaved.
+        // Always redistribute connectors evenly for auto-distancing
         const entries = group.map(function (c) {
             const extent = connectorEdgeExtent(c, side);
             return { c: c, extent: extent };
@@ -468,9 +628,7 @@ function assignFallbackConnectorPositions(scene) {
             return;
         }
 
-        // Multi-connector: ALWAYS distribute all connectors evenly.
-        // Even connectors with saved positions get repositioned if the
-        // group has changed (pins added/removed).
+        // Multi-connector: distribute evenly
         const totalExtents = entries.reduce(function (s, e) { return s + e.extent; }, 0);
         const totalGaps = (entries.length - 1) * CONNECTOR_GAP;
         const totalNeeded = totalExtents + totalGaps + edgeMargin * 2;
@@ -493,8 +651,6 @@ function assignFallbackConnectorPositions(scene) {
             // Center of this connector along the edge
             const center = cursor + entry.extent / 2;
 
-            // Always reposition — this handles initial zero/zero positions
-            // AND redistribution after pin add/remove
             const t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, center / edgeSize));
             const edge = edgePoint(module, side, t);
             const normal = SIDE_AXIS[side].normal;
@@ -575,6 +731,39 @@ function renderModules(scene) {
         .attr('y', d => Math.max(MODULE_MIN_HEIGHT, d.height) / 2)
         .text(d => d.name);
 
+    // Resize handles (shown on hover via CSS)
+    const handleSize = 14;
+    const hh = handleSize / 2; // half-handle for centering
+    const handleDefs = [
+        // corners
+        { cls: 'resize-nw', x: -hh, y: -hh, cursor: 'nwse-resize', dir: 'nw' },
+        { cls: 'resize-ne', x: d => Math.max(MODULE_MIN_WIDTH, d.width) - hh, y: -hh, cursor: 'nesw-resize', dir: 'ne' },
+        { cls: 'resize-sw', x: -hh, y: d => Math.max(MODULE_MIN_HEIGHT, d.height) - hh, cursor: 'nesw-resize', dir: 'sw' },
+        { cls: 'resize-se', x: d => Math.max(MODULE_MIN_WIDTH, d.width) - hh, y: d => Math.max(MODULE_MIN_HEIGHT, d.height) - hh, cursor: 'nwse-resize', dir: 'se' },
+        // edge midpoints
+        { cls: 'resize-n', x: d => Math.max(MODULE_MIN_WIDTH, d.width) / 2 - hh, y: -hh, cursor: 'ns-resize', dir: 'n' },
+        { cls: 'resize-s', x: d => Math.max(MODULE_MIN_WIDTH, d.width) / 2 - hh, y: d => Math.max(MODULE_MIN_HEIGHT, d.height) - hh, cursor: 'ns-resize', dir: 's' },
+        { cls: 'resize-w', x: -hh, y: d => Math.max(MODULE_MIN_HEIGHT, d.height) / 2 - hh, cursor: 'ew-resize', dir: 'w' },
+        { cls: 'resize-e', x: d => Math.max(MODULE_MIN_WIDTH, d.width) - hh, y: d => Math.max(MODULE_MIN_HEIGHT, d.height) / 2 - hh, cursor: 'ew-resize', dir: 'e' },
+    ];
+
+    handleDefs.forEach(function (def) {
+        moduleSel.append('rect')
+            .attr('class', 'resize-handle ' + def.cls)
+            .attr('width', handleSize)
+            .attr('height', handleSize)
+            .attr('x', def.x)
+            .attr('y', def.y)
+            .attr('fill', 'transparent')
+            .attr('stroke', 'var(--accent)')
+            .attr('stroke-width', 1.5)
+            .attr('rx', 3).attr('ry', 3)
+            .attr('cursor', def.cursor)
+            .attr('opacity', 0)
+            .attr('pointer-events', 'all')
+            .call(resizeBehavior(def.dir));
+    });
+
     // Connectors + pins, drawn relative to their parent module group.
     scene.connectors.forEach(function (c) {
         const parent = g.selectAll('.module-box').filter(d => String(d.id) === String(c.module_id));
@@ -618,6 +807,7 @@ function renderModules(scene) {
         const handleSize = 6;
         connGroup.append('path')
             .attr('class', 'connector-drag-handle')
+            .attr('data-connector-id', c.id)
             .attr('d', `M${c.x},${c.y - handleSize} L${c.x + handleSize},${c.y} L${c.x},${c.y + handleSize} L${c.x - handleSize},${c.y} Z`)
             .attr('fill', '#f39c12')
             .attr('stroke', '#e67e22')
@@ -629,6 +819,7 @@ function renderModules(scene) {
             (side === 'left' ? { x: -8, y: -6 } : { x: 8, y: -6 });
         connGroup.append('text')
             .attr('class', 'connector-label')
+            .attr('data-connector-id', c.id)
             .attr('x', c.x + labelOffset.x)
             .attr('y', c.y + labelOffset.y)
             .attr('text-anchor', isHorizSide ? 'start' : (side === 'left' ? 'end' : 'start'))
@@ -698,6 +889,7 @@ function renderModules(scene) {
 
             parent.append('text')
                 .attr('class', 'pin-label')
+                .attr('data-pin-id', p.id)
                 .attr('x', px + labelDx)
                 .attr('y', py + labelDy)
                 .attr('text-anchor', anchor)
@@ -1047,27 +1239,46 @@ const ROUTE_LEAD = 16;
 function renderInterfaces(scene, pinLookup, movedPinIds) {
     const interfaceGroup = g.append('g').attr('class', 'interfaces-layer');
     const obstacleRects = scene.modules.map(m => ({ x: m.x, y: m.y, width: m.width, height: m.height }));
+    // Build a set of hidden pin IDs for quick lookup
+    const hiddenPins = new Set(scene.hidden_pins || []);
 
     scene.interfaces.forEach(function (iface) {
-        // Decide if this interface needs fresh A* routing
-        var needsRecompute = !movedPinIds; // null → full recompute
-        if (movedPinIds && movedPinIds.size > 0) {
-            needsRecompute = movedPinIds.has(iface.from_pin) || movedPinIds.has(iface.to_pin);
-        }
+        // Skip interfaces connected to hidden pins (unchecked in sidebar tree)
+        if (hiddenPins.has(iface.from_pin) || hiddenPins.has(iface.to_pin)) return;
 
-        var points = (!needsRecompute && iface.points && iface.points.length >= 2) ? iface.points : null;
+        // Determine points: prefer manual-override points (loaded from DB or runtime),
+        // otherwise compute via A* router.
+        var isManual = (iface.manual_override || iface._manualOverride);
+        var points = null;
 
-        if (!points && iface.from_pin && iface.to_pin) {
-            var a = pinLookup[iface.from_pin];
-            var b = pinLookup[iface.to_pin];
-            if (a && b) {
-                points = computeRoutePoints(a, b, obstacleRects);
+        if (isManual && iface.points && iface.points.length >= 2) {
+            // Use the saved manual points as-is — do NOT recompute via A*
+            points = iface.points;
+        } else {
+            // Decide if this interface needs fresh A* routing
+            var needsRecompute = !movedPinIds; // null → full recompute
+            if (movedPinIds && movedPinIds.size > 0) {
+                needsRecompute = movedPinIds.has(iface.from_pin) || movedPinIds.has(iface.to_pin);
+            }
+
+            points = (!needsRecompute && iface.points && iface.points.length >= 2) ? iface.points : null;
+
+            if (!points && iface.from_pin && iface.to_pin) {
+                var a = pinLookup[iface.from_pin];
+                var b = pinLookup[iface.to_pin];
+                if (a && b) {
+                    points = computeRoutePoints(a, b, obstacleRects);
+                }
             }
         }
+
         if (!points || points.length < 2) return;
 
+        // Store points so persistence uses them
+        iface.points = points;
+
         const line = d3.line().x(p => p[0] !== undefined ? p[0] : p.x).y(p => p[1] !== undefined ? p[1] : p.y);
-        interfaceGroup.append('path')
+        var path = interfaceGroup.append('path')
             .attr('class', 'interface-path')
             .attr('data-interface-id', iface.id)
             .attr('d', line(points))
@@ -1080,6 +1291,158 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
                     return Number(d3.select(this).attr('data-interface-id')) === iface.id;
                 });
             });
+
+        // --- Wire dragging: add draggable handles at each interior vertex ---
+        for (var i = 0; i < points.length; i++) {
+            if (i === 0 || i === points.length - 1) continue;
+
+            (function (pi) {
+                var pt = points[pi];
+                var cx = pt[0] !== undefined ? pt[0] : pt.x;
+                var cy = pt[1] !== undefined ? pt[1] : pt.y;
+
+                interfaceGroup.append('circle')
+                    .attr('class', 'interface-drag-handle')
+                    .attr('data-interface-id', iface.id)
+                    .attr('data-point-index', pi)
+                    .attr('cx', cx)
+                    .attr('cy', cy)
+                    .attr('r', 10)
+                    .attr('fill', 'transparent')
+                    .attr('stroke', 'var(--accent)')
+                    .attr('stroke-width', 1.5)
+                    .attr('stroke-dasharray', '2,2')
+                    .attr('cursor', 'move')
+                    .attr('opacity', 0)
+                    .on('mouseenter', function () { d3.select(this).attr('opacity', 0.6); })
+                    .on('mouseleave', function () { d3.select(this).attr('opacity', 0); })
+                    .call(d3.drag()
+                        .on('start', function (event) {
+                            event.sourceEvent.stopPropagation();
+                            d3.select(this).raise().attr('opacity', 0.9).attr('fill', 'rgba(91, 141, 239, 0.35)');
+                        })
+                        .on('drag', function (event) {
+                            // Use d3.pointer to get coords in scene (g) space
+                            var pt = d3.pointer(event.sourceEvent, g.node());
+                            var newX = pt[0];
+                            var newY = pt[1];
+                            points[pi] = [newX, newY];
+                            iface.points = points;
+                            d3.select(this).attr('cx', newX).attr('cy', newY);
+                            path.attr('d', line(points));
+                        })
+                        .on('end', function () {
+                            d3.select(this).attr('opacity', 0.6).attr('fill', 'transparent');
+                            iface._manualOverride = true;
+                            persistCurrentRoutes();
+                        })
+                    );
+            })(i);
+        }
+
+        // --- Drag any point ON the path (not just vertices) to reroute ---
+        // When user clicks and drags on a path segment, a new waypoint is
+        // inserted at that position and becomes draggable.
+        (function (iface, points, path, interfaceGroup, line) {
+            var dragState = null;
+
+            function distToSegmentSq(px, py, ax, ay, bx, by) {
+                var dx = bx - ax, dy = by - ay;
+                var lenSq = dx * dx + dy * dy;
+                if (lenSq === 0) {
+                    var ex = px - ax, ey = py - ay;
+                    return ex * ex + ey * ey;
+                }
+                var t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+                t = Math.max(0, Math.min(1, t));
+                var cx = ax + t * dx, cy = ay + t * dy;
+                var rx = px - cx, ry = py - cy;
+                return rx * rx + ry * ry;
+            }
+
+            path.call(d3.drag()
+                .on('start', function (event) {
+                    event.sourceEvent.stopPropagation();
+                    var pt = d3.pointer(event.sourceEvent, g.node());
+                    var px = pt[0], py = pt[1];
+
+                    // Find nearest segment and insert a new vertex there
+                    var bestDist = Infinity, bestIdx = -1, insertX = px, insertY = py;
+                    for (var j = 0; j < points.length - 1; j++) {
+                        var p1 = points[j], p2 = points[j + 1];
+                        var a = [Array.isArray(p1) ? p1[0] : (p1.x !== undefined ? p1.x : p1[0]), Array.isArray(p1) ? p1[1] : (p1.y !== undefined ? p1.y : p1[1])];
+                        var b = [Array.isArray(p2) ? p2[0] : (p2.x !== undefined ? p2.x : p2[0]), Array.isArray(p2) ? p2[1] : (p2.y !== undefined ? p2.y : p2[1])];
+                        var dist = distToSegmentSq(px, py, a[0], a[1], b[0], b[1]);
+                        if (dist < bestDist) {
+                            bestDist = dist;
+                            bestIdx = j;
+                            // Closest point on the segment
+                            var dx = b[0] - a[0], dy = b[1] - a[1];
+                            var lenSq = dx * dx + dy * dy;
+                            var t = lenSq > 0 ? Math.max(0, Math.min(1, ((px - a[0]) * dx + (py - a[1]) * dy) / lenSq)) : 0;
+                            insertX = a[0] + t * dx;
+                            insertY = a[1] + t * dy;
+                        }
+                    }
+
+                    if (bestIdx >= 0) {
+                        dragState = { pointIndex: bestIdx + 1, hadDrag: false };
+                        points.splice(bestIdx + 1, 0, [insertX, insertY]);
+                        iface.points = points;
+                        path.attr('d', line(points));
+
+                        // Show a temporary drag handle at the insertion point
+                        var handle = interfaceGroup.insert('circle', ':first-child')
+                            .attr('r', 8)
+                            .attr('fill', 'rgba(91, 141, 239, 0.45)')
+                            .attr('stroke', 'var(--accent)')
+                            .attr('stroke-width', 2)
+                            .attr('cx', insertX)
+                            .attr('cy', insertY);
+                        dragState.handle = handle;
+                    }
+                })
+                .on('drag', function (event) {
+                    if (!dragState) return;
+                    dragState.hadDrag = true;
+                    var pt = d3.pointer(event.sourceEvent, g.node());
+                    var idx = dragState.pointIndex;
+                    points[idx] = [pt[0], pt[1]];
+                    iface.points = points;
+                    path.attr('d', line(points));
+                    if (dragState.handle) {
+                        dragState.handle.attr('cx', pt[0]).attr('cy', pt[1]);
+                    }
+                })
+                .on('end', function () {
+                    if (!dragState) return;
+                    
+                    // Remove the temporary drag handle
+                    if (dragState.handle) {
+                        dragState.handle.remove();
+                    }
+                    
+                    // If no actual drag occurred (just a click), undo the insertion
+                    if (!dragState.hadDrag) {
+                        points.splice(dragState.pointIndex, 1);
+                        iface.points = points;
+                        path.attr('d', line(points));
+                        dragState = null;
+                        return;
+                    }
+                    
+                    if (iface && iface.points && iface.points.length > 2) {
+                        iface._manualOverride = true;
+                        persistCurrentRoutes();
+                        // Re-render the interface layer to show proper drag handles
+                        // at all vertices (including the newly created one)
+                        g.select('.interfaces-layer').remove();
+                        renderInterfaces(sceneData, buildPinLookup(sceneData), new Set());
+                    }
+                    dragState = null;
+                })
+            );
+        })(iface, points, path, interfaceGroup, line);
     });
 }
 
@@ -1108,7 +1471,10 @@ function dragBehavior() {
             d.x = event.x;
             d.y = event.y;
             d3.select(this).attr('transform', `translate(${d.x}, ${d.y})`);
-            redrawConnectorsFor(d);
+            // Live wire rerouting — updates interface paths in-place, no flicker
+            updateInterfacesInPlace(d);
+            // Update subsystem halos in-place so they follow moved modules
+            updateSubsystemHalosInPlace(sceneData);
         })
         .on('end', function (event, d) {
             if (!bridge) return;
@@ -1118,6 +1484,214 @@ function dragBehavior() {
             persistCurrentRoutes();
         });
 }
+
+// ---------------------------------------------------------------------
+// Module resize behavior with 8 handles (corners + edge midpoints)
+// Updates connectors, pins, AND interfaces in real-time during resize.
+// ---------------------------------------------------------------------
+function resizeBehavior(direction) {
+    return d3.drag()
+        .on('start', function (event, d) {
+            event.sourceEvent.stopPropagation();
+            d3.select(this).raise();
+            // Show all resize handles on the module being resized
+            d3.select(this.parentNode).selectAll('.resize-handle')
+                .transition().duration(100)
+                .attr('opacity', 1)
+                .attr('fill', 'rgba(91, 141, 239, 0.2)');
+
+            // Store initial t-fractions for all connectors so we can
+            // recompute their positions relative to the new module size
+            d._connectorFractions = {};
+            sceneData.connectors.forEach(function (c) {
+                if (String(c.module_id) !== String(d.id)) return;
+                var side = normalizeSide(c.side);
+                var normal = SIDE_AXIS[side].normal;
+                var oldW = Math.max(MODULE_MIN_WIDTH, d.width);
+                var oldH = Math.max(MODULE_MIN_HEIGHT, d.height);
+                var t;
+                if (side === 'top' || side === 'bottom') {
+                    // c.x = t * oldW + normal.x * CONNECTOR_STUB
+                    t = (c.x - normal.x * CONNECTOR_STUB) / oldW;
+                } else {
+                    // c.y = t * oldH + normal.y * CONNECTOR_STUB
+                    t = (c.y - normal.y * CONNECTOR_STUB) / oldH;
+                }
+                d._connectorFractions[c.id] = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, t));
+            });
+        })
+        .on('drag', function (event, d) {
+            var minW = MODULE_MIN_WIDTH;
+            var minH = MODULE_MIN_HEIGHT;
+            var w = d.width;
+            var h = d.height;
+            var dx = event.dx;
+            var dy = event.dy;
+            const hh = 7; // half handle size (14/2)
+
+            // Adjust width/height and position based on which handle is dragged
+            if (direction.indexOf('e') >= 0) {
+                w = Math.max(minW, d.width + dx);
+            }
+            if (direction.indexOf('w') >= 0) {
+                w = Math.max(minW, d.width - dx);
+                d.x = d.x + (d.width - w);
+            }
+            if (direction.indexOf('s') >= 0) {
+                h = Math.max(minH, d.height + dy);
+            }
+            if (direction.indexOf('n') >= 0) {
+                h = Math.max(minH, d.height - dy);
+                d.y = d.y + (d.height - h);
+            }
+
+            d.width = w;
+            d.height = h;
+
+            var modGroup = d3.select(this.parentNode);
+
+            // Update module group position
+            modGroup.attr('transform', 'translate(' + d.x + ',' + d.y + ')');
+
+            // Update rect size
+            modGroup.select('.module-rect')
+                .attr('width', w)
+                .attr('height', h);
+
+            // Update label position
+            modGroup.select('.module-label')
+                .attr('x', w / 2)
+                .attr('y', h / 2);
+
+            // Reposition all resize handles
+            modGroup.select('.resize-nw').attr('x', -hh).attr('y', -hh);
+            modGroup.select('.resize-ne').attr('x', w - hh).attr('y', -hh);
+            modGroup.select('.resize-sw').attr('x', -hh).attr('y', h - hh);
+            modGroup.select('.resize-se').attr('x', w - hh).attr('y', h - hh);
+            modGroup.select('.resize-n').attr('x', w / 2 - hh).attr('y', -hh);
+            modGroup.select('.resize-s').attr('x', w / 2 - hh).attr('y', h - hh);
+            modGroup.select('.resize-w').attr('x', -hh).attr('y', h / 2 - hh);
+            modGroup.select('.resize-e').attr('x', w - hh).attr('y', h / 2 - hh);
+
+            // Update connector positions and ALL their SVG elements (connector line,
+            // handle, bbox, label + pin circles + pin labels) in real-time
+            updateModuleConnectorsSvg(d, modGroup);
+
+            // Update interfaces (wires) — in-place, no flicker
+            updateInterfacesInPlace(d);
+            // Update subsystem halos in-place to follow the resized module
+            updateSubsystemHalosInPlace(sceneData);
+        })
+        .on('end', function (event, d) {
+            // Hide resize handles
+            d3.select(this.parentNode).selectAll('.resize-handle')
+                .transition().duration(200)
+                .attr('opacity', 0)
+                .attr('fill', 'transparent');
+
+            // Clean up stored fractions
+            delete d._connectorFractions;
+            // Mark this module as explicitly sized so subsequent renders
+            // (tab switch) don't auto-shrink it.
+            d._sized = true;
+
+            if (!bridge) return;
+            // Save module position AND size to DB
+            bridge.save_module_positions(JSON.stringify({
+                [d.id]: { x: d.x, y: d.y, width: d.width, height: d.height }
+            }));
+            persistCurrentRoutes();
+        });
+}
+
+// Update ALL connector and pin SVG elements for a module in real-time.
+// Called during module resize and module drag to keep visuals in sync.
+function updateModuleConnectorsSvg(module, modGroup) {
+    var w = Math.max(MODULE_MIN_WIDTH, module.width);
+    var h = Math.max(MODULE_MIN_HEIGHT, module.height);
+    var fractions = module._connectorFractions || {};
+
+    sceneData.connectors.forEach(function (c) {
+        if (String(c.module_id) !== String(module.id)) return;
+        var side = normalizeSide(c.side);
+        var normal = SIDE_AXIS[side].normal;
+        var tangent = SIDE_AXIS[side].tangent;
+
+        // Recompute connector position using stored fraction t (captured at resize start).
+        // If no stored fraction (should never happen during normal drag), derive from
+        // current c.x/c.y against current module dimensions.
+        var t = fractions[c.id];
+        if (t === undefined) {
+            if (side === 'top' || side === 'bottom') {
+                t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, c.x / w));
+            } else {
+                t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, c.y / h));
+            }
+        }
+        t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, t));
+
+        var ep = edgePoint(module, side, t);
+        c.x = ep.x + normal.x * CONNECTOR_STUB;
+        c.y = ep.y + normal.y * CONNECTOR_STUB;
+
+        // 1. Update connector line (from module edge to stub tip)
+        var edge = connectorEdgeAnchor(module, c);
+        modGroup.select('.connector-line[data-connector-id="' + c.id + '"]')
+            .attr('x1', edge.x).attr('y1', edge.y)
+            .attr('x2', c.x).attr('y2', c.y);
+
+        // 2. Update drag handle (diamond at stub tip)
+        var hs = 6;
+        modGroup.select('.connector-drag-handle[data-connector-id="' + c.id + '"]')
+            .attr('d', 'M' + c.x + ',' + (c.y - hs) + ' L' + (c.x + hs) + ',' + c.y + ' L' + c.x + ',' + (c.y + hs) + ' L' + (c.x - hs) + ',' + c.y + ' Z');
+
+        // 3. Update connector bounding box
+        var bbox = connectorBBox(module, c);
+        modGroup.select('.connector-bbox[data-connector-id="' + c.id + '"]')
+            .attr('x', bbox.x).attr('y', bbox.y)
+            .attr('width', bbox.w).attr('height', bbox.h);
+        modGroup.select('.connector-hitbox[data-connector-id="' + c.id + '"]')
+            .attr('x', bbox.x).attr('y', bbox.y)
+            .attr('width', bbox.w).attr('height', bbox.h);
+
+        // 4. Update connector label position (using data-connector-id for direct selection)
+        var isHoriz = (side === 'top' || side === 'bottom');
+        var labelOffX = isHoriz ? 10 : (side === 'left' ? -8 : 8);
+        var labelOffY = -6;
+        modGroup.select('.connector-label[data-connector-id="' + c.id + '"]')
+            .attr('x', c.x + labelOffX)
+            .attr('y', c.y + labelOffY)
+            .attr('text-anchor', isHoriz ? 'start' : (side === 'left' ? 'end' : 'start'));
+
+        // 5. Update pin circles and labels
+        var count = c.pins.length;
+        var mid = connectorBodyMidpoint(module, c);
+
+        c.pins.forEach(function (p, i) {
+            var offset = -(count - 1) * PIN_HALF_STEP + i * (PIN_HALF_STEP * 2);
+            var px = mid.x + tangent.x * offset;
+            var py = mid.y + tangent.y * offset;
+
+            // Move pin circle
+            modGroup.select('circle.pin-circle[data-pin-id="' + p.id + '"]')
+                .attr('cx', px).attr('cy', py);
+
+            // Move pin label
+            var isVert = (side === 'top' || side === 'bottom');
+            var labelDx = isVert ? 0 : (side === 'left' ? -PIN_RADIUS - 3 : PIN_RADIUS + 3);
+            var labelDy = isVert ? (side === 'top' ? -PIN_RADIUS - 3 : PIN_RADIUS + 11) : 0;
+            var anchor = isVert ? 'middle' : (side === 'left' ? 'end' : 'start');
+
+            modGroup.select('text.pin-label[data-pin-id="' + p.id + '"]')
+                .attr('x', px + labelDx)
+                .attr('y', py + labelDy)
+                .attr('text-anchor', anchor);
+        });
+    });
+}
+
+// Show resize handles on module hover (via CSS might not work for dynamically added elements)
+// Override the module-box hover to toggle handles
 
 // Recompute every interface's route against the current module layout and
 // push the result to the DB via bridge.save_routing(). Called once per
@@ -1130,12 +1704,18 @@ function persistCurrentRoutes() {
     const payload = {};
 
     sceneData.interfaces.forEach(function (iface) {
-        const a = pinLookup[iface.from_pin];
-        const b = pinLookup[iface.to_pin];
-        if (!a || !b) return;
-        const points = computeRoutePoints(a, b, obstacleRects);
-        iface.points = points; // keep in-memory scene consistent with what we just saved
-        payload[iface.id] = { points: points, manual_override: false, locked: false };
+        if ((iface._manualOverride || iface.manual_override) && iface.points && iface.points.length >= 2) {
+            // Use the user-dragged manual points directly
+            payload[iface.id] = { points: iface.points, manual_override: true, locked: false };
+        } else {
+            // Compute the route via A* orthogonal router
+            const a = pinLookup[iface.from_pin];
+            const b = pinLookup[iface.to_pin];
+            if (!a || !b) return;
+            const points = computeRoutePoints(a, b, obstacleRects);
+            iface.points = points; // keep in-memory scene consistent
+            payload[iface.id] = { points: points, manual_override: false, locked: false };
+        }
     });
 
     if (Object.keys(payload).length) {
@@ -1143,9 +1723,64 @@ function persistCurrentRoutes() {
     }
 }
 
-// Redraw interfaces during drag. Only re-routes wires connected to the
-// moved module via A*; all other interfaces keep their cached points.
-// This avoids running expensive A* routing for every wire on every frame.
+// Update interface paths in-place (no DOM removal/recreation) to avoid flicker.
+// Only re-routes wires connected to the moved module.
+function updateInterfacesInPlace(movedModule) {
+    const pinLookup = buildPinLookup(sceneData);
+    const obstacleRects = sceneData.modules.map(m => ({ x: m.x, y: m.y, width: m.width, height: m.height }));
+    const hiddenPins = new Set(sceneData.hidden_pins || []);
+
+    // Collect pin IDs belonging to the moved module
+    var movedPinIds = new Set();
+    sceneData.connectors.forEach(function (c) {
+        if (String(c.module_id) === String(movedModule.id)) {
+            c.pins.forEach(function (p) {
+                // Skip hidden pins — their wiring is not shown
+                if (!hiddenPins.has(p.id)) movedPinIds.add(p.id);
+            });
+        }
+    });
+
+    sceneData.interfaces.forEach(function (iface) {
+        // Skip interfaces connected to hidden pins
+        if (hiddenPins.has(iface.from_pin) || hiddenPins.has(iface.to_pin)) return;
+        if (!movedPinIds.has(iface.from_pin) && !movedPinIds.has(iface.to_pin)) return;
+
+        // For manually overridden wires: update only the endpoints to follow moved
+        // pins, preserving the interior points the user positioned.
+        if (iface.manual_override || iface._manualOverride) {
+            var a = pinLookup[iface.from_pin];
+            var b = pinLookup[iface.to_pin];
+            if (a && b && iface.points && iface.points.length >= 2) {
+                // Update first and last point to match moved pin positions
+                iface.points[0] = [a.x, a.y];
+                iface.points[iface.points.length - 1] = [b.x, b.y];
+                // Update SVG path in-place
+                var lineMaker = d3.line().x(function (p) { return p[0]; }).y(function (p) { return p[1]; });
+                var p = g.select('.interface-path[data-interface-id="' + iface.id + '"]');
+                if (p.node()) p.attr('d', lineMaker(iface.points));
+            }
+            return;
+        }
+
+        var a = pinLookup[iface.from_pin];
+        var b = pinLookup[iface.to_pin];
+        if (!a || !b) return;
+
+        var points = computeRoutePoints(a, b, obstacleRects);
+        if (!points || points.length < 2) return;
+
+        const line = d3.line().x(p => p[0] !== undefined ? p[0] : p.x).y(p => p[1] !== undefined ? p[1] : p.y);
+        var path = g.select('.interface-path[data-interface-id="' + iface.id + '"]');
+        if (path.node()) {
+            path.attr('d', line(points));
+        }
+    });
+}
+
+// Full redraw (removes and recreates) — used only on resize end or full render.
+// NOTE: During interactive resize/drag, use updateInterfacesInPlace() instead
+// to avoid flicker.
 function redrawConnectorsFor(movedModule) {
     const pinLookup = buildPinLookup(sceneData);
 
@@ -1240,86 +1875,212 @@ function triggerSaveLayout() {
     bridge.save_connector_positions(JSON.stringify(connectorPositions));
 }
 
+// Reorder connectors in sceneData.connectors so that the dragged connector
+// appears at the position matching where it was dropped among its peers
+// on the same module+side. This enables reordering: when
+// assignFallbackConnectorPositions redistributes evenly, the new array
+// order determines the visual order.
+function reorderConnectorsAfterDrag(module, draggedConnector, currentSide) {
+    // Collect all connectors on the same module+side (excluding the dragged one)
+    var sameSide = [];
+    sceneData.connectors.forEach(function (conn) {
+        if (String(conn.module_id) === String(module.id) &&
+            normalizeSide(conn.side) === currentSide &&
+            conn.id !== draggedConnector.id) {
+            sameSide.push(conn);
+        }
+    });
+    
+    if (sameSide.length === 0) return;
+    
+    // Calculate t-fraction for each connector
+    var w = Math.max(MODULE_MIN_WIDTH, module.width);
+    var h = Math.max(MODULE_MIN_HEIGHT, module.height);
+    var draggedT;
+    if (currentSide === 'top' || currentSide === 'bottom') {
+        draggedT = (draggedConnector.x - SIDE_AXIS[currentSide].normal.x * CONNECTOR_STUB) / w;
+    } else {
+        draggedT = (draggedConnector.y - SIDE_AXIS[currentSide].normal.y * CONNECTOR_STUB) / h;
+    }
+    
+    // Find insertion position: count how many connectors are "before" the dragged one
+    var insertBeforeIdx = 0;
+    sameSide.forEach(function (other) {
+        var otherT;
+        if (currentSide === 'top' || currentSide === 'bottom') {
+            otherT = (other.x - SIDE_AXIS[currentSide].normal.x * CONNECTOR_STUB) / w;
+        } else {
+            otherT = (other.y - SIDE_AXIS[currentSide].normal.y * CONNECTOR_STUB) / h;
+        }
+        if (otherT < draggedT) {
+            insertBeforeIdx++;
+        }
+    });
+    
+    // Remove dragged connector from its current position and insert at new position
+    var connArray = sceneData.connectors;
+    var oldIdx = connArray.indexOf(draggedConnector);
+    if (oldIdx >= 0) connArray.splice(oldIdx, 1);
+    
+    // Find the target index among the same-side group after removal
+    var targetConn = null;
+    var count = 0;
+    for (var i = 0; i < connArray.length; i++) {
+        if (String(connArray[i].module_id) === String(module.id) &&
+            normalizeSide(connArray[i].side) === currentSide) {
+            if (count === insertBeforeIdx) {
+                targetConn = connArray[i];
+                break;
+            }
+            count++;
+        }
+    }
+    
+    if (targetConn) {
+        var newIdx = connArray.indexOf(targetConn);
+        connArray.splice(newIdx, 0, draggedConnector);
+    } else {
+        connArray.push(draggedConnector);
+    }
+}
+
 function enableConnectorSideDrag(group, c, module) {
-    const dragState = { currentSide: normalizeSide(c.side) };
+    var dragState = { currentSide: normalizeSide(c.side), hadDrag: false };
 
     group.call(d3.drag()
         .on('start', function (event) {
             event.sourceEvent.stopPropagation();
             dragState.currentSide = normalizeSide(c.side);
+            dragState.hadDrag = false;
         })
         .on('drag', function (event) {
-            const w = Math.max(MODULE_MIN_WIDTH, module.width);
-            const h = Math.max(MODULE_MIN_HEIGHT, module.height);
+            dragState.hadDrag = true;
+            var w = Math.max(MODULE_MIN_WIDTH, module.width);
+            var h = Math.max(MODULE_MIN_HEIGHT, module.height);
+            var sceneCoords = d3.pointer(event.sourceEvent, g.node());
+            var mx = sceneCoords[0] - module.x; // module-local X
+            var my = sceneCoords[1] - module.y; // module-local Y
 
-            // event.sourceEvent gives us the raw pointer event.
-            // We need the pointer position in MODULE-LOCAL coordinates.
-            // The module group has transform translate(module.x, module.y),
-            // and the SVG has a zoom transform. Use d3.pointer with the
-            // module's parent group (scene-root) to get scene coords,
-            // then subtract module position to get module-local coords.
-            const sceneCoords = d3.pointer(event.sourceEvent, g.node());
-            const mx = sceneCoords[0] - module.x; // module-local X
-            const my = sceneCoords[1] - module.y; // module-local Y
+            // Project pointer onto the current side's axis to allow same-side
+            // reordering. Only switch sides when pointer is clearly on a
+            // different edge (beyond the module's exterior margin).
+            var newSide = dragState.currentSide;
+            var t;
+            var switchThreshold = 30; // px beyond edge before side-switch
 
-            // Determine closest side based on which edge the pointer is nearest to
-            let newSide;
-            const dx = mx - w / 2;
-            const dy = my - h / 2;
-            const absDx = Math.abs(dx);
-            const absDy = Math.abs(dy);
-
-            if (absDx / w > absDy / h) {
-                newSide = dx > 0 ? 'right' : 'left';
-            } else {
-                newSide = dy > 0 ? 'bottom' : 'top';
-            }
-
-            // Compute fraction along the new edge, clamped to avoid corners
-            let t;
-            if (newSide === 'top' || newSide === 'bottom') {
+            if (dragState.currentSide === 'top') {
                 t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, mx / w));
-            } else {
+                if (my > h + switchThreshold) newSide = 'bottom';
+                else if (mx < -switchThreshold) newSide = 'left';
+                else if (mx > w + switchThreshold) newSide = 'right';
+                // else stay on top
+            } else if (dragState.currentSide === 'bottom') {
+                t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, mx / w));
+                if (my < -switchThreshold) newSide = 'top';
+                else if (mx < -switchThreshold) newSide = 'left';
+                else if (mx > w + switchThreshold) newSide = 'right';
+            } else if (dragState.currentSide === 'left') {
                 t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, my / h));
+                if (mx > w + switchThreshold) newSide = 'right';
+                else if (my < -switchThreshold) newSide = 'top';
+                else if (my > h + switchThreshold) newSide = 'bottom';
+            } else { // right
+                t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, my / h));
+                if (mx < -switchThreshold) newSide = 'left';
+                else if (my < -switchThreshold) newSide = 'top';
+                else if (my > h + switchThreshold) newSide = 'bottom';
             }
 
-            // Update connector side and position
+            // If side changed, update t for the new side axis
+            if (newSide !== dragState.currentSide) {
+                if (newSide === 'top' || newSide === 'bottom') {
+                    t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, mx / w));
+                } else {
+                    t = Math.max(CORNER_OFFSET, Math.min(1 - CORNER_OFFSET, my / h));
+                }
+            }
+
+            // Update connector data
             c.side = newSide;
             dragState.currentSide = newSide;
-
-            const ep = edgePoint(module, newSide, t);
-            const n = SIDE_AXIS[newSide].normal;
+            var ep = edgePoint(module, newSide, t);
+            var n = SIDE_AXIS[newSide].normal;
             c.x = ep.x + n.x * CONNECTOR_STUB;
             c.y = ep.y + n.y * CONNECTOR_STUB;
 
-            // Update SVG directly (no full re-render)
-            const edge = connectorEdgeAnchor(module, c);
+            // Update SVG elements
+            var edge = connectorEdgeAnchor(module, c);
             group.select('.connector-line')
                 .attr('x1', edge.x).attr('y1', edge.y)
                 .attr('x2', c.x).attr('y2', c.y);
-            const hs = 6;
+            var hs = 6;
             group.select('.connector-drag-handle')
-                .attr('d', `M${c.x},${c.y - hs} L${c.x + hs},${c.y} L${c.x},${c.y + hs} L${c.x - hs},${c.y} Z`);
+                .attr('d', 'M' + c.x + ',' + (c.y - hs) + ' L' + (c.x + hs) + ',' + c.y + ' L' + c.x + ',' + (c.y + hs) + ' L' + (c.x - hs) + ',' + c.y + ' Z');
 
-            // Update bounding box
-            const bbox = connectorBBox(module, c);
+            var bbox = connectorBBox(module, c);
             group.select('.connector-bbox')
                 .attr('x', bbox.x).attr('y', bbox.y)
                 .attr('width', bbox.w).attr('height', bbox.h);
+
+            // Update connector label position
+            var isHoriz = (newSide === 'top' || newSide === 'bottom');
+            var labelOffX = isHoriz ? 10 : (newSide === 'left' ? -8 : 8);
+            var labelOffY = -6;
+            group.select('.connector-label')
+                .attr('x', c.x + labelOffX)
+                .attr('y', c.y + labelOffY)
+                .attr('text-anchor', isHoriz ? 'start' : (newSide === 'left' ? 'end' : 'start'))
+                .attr('dominant-baseline', 'auto');
+
+            // CRITICAL: Update pin circles and labels to move in sync with the connector
+            var moduleGroup = d3.select(group.node().parentNode);
+            var count = c.pins.length;
+            var tangent = SIDE_AXIS[newSide].tangent;
+            var mid = connectorBodyMidpoint(module, c);
+
+            c.pins.forEach(function (p, i) {
+                var offset = -(count - 1) * PIN_HALF_STEP + i * (PIN_HALF_STEP * 2);
+                var px = mid.x + tangent.x * offset;
+                var py = mid.y + tangent.y * offset;
+
+                // Move pin circle
+                moduleGroup.select('circle[data-pin-id="' + p.id + '"]')
+                    .attr('cx', px).attr('cy', py);
+
+                // Move pin label
+                var isVert = (newSide === 'top' || newSide === 'bottom');
+                var labelDx = isVert ? 0 : (newSide === 'left' ? -PIN_RADIUS - 3 : PIN_RADIUS + 3);
+                var labelDy = isVert ? (newSide === 'top' ? -PIN_RADIUS - 3 : PIN_RADIUS + 11) : 0;
+                var anchor = isVert ? 'middle' : (newSide === 'left' ? 'end' : 'start');
+
+                moduleGroup.select('text.pin-label')
+                    .filter(function () { return d3.select(this).text() === p.name; })
+                    .attr('x', px + labelDx)
+                    .attr('y', py + labelDy)
+                    .attr('text-anchor', anchor);
+            });
+
+            // Mark as manually positioned so assignFallbackConnectorPositions won't redistribute
+            c._dragPositioned = true;
 
             // Update wires
             redrawConnectorsFor(module);
         })
         .on('end', function () {
-            if (bridge) {
-                // save_connector_positions now persists both x, y AND side in one call
+            if (dragState.hadDrag && bridge) {
+                // Reorder connectors in the scene data array so the new order
+                // is preserved when assignFallbackConnectorPositions redistributes
+                reorderConnectorsAfterDrag(module, c, dragState.currentSide);
+                
                 bridge.save_connector_positions(JSON.stringify(
                     { [c.id]: { x: c.x, y: c.y, side: dragState.currentSide } }
                 ));
+                
+                // Redistribute evenly & save routes
+                render(sceneData);
+                persistCurrentRoutes();
             }
-            render(sceneData);
-            // Persist fresh route points so wires stay correct until next recompute
-            persistCurrentRoutes();
+            // is preserved via the _dragPositioned flag on the connector data.
         })
     );
 }

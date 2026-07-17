@@ -29,7 +29,7 @@ get_complete_layout(module_ids, connector_ids, interface_ids) returns:
     interface_points[iid]       = [(x, y), ...]       -- same as routing_persistence.py
 """
 
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Set
 
 from database import get_connection, get_current_project_id, get_complete_layout
 
@@ -83,7 +83,11 @@ def _grid_fallback_position(index: int) -> Tuple[float, float]:
     return GRID_MARGIN + col * GRID_CELL_W, GRID_MARGIN + row * GRID_CELL_H
 
 
-def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, Any]:
+def load_schematic_scene(
+    module_ids: Optional[List[int]] = None,
+    connector_ids: Optional[Set[int]] = None,
+    pin_ids: Optional[Set[int]] = None,
+) -> Dict[str, Any]:
     """
     Load the full schematic scene (modules, connectors, pins, interfaces)
     for the current project and return a JSON-serializable dict:
@@ -101,12 +105,16 @@ def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, An
         ...
       ],
       "connectors": [ ... ],
-      "interfaces": [ ... ]
+      "interfaces": [ ... ],
+      "hidden_pins": [3, 7, ...]  # pin IDs to hide wiring for
     }
 
-    If module_ids is given, only those modules (and their connectors/pins/
-    interfaces between them) are included; otherwise the whole project
-    scene is loaded.
+    Args:
+        module_ids: If given, only these modules are shown. None = show all.
+        connector_ids: If given, only these connectors within selected
+            modules are shown. None = show all.
+        pin_ids: If given, pins NOT in this set have their wiring hidden
+            but remain visible. None = show all wiring.
     """
     scene: Dict[str, Any] = {"subsystems": [], "modules": [], "connectors": [], "interfaces": []}
 
@@ -158,11 +166,19 @@ def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, An
             f"WHERE module_id IN ({placeholders}) AND project_id = %s",
             (*module_id_list, project_id),
         )
-        connector_rows = cur.fetchall()
+        all_connector_rows = cur.fetchall()
+
+        # Filter connectors by connector_ids if specified
+        if connector_ids is not None:
+            connector_rows = [r for r in all_connector_rows if r[0] in connector_ids]
+        else:
+            connector_rows = all_connector_rows
+
         connector_id_list = [row[0] for row in connector_rows]
 
-        # Fetch pins for all these connectors
+        # Fetch pins for all these connectors — always keep all pins visible
         pin_data_by_connector = {}
+        all_pin_ids_set: Set[int] = set()
         if connector_id_list:
             conn_ph = ",".join(["%s"] * len(connector_id_list))
             cur.execute(
@@ -171,10 +187,17 @@ def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, An
                 (*connector_id_list, project_id),
             )
             for pin_id, conn_id, pin_name in cur.fetchall():
+                all_pin_ids_set.add(pin_id)
                 pin_data_by_connector.setdefault(conn_id, []).append({
                     "id": pin_id,
                     "name": pin_name,
                 })
+
+        # Compute hidden_pins: if pin_ids is specified, pins NOT in it have wiring hidden
+        if pin_ids is not None:
+            scene["hidden_pins"] = [pid for pid in all_pin_ids_set if pid not in pin_ids]
+        else:
+            scene["hidden_pins"] = []
 
         # ---------------- Interfaces between the visible modules ----------------
         interface_id_list: List[int] = []
@@ -303,9 +326,12 @@ def load_schematic_scene(module_ids: Optional[List[int]] = None) -> Dict[str, An
 def save_module_positions(positions: Dict[int, Dict[str, float]]) -> None:
     """
     Persist module positions after a drag in the frontend.
+    Can also persist width/height if included in the position dict.
 
     positions example:
       { 1: {"x": 120.0, "y": 80.0}, 2: {"x": 340.0, "y": 80.0} }
+    Or with size:
+      { 1: {"x": 120.0, "y": 80.0, "width": 300.0, "height": 200.0} }
     """
     project_id = get_current_project_id()
     if project_id is None or not positions:
@@ -314,11 +340,40 @@ def save_module_positions(positions: Dict[int, Dict[str, float]]) -> None:
     with get_connection() as conn:
         cur = conn.cursor()
         for mod_id, pos in positions.items():
-            cur.execute(
-                "UPDATE modules SET pos_x = %s, pos_y = %s "
-                "WHERE id = %s AND project_id = %s",
-                (pos["x"], pos["y"], mod_id, project_id),
-            )
+            x = pos.get("x")
+            y = pos.get("y")
+            w = pos.get("width")
+            h = pos.get("height")
+            if w is not None and h is not None:
+                cur.execute(
+                    "UPDATE modules SET pos_x = %s, pos_y = %s, width = %s, height = %s "
+                    "WHERE id = %s AND project_id = %s",
+                    (x, y, w, h, mod_id, project_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE modules SET pos_x = %s, pos_y = %s "
+                    "WHERE id = %s AND project_id = %s",
+                    (x, y, mod_id, project_id),
+                )
+        conn.commit()
+
+
+def save_module_size(module_id: int, width: float, height: float) -> None:
+    """
+    Persist module dimensions after a resize operation.
+    """
+    project_id = get_current_project_id()
+    if project_id is None:
+        return
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE modules SET width = %s, height = %s "
+            "WHERE id = %s AND project_id = %s",
+            (width, height, module_id, project_id),
+        )
         conn.commit()
 
 
@@ -455,7 +510,8 @@ def rename_module(module_id: int, new_name: str) -> None:
 def create_module(name: str, x: float = 40.0, y: float = 40.0,
                    width: float = DEFAULT_MODULE_WIDTH,
                    height: float = DEFAULT_MODULE_HEIGHT,
-                   color: Optional[str] = None) -> Optional[int]:
+                   color: Optional[str] = None,
+                   subsystem_id: Optional[int] = None) -> Optional[int]:
     """Insert a new module and return its id."""
     project_id = get_current_project_id()
     if project_id is None or not name.strip():
@@ -464,9 +520,9 @@ def create_module(name: str, x: float = 40.0, y: float = 40.0,
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO modules (project_id, name, color, pos_x, pos_y, width, height, mass, power) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 0) RETURNING id",
-            (project_id, name.strip(), color, x, y, width, height),
+            "INSERT INTO modules (project_id, name, color, pos_x, pos_y, width, height, mass, power, subsystem_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 0, %s) RETURNING id",
+            (project_id, name.strip(), color, x, y, width, height, subsystem_id),
         )
         new_id = cur.fetchone()[0]
         conn.commit()

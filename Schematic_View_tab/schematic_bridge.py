@@ -63,9 +63,11 @@ class SchematicBridge(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # None = whole project scene; otherwise a list of module ids,
-        # set via set_module_selection() (mirrors SchematicTreeSelector).
+        # None = whole project scene; otherwise a list/set of ids,
+        # set via set_selection() (mirrors SchematicTreeSelector).
         self._selected_module_ids = None
+        self._selected_connector_ids = None
+        self._selected_pin_ids = None
         self._host_widget = None
 
         style_manager.theme_changed.connect(self._on_theme_changed)
@@ -82,7 +84,12 @@ class SchematicBridge(QObject):
             return
 
         try:
-            scene = load_schematic_scene(self._selected_module_ids)
+            mod_ids, conn_ids, pin_ids = self._get_selection()
+            scene = load_schematic_scene(
+                module_ids=mod_ids,
+                connector_ids=conn_ids,
+                pin_ids=pin_ids,
+            )
             self.scene_data_ready.emit(json.dumps(scene))
         except Exception as e:
             self.scene_data_ready.emit(
@@ -105,16 +112,40 @@ class SchematicBridge(QObject):
     @pyqtSlot(str)
     def set_module_selection(self, module_ids_json: str):
         """
-        Restrict the scene to a subset of modules (mirrors
-        SchematicTreeSelector's checkbox tree). Call with "[]" or an
-        empty string to show the whole project again.
+        Legacy single-category setter. Delegates to set_selection() with
+        modules-only. Kept for backward compatibility.
         """
         try:
             ids = json.loads(module_ids_json) if module_ids_json else []
-            self._selected_module_ids = [int(i) for i in ids] if ids else None
+            self.set_selection(modules=[int(i) for i in ids] if ids else [])
         except (ValueError, TypeError):
-            self._selected_module_ids = None
+            self.set_selection()
+
+    def set_selection(self, modules=None, connectors=None, pins=None):
+        """
+        Store the full tree selection and reload the scene.
+
+        Args:
+            modules: list of selected module IDs (empty = show all)
+            connectors: list of selected connector IDs (empty = show none unless modules is empty)
+            pins: list of selected pin IDs (empty = show none unless connectors is empty)
+
+        Note: An empty modules list means "show everything" (bridge shows
+        all modules). When modules ARE specified, the connectors and pins
+        lists further filter what's visible within those modules.
+        """
+        self._selected_module_ids = [int(i) for i in (modules or [])] if modules else None
+        self._selected_connector_ids = set(int(i) for i in (connectors or [])) if connectors else None
+        self._selected_pin_ids = set(int(i) for i in (pins or [])) if pins else None
         self.get_scene_data()
+
+    def _get_selection(self):
+        """Return the full selection tuple for the scene model."""
+        return (
+            self._selected_module_ids,
+            self._selected_connector_ids,
+            self._selected_pin_ids,
+        )
 
     # ------------------------------------------------------------------
     # Saving (called from JS after a drag / edit)
@@ -224,9 +255,10 @@ class SchematicBridge(QObject):
             self.save_finished.emit(False, f"Failed to rename module: {e}")
 
     @pyqtSlot(str, result=int)
-    def create_module(self, name: str):
+    def create_module(self, name: str, subsystem_id: int = -1):
         try:
-            new_id = persist_create_module(name)
+            sid = subsystem_id if subsystem_id >= 0 else None
+            new_id = persist_create_module(name, subsystem_id=sid)
             if new_id is None:
                 self.save_finished.emit(False, "Could not create module")
                 return -1

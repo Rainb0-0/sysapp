@@ -45,6 +45,21 @@
 
   /* ========= Module Styles ========= */
   .module-box { cursor: move; }
+  .module-box:hover .resize-handle {
+    opacity: 0.85 !important;
+    fill: rgba(91, 141, 239, 0.15) !important;
+  }
+  .resize-handle {
+    transition: opacity 0.12s ease, fill 0.12s ease, transform 0.12s ease;
+    transform-box: fill-box;
+    transform-origin: center;
+  }
+  .resize-handle:hover {
+    opacity: 1 !important;
+    fill: rgba(91, 141, 239, 0.45) !important;
+    transform: scale(1.4);
+    filter: drop-shadow(0 0 3px rgba(91, 141, 239, 0.5));
+  }
   .module-rect {
     stroke: var(--primary-light); stroke-width: 1.5;
     transition: stroke-width 0.15s ease, stroke 0.15s ease;
@@ -108,6 +123,25 @@
   .interface-path.selected {
     stroke-width: 3.5; opacity: 1;
     filter: drop-shadow(0 0 4px rgba(91, 141, 239, 0.4));
+  }
+  /* Show drag handles when hovering the interface path */
+  .interface-path:hover ~ .interface-drag-handle,
+  .interface-path:hover + .interface-drag-handle,
+  .interface-drag-handle:hover {
+    opacity: 0.6 !important;
+    fill: rgba(91, 141, 239, 0.15) !important;
+  }
+  /* Sibling hover trick using JS would be better, but this covers the basic hover for handles */
+  .interface-drag-handle {
+    transition: opacity 0.12s ease, fill 0.12s ease, transform 0.12s ease;
+    transform-box: fill-box;
+    transform-origin: center;
+  }
+  .interface-drag-handle:hover {
+    opacity: 1 !important;
+    fill: rgba(91, 141, 239, 0.4) !important;
+    transform: scale(1.5);
+    filter: drop-shadow(0 0 4px rgba(91, 141, 239, 0.6));
   }
 
   /* Temporary drag line (dashed while creating a connection) */
