@@ -404,7 +404,8 @@ function renderSubsystemHalos(scene) {
 
     Object.keys(groups).forEach(function (ssId) {
         const group = groups[ssId];
-        if (group.modules.length < 2) return;
+        // Show halo even for single-module subsystems
+        if (group.modules.length < 1) return;
 
         // Compute bounds including wiring
         var bounds = _computeHaloBounds(scene, group, pinModMap);
@@ -486,7 +487,8 @@ function updateSubsystemHalosInPlace(scene) {
 
     Object.keys(groups).forEach(function (ssId) {
         const group = groups[ssId];
-        if (group.modules.length < 2) return;
+        // Show halo even for single-module subsystems
+        if (group.modules.length < 1) return;
 
         // Compute bounds including wiring
         var bounds = _computeHaloBounds(scene, group, pinModMap);

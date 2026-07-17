@@ -786,11 +786,25 @@ def create_mode(mode_name, module_ids):
             cur.execute("DELETE FROM mode_modules WHERE mode_name = %s AND project_id = %s",
                         (mode_name, current_project_id))
 
+            # Safety: filter out module IDs that no longer exist in the modules table,
+            # to avoid foreign-key constraint violations when modules were deleted
+            # after being added to a mode.
+            if module_ids:
+                placeholders = ",".join("%s" for _ in module_ids)
+                cur.execute(
+                    f"SELECT id FROM modules WHERE id IN ({placeholders}) AND project_id = %s",
+                    (*module_ids, current_project_id),
+                )
+                valid_ids = {row[0] for row in cur.fetchall()}
+            else:
+                valid_ids = set()
+
             for mid in module_ids:
-                cur.execute("""
-                    INSERT INTO mode_modules (mode_name, module_id, project_id)
-                    VALUES (%s, %s, %s)
-                """, (mode_name, mid, current_project_id))
+                if mid in valid_ids:
+                    cur.execute("""
+                        INSERT INTO mode_modules (mode_name, module_id, project_id)
+                        VALUES (%s, %s, %s)
+                    """, (mode_name, mid, current_project_id))
 
             conn.commit()
             return True

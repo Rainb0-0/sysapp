@@ -53,6 +53,7 @@ from styles.theme_manager import theme_manager
 
 from Schematic_View_tab.schematic_bridge import SchematicBridge
 from Schematic_View_tab.schematic_tree_selector import SchematicTreeSelector
+from Schematic_View_tab.mode.mode_web_panel import ModeWebPanel
 
 # ---------------------------------------------------------------------------
 # Grid layout constants for auto-positioning new modules (mirrors
@@ -188,17 +189,35 @@ class SchematicViewTab(QWidget):
 
         self.create_toolbar(main_layout)
 
-        splitter = QSplitter(Qt.Horizontal)
+        # ---- Splitter: tree | mode-panel | scene ----
+        self.splitter = QSplitter(Qt.Horizontal)
+
+        # Tree selector
         self.tree_selector = SchematicTreeSelector()
         self.tree_selector.selectionChanged.connect(self._on_tree_selection_changed)
         self.tree_selector.setMaximumWidth(280)
-        splitter.addWidget(self.tree_selector)
-        splitter.addWidget(self.create_scene_container())
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 900])
+        self.splitter.addWidget(self.tree_selector)
 
-        main_layout.addWidget(splitter)
+        # Mode panel (hidden by default)
+        self.mode_panel = ModeWebPanel()
+        self.mode_panel.set_tree_selector(self.tree_selector)
+        self.mode_panel.set_bridge(self.bridge)
+        self.mode_panel.modeEntered.connect(self._on_mode_entered)
+        self.mode_panel.modeExited.connect(self._on_mode_exited)
+        self.mode_panel.modeCreated.connect(self._on_mode_list_changed)
+        self.mode_panel.modeDeleted.connect(self._on_mode_list_changed)
+        self.mode_panel.modeSaved.connect(self._on_mode_list_changed)
+        self.mode_panel.hide()
+        self.splitter.addWidget(self.mode_panel)
+
+        self.splitter.addWidget(self.create_scene_container())
+
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 0)  # mode panel doesn't stretch
+        self.splitter.setStretchFactor(2, 1)
+        self.splitter.setSizes([260, 0, 900])
+
+        main_layout.addWidget(self.splitter)
 
     def _on_tree_selection_changed(self, checked_ids: dict):
         """
@@ -261,6 +280,14 @@ class SchematicViewTab(QWidget):
         self.save_layout_btn.clicked.connect(self.save_layout)
         layout.addWidget(self.refresh_btn)
         layout.addWidget(self.save_layout_btn)
+        layout.addSpacing(8)
+
+        # Modes toggle button
+        self.modes_btn = create_styled_button("🗂️ Modes", "normal")
+        self.modes_btn.setToolTip("Show/hide mode management panel")
+        self.modes_btn.setCheckable(True)
+        self.modes_btn.toggled.connect(self._toggle_mode_panel)
+        layout.addWidget(self.modes_btn)
         layout.addSpacing(30)
 
         self.export_pdf_btn = create_styled_button("PDF", "normal")
@@ -281,6 +308,7 @@ class SchematicViewTab(QWidget):
             self.fit_view_btn,
             self.refresh_btn,
             self.save_layout_btn,
+            self.modes_btn,
             self.export_pdf_btn,
             self.export_png_btn,
         ):
@@ -356,6 +384,7 @@ class SchematicViewTab(QWidget):
             self.fit_view_btn,
             self.refresh_btn,
             self.save_layout_btn,
+            self.modes_btn,
             self.export_pdf_btn,
             self.export_png_btn,
         ):
@@ -368,10 +397,67 @@ class SchematicViewTab(QWidget):
         pass
 
     # ------------------------------------------------------------------
+    # Mode panel integration
+    # ------------------------------------------------------------------
+    def _toggle_mode_panel(self, visible: bool):
+        """Show or hide the mode management panel."""
+        if visible:
+            self.mode_panel.refresh_modes()
+            self.mode_panel.show()
+            # Adjust splitter sizes to make room
+            sizes = self._get_splitter_sizes()
+            if len(sizes) >= 3:
+                sizes[1] = 240  # mode panel width
+                # Shrink tree selector proportionally
+                tree_w = sizes[0]
+                if tree_w > 200:
+                    sizes[0] = max(180, tree_w - 240)
+                self.splitter.setSizes(sizes)
+        else:
+            self.mode_panel.hide()
+            # Restore splitter
+            sizes = self._get_splitter_sizes()
+            if len(sizes) >= 3:
+                sizes[1] = 0
+                if sizes[0] < 200:
+                    sizes[0] = 260
+                self.splitter.setSizes(sizes)
+
+    def _get_splitter_sizes(self):
+        """Get splitter sizes (handle case where splitter doesn't exist yet)."""
+        if hasattr(self, "splitter"):
+            return list(self.splitter.sizes())
+        return [260, 0, 900]
+
+    def _on_mode_entered(self, mode_name: str):
+        """Called when a mode is entered — refresh scene."""
+        if self.page_ready:
+            self.bridge.get_scene_data()
+
+    def _on_mode_exited(self):
+        """Called when mode is exited — refresh scene."""
+        if self.page_ready:
+            self.bridge.get_scene_data()
+
+    def _on_mode_list_changed(self, mode_name: str = None):
+        """Called when modes are created/deleted/saved — refresh scene."""
+        if self.page_ready:
+            self.bridge.get_scene_data()
+
+    # ------------------------------------------------------------------
     # Toolbar actions
     # ------------------------------------------------------------------
     def refresh_scene(self):
+        """Refresh the scene data AND the tree selector from the database."""
         self.bridge.refresh_scene_data()
+
+        # Refresh the tree selector silently, then re-apply saved selection
+        # This avoids the flicker caused by refresh_tree() emitting an empty
+        # selection and then apply_selection() emitting a second time.
+        if hasattr(self, "tree_selector") and hasattr(self.tree_selector, "refresh_tree"):
+            saved_selection = self.tree_selector.get_checked_ids()
+            self.tree_selector.refresh_tree(emit_selection=False)
+            self.tree_selector.apply_selection(saved_selection)
 
     def add_module(self):
         from PyQt5.QtWidgets import QInputDialog, QComboBox, QDialog, QVBoxLayout, QLabel, QDialogButtonBox
@@ -441,14 +527,17 @@ class SchematicViewTab(QWidget):
         if new_id > 0:
             _place_module_without_overlap(new_id, name.strip())
 
-        # Force refresh the scene immediately
+        # Force refresh the scene and the tree selector immediately.
+        # The new module is injected into the saved selection so it gets
+        # auto-checked and appears on screen.
         self.bridge.get_scene_data()
 
-        # Refresh the tree selector preserving current selection state
         if hasattr(self, "tree_selector") and hasattr(self.tree_selector, "refresh_tree"):
             saved_selection = self.tree_selector.get_checked_ids()
-            self.tree_selector.refresh_tree()
-            # Restore the previous selection so the sidebar doesn't reset
+            # Include the newly created module so it shows up on screen
+            if new_id > 0 and new_id not in saved_selection["modules"]:
+                saved_selection["modules"].append(new_id)
+            self.tree_selector.refresh_tree(emit_selection=False)
             self.tree_selector.apply_selection(saved_selection)
 
     def save_layout(self):

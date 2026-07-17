@@ -316,8 +316,15 @@ class SchematicTreeSelector(QWidget):
         self.update_expand_button()
         self.update_selection_button()
 
-    def refresh_tree(self):
-        """Refresh the tree with data from the database"""
+    def refresh_tree(self, emit_selection: bool = True):
+        """
+        Refresh the tree with data from the database.
+
+        Args:
+            emit_selection: If True, emit selectionChanged after rebuilding.
+                Pass False when you plan to call apply_selection() right after
+                to avoid a double emission (which causes flicker).
+        """
         if not self.tree:
             return
         
@@ -400,8 +407,8 @@ class SchematicTreeSelector(QWidget):
 
         self.tree.blockSignals(False)
         self._rebuild_index()
-        # Emit empty selection to reset the bridge on tab switch
-        self.selectionChanged.emit(self.get_checked_ids())
+        if emit_selection:
+            self.selectionChanged.emit(self.get_checked_ids())
         self.update_selection_button()
         self.update_expand_button()
 
