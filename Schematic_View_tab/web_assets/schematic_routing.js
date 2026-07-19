@@ -15,6 +15,12 @@
 // output closely enough in practice.
 
 const ORTHO_EPS = 1.5;
+const GRID_SIZE = 20;
+
+function snapToGrid(v) {
+    return Math.round(v / GRID_SIZE) * GRID_SIZE;
+}
+
 const SIDE_VECTORS = {
     right:  { x: +1, y: 0 },
     left:   { x: -1, y: 0 },
@@ -33,9 +39,10 @@ function uniqueSorted(vals) {
 class GridRouter {
     constructor(rects, margin) {
         // rects: [{x, y, width, height}, ...] in scene coordinates (NOT yet inflated)
+        // Snap inflated rect edges to grid so all routes are grid-aligned (no diagonal wires)
         this.rects = rects.map(r => ({
-            left: r.x - margin, top: r.y - margin,
-            right: r.x + r.width + margin, bottom: r.y + r.height + margin,
+            left: snapToGrid(r.x - margin), top: snapToGrid(r.y - margin),
+            right: snapToGrid(r.x + r.width + margin), bottom: snapToGrid(r.y + r.height + margin),
         }));
         this.margin = margin;
     }
@@ -210,6 +217,11 @@ function extrudedLeadPoint(p, side, length) {
     return { x: p.x + v.x * length, y: p.y + v.y * length };
 }
 
+// Snap a point {x, y} to grid
+function snapPoint(p) {
+    return { x: snapToGrid(p.x), y: snapToGrid(p.y) };
+}
+
 /**
  * Compute an orthogonal route between two pins, going around the given
  * module rectangles (obstacles). Mirrors SmartOrthogonalConnector's
@@ -222,28 +234,62 @@ function extrudedLeadPoint(p, side, length) {
  * @param {number} lead    stub length extruded from the pin before routing (matches DEFAULT_LEAD_LENGTH = 24)
  */
 function routeOrthogonal(fromPin, toPin, obstacleRects, margin = 20, lead = 24) {
-    const startLead = extrudedLeadPoint(fromPin, fromPin.side || 'right', Math.max(lead, margin + 2));
-    const endLead = extrudedLeadPoint(toPin, toPin.side || 'left', Math.max(lead, margin + 2));
+    // Snap pin positions to grid so the entire route is grid-aligned
+    const snappedFrom = snapPoint(fromPin);
+    snappedFrom.side = fromPin.side || 'right';
+    const snappedTo = snapPoint(toPin);
+    snappedTo.side = toPin.side || 'left';
+
+    const startLead = extrudedLeadPoint(snappedFrom, snappedFrom.side, Math.max(lead, margin + 2));
+    const endLead = extrudedLeadPoint(snappedTo, snappedTo.side, Math.max(lead, margin + 2));
+
+    // Snap lead points to grid
+    const snappedStartLead = snapPoint(startLead);
+    const snappedEndLead = snapPoint(endLead);
 
     const router = new GridRouter(obstacleRects, margin);
-    const middle = router.route(startLead, endLead);
+    const middle = router.route(snappedStartLead, snappedEndLead);
     if (!middle) {
-        // No obstacle-free path found -- fall back to a direct line through
-        // the lead stubs so the connection never just disappears.
-        return [fromPin, startLead, endLead, toPin];
+        // No obstacle-free path found -- create a grid-aligned L-shaped
+        // fallback so the connection never just disappears.
+        // The bend point splits startLead->endLead into two axis-aligned legs.
+        const bendX = snapToGrid(snappedStartLead.x);
+        const bendY = snapToGrid(snappedEndLead.y);
+        var fallbackPoints = [
+            snappedFrom,
+            snappedStartLead,
+            { x: bendX, y: bendY },
+            snappedEndLead,
+            snappedTo
+        ];
+        // Apply leg snapping so first/last segments are perpendicular to pins
+        if (fallbackPoints.length >= 2) {
+            var sideS = snappedFrom.side;
+            if (sideS === 'left' || sideS === 'right') fallbackPoints[1].y = fallbackPoints[0].y;
+            else fallbackPoints[1].x = fallbackPoints[0].x;
+            var n = fallbackPoints.length;
+            var sideE = snappedTo.side;
+            if (sideE === 'left' || sideE === 'right') fallbackPoints[n - 2].y = fallbackPoints[n - 1].y;
+            else fallbackPoints[n - 2].x = fallbackPoints[n - 1].x;
+        }
+        return fallbackPoints;
     }
 
-    const points = [fromPin, startLead, ...middle, endLead, toPin];
+    // Snap all middle points to grid (the router should produce snapped points
+    // since inputs are snapped, but this ensures consistency)
+    const snappedMiddle = middle.map(snapPoint);
+
+    const points = [snappedFrom, snappedStartLead, ...snappedMiddle, snappedEndLead, snappedTo];
 
     // Snap the first/last legs to be perpendicular to each pin
     // (mirrors _snap_first_last_legs in smart_connection.py).
     if (points.length >= 2) {
-        const sideS = fromPin.side || 'right';
+        const sideS = snappedFrom.side;
         if (sideS === 'left' || sideS === 'right') points[1].y = points[0].y;
         else points[1].x = points[0].x;
 
         const n = points.length;
-        const sideE = toPin.side || 'left';
+        const sideE = snappedTo.side;
         if (sideE === 'left' || sideE === 'right') points[n - 2].y = points[n - 1].y;
         else points[n - 2].x = points[n - 1].x;
     }

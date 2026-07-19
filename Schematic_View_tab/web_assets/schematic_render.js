@@ -38,6 +38,7 @@ const CONNECTOR_GAP = 12;  // minimum gap between connector edges on same side
 const CONNECTOR_BBOX_PAD = 8; // extra padding around connector bounding box
 const EDGE_MARGIN = 8; // min distance from edge corners for connector placement
 
+// GRID_SIZE and snapToGrid are defined in schematic_routing.js (loaded first)
 
 // Real DB side values are 'left' | 'right' | 'top' | 'bottom' (default 'top').
 // normal = direction the stub sticks out; tangent = direction pins spread along the stub.
@@ -288,9 +289,12 @@ function render(scene) {
         if (typeof c.y !== 'number' || isNaN(c.y)) c.y = 0;
     });
 
+    // Draw faint grid background (before everything else)
+    renderGridBackground();
+
     const pinLookup = buildPinLookup(scene);
 
-    // Draw subsystem halos first (behind everything)
+    // Draw subsystem halos next (behind modules and wires)
     renderSubsystemHalos(scene);
 
     renderInterfaces(scene, pinLookup, null); // null = recompute all routes on full render
@@ -304,6 +308,52 @@ function render(scene) {
     }
 }
 render.hasFitOnce = false;
+
+// ---------------------------------------------------------------------
+// Faint grid background — graph-paper-style grid lines at GRID_SIZE intervals
+// ---------------------------------------------------------------------
+function renderGridBackground() {
+    // Use a <pattern> so the grid tiles efficiently without creating
+    // thousands of individual line elements. The pattern is defined once
+    // and fills an infinite-looking background rect.
+    var defs = g.select('defs.grid-defs').node();
+    if (!defs) {
+        defs = g.append('defs').attr('class', 'grid-defs').node();
+    }
+
+    // Only create the pattern if it doesn't already exist on the SVG
+    var patternId = 'grid-pattern-' + GRID_SIZE;
+    var existing = g.select('pattern#' + patternId).node();
+    if (!existing) {
+        var pattern = d3.select(defs).append('pattern')
+            .attr('id', patternId)
+            .attr('width', GRID_SIZE)
+            .attr('height', GRID_SIZE)
+            .attr('patternUnits', 'userSpaceOnUse');
+
+        // Crosshair grid lines: horiz + vert lines from origin
+        pattern.append('path')
+            .attr('d', 'M ' + GRID_SIZE + ' 0 L 0 0 0 ' + GRID_SIZE)
+            .attr('fill', 'none')
+            .attr('stroke', 'rgba(255, 255, 255, 0.04)')
+            .attr('stroke-width', 0.5);
+    }
+
+    // A large background rect with the pattern fill — sits behind everything
+    // Use a fixed large size rather than viewport-dependent so pan/zoom
+    // always sees grid lines.
+    var bg = g.select('.grid-bg').node();
+    if (!bg) {
+        g.insert('rect', ':first-child')
+            .attr('class', 'grid-bg')
+            .attr('x', -10000)
+            .attr('y', -10000)
+            .attr('width', 20000)
+            .attr('height', 20000)
+            .attr('fill', 'url(#' + patternId + ')')
+            .attr('pointer-events', 'none');
+    }
+}
 
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
@@ -1165,6 +1215,59 @@ function showPinContextMenu(event, pinDatum, connectorDatum) {
     ]);
 }
 
+function showInterfaceDragHandleContextMenu(event, ifaceId, pointIndex, scene) {
+    // Find the interface by ID
+    var iface = null;
+    for (var k = 0; k < scene.interfaces.length; k++) {
+        if (scene.interfaces[k].id === ifaceId) {
+            iface = scene.interfaces[k];
+            break;
+        }
+    }
+    
+    if (!iface || !iface.points || iface.points.length <= 3) {
+        // Can't remove a pivot if there are only 2 endpoints + 0 interior points,
+        // or only 1 interior point.
+        // Actually need at least 3 points to have an interior pivot to remove
+        // (2 endpoints + at least 1 interior pivot).
+        // Minimum 3 points: start, interior, end. So removing one leaves 2 = straight line.
+        // Only show if there are interior pivots to remove (points.length > 2).
+        if (!iface || !iface.points || iface.points.length <= 2) return;
+    }
+    
+    showContextMenu(event, [
+        { icon: '\u2796', label: 'Remove Pivot', action: function () { removePivotFromInterface(ifaceId, pointIndex); } },
+    ]);
+}
+
+function removePivotFromInterface(ifaceId, pointIndex) {
+    // Find the interface in sceneData
+    var iface = null;
+    var ifaceIdx = -1;
+    for (var k = 0; k < sceneData.interfaces.length; k++) {
+        if (sceneData.interfaces[k].id === ifaceId) {
+            iface = sceneData.interfaces[k];
+            ifaceIdx = k;
+            break;
+        }
+    }
+    
+    if (!iface || !iface.points || iface.points.length <= 2) return;
+    
+    // Remove the interior point at the given index
+    iface.points.splice(pointIndex, 1);
+    
+    // Mark as manual override since the user modified the path
+    iface._manualOverride = true;
+    
+    // Persist the updated routes
+    persistCurrentRoutes();
+    
+    // Re-render the interface layer
+    g.select('.interfaces-layer').remove();
+    renderInterfaces(sceneData, buildPinLookup(sceneData), new Set());
+}
+
 function renameModulePrompt(moduleDatum) {
     const newName = prompt('Module name:', moduleDatum.name);
     if (newName && newName.trim() && bridge) {
@@ -1318,6 +1421,11 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
                     .attr('opacity', 0)
                     .on('mouseenter', function () { d3.select(this).attr('opacity', 0.6); })
                     .on('mouseleave', function () { d3.select(this).attr('opacity', 0); })
+                    .on('contextmenu', function (event) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        showInterfaceDragHandleContextMenu(event, iface.id, pi, sceneData);
+                    })
                     .call(d3.drag()
                         .on('start', function (event) {
                             event.sourceEvent.stopPropagation();
@@ -1326,16 +1434,23 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
                         .on('drag', function (event) {
                             // Use d3.pointer to get coords in scene (g) space
                             var pt = d3.pointer(event.sourceEvent, g.node());
-                            var newX = pt[0];
-                            var newY = pt[1];
+                            var newX = snapToGrid(pt[0]);
+                            var newY = snapToGrid(pt[1]);
                             points[pi] = [newX, newY];
                             iface.points = points;
                             d3.select(this).attr('cx', newX).attr('cy', newY);
-                            path.attr('d', line(points));
+                            // Show the orthogonal preview live during drag
+                            path.attr('d', line(enforceOrthogonalRoute(points)));
                         })
                         .on('end', function () {
                             d3.select(this).attr('opacity', 0.6).attr('fill', 'transparent');
                             iface._manualOverride = true;
+                            // Enforce orthogonal route — insert bend points
+                            // wherever a diagonal segment was created by the drag
+                            iface.points = enforceOrthogonalRoute(iface.points);
+                            // Update the path immediately so the user sees the
+                            // orthogonal result without waiting for a re-render
+                            path.attr('d', line(iface.points));
                             persistCurrentRoutes();
                         })
                     );
@@ -1389,6 +1504,29 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
 
                     if (bestIdx >= 0) {
                         dragState = { pointIndex: bestIdx + 1, hadDrag: false };
+                        // Constrain the snapped insertion point to stay on the
+                        // segment's axis. For vertical segments, snap Y only and
+                        // keep X on the segment. For horizontal, snap X only.
+                        // This prevents diagonal segments when existing points
+                        // aren't perfectly grid-aligned.
+                        var segAx = points[bestIdx], segBx = points[bestIdx + 1];
+                        var ax = Array.isArray(segAx) ? segAx[0] : (segAx.x !== undefined ? segAx.x : segAx[0]);
+                        var ay = Array.isArray(segAx) ? segAx[1] : (segAx.y !== undefined ? segAx.y : segAx[1]);
+                        var bx = Array.isArray(segBx) ? segBx[0] : (segBx.x !== undefined ? segBx.x : segBx[0]);
+                        var by = Array.isArray(segBx) ? segBx[1] : (segBx.y !== undefined ? segBx.y : segBx[1]);
+                        if (Math.abs(ax - bx) < 0.001) {
+                            // Vertical segment: keep X aligned, snap Y only
+                            insertX = ax;
+                            insertY = snapToGrid(insertY);
+                        } else if (Math.abs(ay - by) < 0.001) {
+                            // Horizontal segment: keep Y aligned, snap X only
+                            insertX = snapToGrid(insertX);
+                            insertY = ay;
+                        } else {
+                            // Diagonal or single-point segment: snap both
+                            insertX = snapToGrid(insertX);
+                            insertY = snapToGrid(insertY);
+                        }
                         points.splice(bestIdx + 1, 0, [insertX, insertY]);
                         iface.points = points;
                         path.attr('d', line(points));
@@ -1408,12 +1546,15 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
                     if (!dragState) return;
                     dragState.hadDrag = true;
                     var pt = d3.pointer(event.sourceEvent, g.node());
+                    var sx = snapToGrid(pt[0]);
+                    var sy = snapToGrid(pt[1]);
                     var idx = dragState.pointIndex;
-                    points[idx] = [pt[0], pt[1]];
+                    points[idx] = [sx, sy];
                     iface.points = points;
-                    path.attr('d', line(points));
+                    // Show the orthogonal preview live during drag
+                    path.attr('d', line(enforceOrthogonalRoute(points)));
                     if (dragState.handle) {
-                        dragState.handle.attr('cx', pt[0]).attr('cy', pt[1]);
+                        dragState.handle.attr('cx', sx).attr('cy', sy);
                     }
                 })
                 .on('end', function () {
@@ -1435,6 +1576,9 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
                     
                     if (iface && iface.points && iface.points.length > 2) {
                         iface._manualOverride = true;
+                        // Enforce orthogonal route — insert bend points
+                        // wherever a diagonal segment was created by the drag
+                        iface.points = enforceOrthogonalRoute(iface.points);
                         persistCurrentRoutes();
                         // Re-render the interface layer to show proper drag handles
                         // at all vertices (including the newly created one)
@@ -1451,14 +1595,52 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
 // Uses the ported A* orthogonal router from schematic_routing.js when
 // available; falls back to a straight line so the connection never just
 // disappears if that script failed to load.
+// After any drag operation, scan the route and insert bend points wherever
+// a diagonal segment exists. This ensures the wire always stays orthogonal
+// (horizontal + vertical segments only) even when pivot points are dragged
+// to positions that don't align with their neighbors.
+function enforceOrthogonalRoute(pts) {
+    if (!pts || pts.length < 3) return pts;
+    var result = [pts[0]];
+    for (var i = 1; i < pts.length; i++) {
+        var prev = result[result.length - 1];
+        var cur = pts[i];
+        var px = Array.isArray(prev) ? prev[0] : prev.x;
+        var py = Array.isArray(prev) ? prev[1] : prev.y;
+        var cx = Array.isArray(cur) ? cur[0] : cur.x;
+        var cy = Array.isArray(cur) ? cur[1] : cur.y;
+        
+        if (Math.abs(px - cx) > 0.001 && Math.abs(py - cy) > 0.001) {
+            // Diagonal segment — insert a bend point using prev's X and cur's Y
+            // to create an L-shaped (horizontal-then-vertical) path
+            var bend = Array.isArray(cur) ? [px, cy] : { x: px, y: cy };
+            result.push(bend);
+        }
+        result.push(cur);
+    }
+    return result;
+}
+
+function snapRoutePointsToGrid(points) {
+    if (!points) return points;
+    return points.map(function (p) {
+        var x = p[0] !== undefined ? p[0] : p.x;
+        var y = p[1] !== undefined ? p[1] : p.y;
+        var sx = snapToGrid(x);
+        var sy = snapToGrid(y);
+        return Array.isArray(p) ? [sx, sy] : { x: sx, y: sy };
+    });
+}
+
 function computeRoutePoints(fromPin, toPin, obstacleRects) {
     if (window.SchematicRouting) {
         const routed = window.SchematicRouting.routeOrthogonal(
             fromPin, toPin, obstacleRects, ROUTE_MARGIN, ROUTE_LEAD
         );
-        return routed.map(p => [p.x, p.y]);
+        return snapRoutePointsToGrid(routed.map(p => [p.x, p.y]));
     }
-    return [[fromPin.x, fromPin.y], [toPin.x, toPin.y]];
+    var direct = [[fromPin.x, fromPin.y], [toPin.x, toPin.y]];
+    return snapRoutePointsToGrid(direct);
 }
 
 // ---------------------------------------------------------------------
