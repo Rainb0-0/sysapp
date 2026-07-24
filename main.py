@@ -214,6 +214,10 @@ class ModuleWiringApp(QMainWindow):
         self._hb.setInterval(20000)  # 20s
         self._hb.timeout.connect(auth.heartbeat)
         auth.auth_changed.connect(self._on_auth_changed_timer)
+        # Start the timer immediately if already logged in (e.g. from LoginDialog
+        # shown before ModuleWiringApp was created — auth_changed fired before
+        # we connected the handler above, so _on_auth_changed_timer was skipped).
+        self._on_auth_changed_timer()
         self.update_user_banner()
 
         # Initialize database connection and show project selection
