@@ -18,8 +18,14 @@ let svg, g, zoom;
 let currentZoom = 1;
 let sceneData = { modules: [], connectors: [], interfaces: [] };
 
-let selectedModuleId = null;
-let selectedInterfaceId = null;
+// Multi-selection sets (rubber-band & shift-click)
+let selectedModuleIds = new Set();
+let selectedInterfaceIds = new Set();
+let selectionRect = null;      // { startX, startY, currentX, currentY } – active rubber band
+let isSpaceDown = false;       // for space+drag pan (Photoshop-style)
+let batchDragState = null;     // { startPositions: {modId: {x, y}} } during batch drag
+let isSelecting = false;       // rubber-band selection in progress; disables d3-zoom pan
+let _selectionDragCompleted = false;  // guard to prevent click handler from clearing just-made selection
 let connectDrag = null; // { fromPinId, tempPath }
 let toastCount = 0;
 
@@ -87,6 +93,7 @@ document.addEventListener('DOMContentLoaded', function () {
     setupScene();
     initializeWebChannel();
     setupKeyboardShortcuts();
+    setupPanModifiers();
 });
 
 // ---------------------------------------------------------------------
@@ -146,14 +153,18 @@ function setupScene() {
     zoom = d3.zoom()
         .scaleExtent([0.1, 6])
         .filter(function (event) {
-            // Allow standard zoom/pan interactions (scroll wheel, etc.)
+            // Allow standard zoom/pan interactions (scroll wheel, middle mouse, ctrl/meta)
             if (event.type === 'wheel' || event.type === 'dblclick' ||
                 event.type === 'mousedown' && (event.button === 1 || event.ctrlKey || event.metaKey)) {
                 return true;
             }
-            // Don't start pan on elements that have their own drag behavior:
-            // interface paths, interface drag handles, pin circles, connector hitboxes,
-            // resize handles, connector drag handles, connector interactive groups.
+            // Space+drag = pan (Photoshop/Inkscape style)
+            if (event.type === 'mousedown' && isSpaceDown) {
+                return true;
+            }
+            // Rubber-band selection in progress — no panning
+            if (isSelecting) return false;
+            // Don't start pan on elements that have their own drag behavior
             var target = event.target;
             if (target) {
                 var cls = target.getAttribute && target.getAttribute('class');
@@ -168,6 +179,10 @@ function setupScene() {
                         return false;
                     }
                 }
+            }
+            // Plain left-click on blank canvas = start rubber-band selection, not pan
+            if (event.type === 'mousedown' && event.button === 0 && !event.ctrlKey && !event.metaKey) {
+                return false;
             }
             return true;
         })
@@ -186,46 +201,228 @@ function updateZoomInfo() {
     if (el) el.textContent = 'Zoom: ' + Math.round(currentZoom * 100) + '%';
 }
 
+function setupPanModifiers() {
+    document.addEventListener('keydown', function (event) {
+        if (event.key === ' ' && event.target.tagName !== 'INPUT') {
+            isSpaceDown = true;
+            document.body.style.cursor = 'grab';
+            event.preventDefault();
+        }
+    });
+    document.addEventListener('keyup', function (event) {
+        if (event.key === ' ') {
+            isSpaceDown = false;
+            document.body.style.cursor = '';
+        }
+    });
+}
+
 function setupKeyboardShortcuts() {
     document.addEventListener('keydown', function (event) {
         if (event.target.tagName === 'INPUT') return;
-        if (event.key === ' ') {
-            fitView();
-            event.preventDefault();
+        if (event.key === ' ' && !isSpaceDown) {
+            // First press of space goes to pan mode (handled by setupPanModifiers).
+            // If space is already down (from pan modifier), don't fit view.
+            // This allows space+drag for pan without also triggering fitView.
+            return;
         } else if (event.key === 'Delete' || event.key === 'Backspace') {
             handleDeleteKey();
             event.preventDefault();
         } else if (event.key === 'Escape') {
             clearSelection();
             cancelConnectDrag();
+        } else if (event.key.toLowerCase() === 'a' && (event.ctrlKey || event.metaKey)) {
+            // Ctrl+A / Cmd+A = select all
+            selectAll();
+            event.preventDefault();
+        }
+    });
+    document.addEventListener('keyup', function (event) {
+        if (event.key === ' ') {
+            isSpaceDown = false;
+            document.body.style.cursor = '';
         }
     });
 
+    // Left-click on empty canvas starts rubber-band selection
+    svg.on('mousedown.selection', function (event) {
+        if (event.button !== 0) return;          // left button only
+        if (isSpaceDown) return;                 // space+drag = pan
+        // Only start selection if clicking directly on the SVG (not on a module/connector/etc)
+        if (event.target !== svg.node()) return;
+        event.stopPropagation();
+        var pt = d3.pointer(event, g.node());
+        startSelectionRect(pt[0], pt[1]);
+    });
+
     svg.on('click', function (event) {
+        // If a rubber-band selection drag just completed, don't clear (finishSelectionRect
+        // already handled it).  This flag is set by finishSelectionRect.
+        if (_selectionDragCompleted) {
+            _selectionDragCompleted = false;
+            return;
+        }
         // Clicking empty canvas (not a module/pin/interface) clears selection.
-        if (event.target === svg.node()) clearSelection();
+        if (event.target === svg.node()) {
+            clearSelection();
+        }
     });
 }
 
 function handleDeleteKey() {
-    if (selectedInterfaceId != null) {
-        if (bridge && confirm('Delete this connection?')) {
-            bridge.delete_interface(selectedInterfaceId);
+    // Delete all selected interfaces first
+    if (selectedInterfaceIds.size > 0) {
+        var ids = Array.from(selectedInterfaceIds);
+        if (bridge && confirm('Delete ' + ids.length + ' selected connection(s)?')) {
+            ids.forEach(function (ifaceId) {
+                bridge.delete_interface(ifaceId);
+            });
         }
         clearSelection();
-    } else if (selectedModuleId != null) {
-        if (bridge && confirm('Delete this module and all its connections?')) {
-            bridge.delete_module(selectedModuleId);
+        return;
+    }
+    // Delete all selected modules
+    if (selectedModuleIds.size > 0) {
+        var ids = Array.from(selectedModuleIds);
+        if (bridge && confirm('Delete ' + ids.length + ' selected module(s) and all their connections?')) {
+            ids.forEach(function (modId) {
+                bridge.delete_module(modId);
+            });
         }
         clearSelection();
     }
 }
 
 function clearSelection() {
-    selectedModuleId = null;
-    selectedInterfaceId = null;
+    selectedModuleIds.clear();
+    selectedInterfaceIds.clear();
+    removeSelectionRect();
+    selectionRect = null;
     g.selectAll('.module-box').classed('selected', false);
     g.selectAll('.interface-path').classed('selected', false);
+}
+
+// ---------------------------------------------------------------------
+// Rubber-band / rectangle selection
+// ---------------------------------------------------------------------
+function startSelectionRect(x, y) {
+    isSelecting = true;  // prevent d3-zoom from panning
+    removeSelectionRect();
+    selectionRect = { startX: x, startY: y, currentX: x, currentY: y };
+    // Draw initial rect
+    drawSelectionRect();
+    svg.on('mousemove.selection', function (event) {
+        if (!selectionRect) return;
+        var pt = d3.pointer(event, g.node());
+        selectionRect.currentX = pt[0];
+        selectionRect.currentY = pt[1];
+        drawSelectionRect();
+    });
+    svg.on('mouseup.selection', function () {
+        finishSelectionRect();
+        svg.on('mousemove.selection', null);
+        svg.on('mouseup.selection', null);
+        isSelecting = false;
+    });
+    // Also cancel on mouseleave
+    svg.on('mouseleave.selection', function () {
+        finishSelectionRect();
+        svg.on('mousemove.selection', null);
+        svg.on('mouseup.selection', null);
+        svg.on('mouseleave.selection', null);
+        isSelecting = false;
+    });
+}
+
+function drawSelectionRect() {
+    removeSelectionRect();
+    if (!selectionRect) return;
+    var x = Math.min(selectionRect.startX, selectionRect.currentX);
+    var y = Math.min(selectionRect.startY, selectionRect.currentY);
+    var w = Math.abs(selectionRect.currentX - selectionRect.startX);
+    var h = Math.abs(selectionRect.currentY - selectionRect.startY);
+    if (w < 2 || h < 2) return; // too small to draw
+    g.append('rect')
+        .attr('class', 'selection-rect')
+        .attr('x', x).attr('y', y)
+        .attr('width', w).attr('height', h)
+        .attr('fill', 'rgba(91, 141, 239, 0.12)')
+        .attr('stroke', '#5b8def')
+        .attr('stroke-width', 1.5)
+        .attr('stroke-dasharray', '5,3')
+        .attr('pointer-events', 'none');
+}
+
+function removeSelectionRect() {
+    g.selectAll('.selection-rect').remove();
+}
+
+function finishSelectionRect() {
+    if (!selectionRect) return;
+    var x = Math.min(selectionRect.startX, selectionRect.currentX);
+    var y = Math.min(selectionRect.startY, selectionRect.currentY);
+    var w = Math.abs(selectionRect.currentX - selectionRect.startX);
+    var h = Math.abs(selectionRect.currentY - selectionRect.startY);
+    removeSelectionRect();
+
+    // If the rect is tiny, treat as a click (clear selection)
+    if (w < 4 && h < 4) {
+        clearSelection();
+        selectionRect = null;
+        return;
+    }
+
+    // Find items inside the rectangle
+    var newModIds = new Set();
+    var newIfaceIds = new Set();
+
+    // Check each module — intersect with selection rect
+    sceneData.modules.forEach(function (m) {
+        // Module bounding box in scene coords
+        var mx = m.x, my = m.y, mw = Math.max(m.width || MODULE_MIN_WIDTH, MODULE_MIN_WIDTH), mh = Math.max(m.height || MODULE_MIN_HEIGHT, MODULE_MIN_HEIGHT);
+        // Check if module rect overlaps selection rect
+        if (mx < x + w && mx + mw > x && my < y + h && my + mh > y) {
+            newModIds.add(m.id);
+        }
+    });
+
+    // Check each interface — points inside rect
+    sceneData.interfaces.forEach(function (iface) {
+        if (!iface.points) return;
+        for (var k = 0; k < iface.points.length; k++) {
+            var pt = iface.points[k];
+            var px = Array.isArray(pt) ? pt[0] : pt.x;
+            var py = Array.isArray(pt) ? pt[1] : pt.y;
+            if (px >= x && px <= x + w && py >= y && py <= y + h) {
+                newIfaceIds.add(iface.id);
+                break; // one point inside is enough
+            }
+        }
+    });
+
+    // Update selection (no shift = replace; but shift is not available on SVG click, so we replace)
+    selectedModuleIds = newModIds;
+    selectedInterfaceIds = newIfaceIds;
+
+    // Update visual selection state
+    g.selectAll('.module-box').classed('selected', function (d) { return selectedModuleIds.has(d.id); });
+    g.selectAll('.interface-path').classed('selected', function () {
+        var id = Number(d3.select(this).attr('data-interface-id'));
+        return selectedInterfaceIds.has(id);
+    });
+
+    _selectionDragCompleted = true;
+    selectionRect = null;
+}
+
+function selectAll() {
+    selectedModuleIds = new Set(sceneData.modules.map(function (m) { return m.id; }));
+    selectedInterfaceIds = new Set(sceneData.interfaces.map(function (iface) { return iface.id; }));
+    g.selectAll('.module-box').classed('selected', function (d) { return selectedModuleIds.has(d.id); });
+    g.selectAll('.interface-path').classed('selected', function () {
+        var id = Number(d3.select(this).attr('data-interface-id'));
+        return selectedInterfaceIds.has(id);
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -302,6 +499,8 @@ function render(scene) {
 
     if (!render.hasFitOnce) {
         setTimeout(() => { fitView(); render.hasFitOnce = true; }, 300);
+        // Show the rectangle-select hint briefly on first render
+        showSelectionHint();
     }
 }
 render.hasFitOnce = false;
@@ -710,9 +909,20 @@ function renderModules(scene) {
         .call(dragBehavior())
         .on('click', function (event, d) {
             event.stopPropagation();
-            selectedInterfaceId = null;
-            selectedModuleId = d.id;
-            g.selectAll('.module-box').classed('selected', dd => dd.id === d.id);
+            if (event.shiftKey) {
+                // Shift+click: toggle this module in/out of the selection
+                if (selectedModuleIds.has(d.id)) {
+                    selectedModuleIds.delete(d.id);
+                } else {
+                    selectedModuleIds.add(d.id);
+                }
+                selectedInterfaceIds.clear();
+            } else {
+                // Normal click: select just this module
+                selectedModuleIds = new Set([d.id]);
+                selectedInterfaceIds.clear();
+            }
+            g.selectAll('.module-box').classed('selected', dd => selectedModuleIds.has(dd.id));
             g.selectAll('.interface-path').classed('selected', false);
         })
         .on('contextmenu', function (event, d) {
@@ -1086,6 +1296,34 @@ function hideLoading() {
 }
 
 // ---------------------------------------------------------------------
+// Selection hint — shown briefly on first load so users know about
+// rectangle select (drag on empty canvas).
+// ---------------------------------------------------------------------
+function showSelectionHint() {
+    var hint = document.getElementById('hint-select');
+    if (!hint) return;
+    // Show after a short delay (after fitView animation)
+    setTimeout(function () {
+        hint.classList.remove('hidden');
+        // Auto-hide after 4 seconds
+        setTimeout(function () {
+            hint.classList.add('hidden');
+        }, 4000);
+    }, 1500);
+    // Also hide on first interaction
+    function dismissHint() {
+        hint.classList.add('hidden');
+        document.removeEventListener('mousedown', dismissHint);
+        document.removeEventListener('keydown', dismissHint);
+    }
+    document.addEventListener('mousedown', dismissHint, { once: true });
+    document.addEventListener('keydown', function (e) {
+        if (e.key === ' ') { /* don't dismiss on space (pan) */ return; }
+        dismissHint();
+    }, { once: true });
+}
+
+// ---------------------------------------------------------------------
 // Context menu
 // ---------------------------------------------------------------------
 function showContextMenu(event, items) {
@@ -1400,11 +1638,21 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
             .attr('d', line(displayPoints))
             .on('click', function (event) {
                 event.stopPropagation();
-                selectedModuleId = null;
-                selectedInterfaceId = iface.id;
+                if (event.shiftKey) {
+                    // Shift+click: toggle this interface in/out of selection
+                    if (selectedInterfaceIds.has(iface.id)) {
+                        selectedInterfaceIds.delete(iface.id);
+                    } else {
+                        selectedInterfaceIds.add(iface.id);
+                    }
+                    selectedModuleIds.clear();
+                } else {
+                    selectedModuleIds.clear();
+                    selectedInterfaceIds = new Set([iface.id]);
+                }
                 g.selectAll('.module-box').classed('selected', false);
                 g.selectAll('.interface-path').classed('selected', function () {
-                    return Number(d3.select(this).attr('data-interface-id')) === iface.id;
+                    return selectedInterfaceIds.has(Number(d3.select(this).attr('data-interface-id')));
                 });
             })
             .on('contextmenu', function (event) {
@@ -1741,29 +1989,130 @@ function dragBehavior() {
         })
         .on('start', function (event, d) {
             d3.select(this).raise();
+            // Record initial positions of ALL selected modules for batch drag
+            batchDragState = { startPositions: {} };
+            var idsToMove = new Set(selectedModuleIds);
+            if (!idsToMove.has(d.id)) {
+                if (event.sourceEvent && event.sourceEvent.shiftKey) {
+                    // Shift+drag: add to existing selection
+                    idsToMove.add(d.id);
+                } else {
+                    // Normal drag: replace selection with just this module
+                    idsToMove = new Set([d.id]);
+                }
+                selectedModuleIds = idsToMove;
+                g.selectAll('.module-box').classed('selected', function (dd) { return selectedModuleIds.has(dd.id); });
+            }
+            // Filter out non-editable modules from batch move
+            idsToMove.forEach(function (mid) {
+                var mod = sceneData.modules.find(function (m) { return m.id === mid; });
+                if (mod != null && mod.editable === false) {
+                    idsToMove.delete(mid);
+                }
+            });
+            // If after filtering the dragged module itself is no longer editable, abort
+            if (!idsToMove.has(d.id)) {
+                batchDragState = null;
+                return;
+            }
+            idsToMove.forEach(function (mid) {
+                var mod = sceneData.modules.find(function (m) { return m.id === mid; });
+                if (mod) {
+                    batchDragState.startPositions[mid] = { x: mod.x, y: mod.y };
+                }
+            });
+
+            // Store original interior pivot points of manual_override interfaces connected to moved modules
+            batchDragState.originalPivots = {};
+            var movedPinIds = new Set();
+            idsToMove.forEach(function (mid) {
+                sceneData.connectors.forEach(function (c) {
+                    if (String(c.module_id) === String(mid)) {
+                        c.pins.forEach(function (p) { movedPinIds.add(p.id); });
+                    }
+                });
+            });
+            sceneData.interfaces.forEach(function (iface) {
+                if ((iface._manualOverride || iface.manual_override) && iface.points && iface.points.length > 2) {
+                    if (movedPinIds.has(iface.from_pin) || movedPinIds.has(iface.to_pin)) {
+                        var originals = [];
+                        for (var pi = 1; pi < iface.points.length - 1; pi++) {
+                            var pt = iface.points[pi];
+                            originals.push({ x: Array.isArray(pt) ? pt[0] : pt.x, y: Array.isArray(pt) ? pt[1] : pt.y });
+                        }
+                        batchDragState.originalPivots[iface.id] = originals;
+                    }
+                }
+            });
         })
         .on('drag', function (event, d) {
-            d.x = event.x;
-            d.y = event.y;
-            d3.select(this).attr('transform', `translate(${d.x}, ${d.y})`);
-            // Live wire rerouting — updates interface paths in-place, no flicker
-            updateInterfacesInPlace(d);
-            // Update subsystem halos in-place so they follow moved modules
+            if (!batchDragState) return;
+            // Compute delta from the dragged module's start position
+            var startPos = batchDragState.startPositions[d.id];
+            if (!startPos) {
+                // Fallback: just move the dragged module
+                d.x = event.x;
+                d.y = event.y;
+                d3.select(this).attr('transform', `translate(${d.x}, ${d.y})`);
+                updateInterfacesInPlace(d);
+                updateSubsystemHalosInPlace(sceneData);
+                return;
+            }
+            var dx = event.x - startPos.x;
+            var dy = event.y - startPos.y;
+
+            // Move ALL selected modules by the same delta
+            var modulesToUpdate = [];
+            selectedModuleIds.forEach(function (mid) {
+                var mod = sceneData.modules.find(function (m) { return m.id === mid; });
+                if (!mod) return;
+                var sp = batchDragState.startPositions[mid];
+                if (!sp) return;
+                mod.x = sp.x + dx;
+                mod.y = sp.y + dy;
+                modulesToUpdate.push(mod);
+                // Update the DOM transform for this module
+                g.selectAll('.module-box').filter(function (md) { return md.id === mod.id; })
+                    .attr('transform', `translate(${mod.x}, ${mod.y})`);
+            });
+
+            // Shift interior pivot points of manual_override interfaces to follow the batch drag
+            if (batchDragState.originalPivots) {
+                Object.keys(batchDragState.originalPivots).forEach(function (ifaceId) {
+                    var iface = sceneData.interfaces.find(function (i) { return String(i.id) === ifaceId; });
+                    if (!iface || !iface.points || iface.points.length < 2) return;
+                    var originals = batchDragState.originalPivots[ifaceId];
+                    for (var pi = 1; pi < iface.points.length - 1; pi++) {
+                        var orig = originals[pi - 1];
+                        if (orig && Array.isArray(iface.points[pi])) {
+                            iface.points[pi][0] = orig.x + dx;
+                            iface.points[pi][1] = orig.y + dy;
+                        }
+                    }
+                });
+            }
+
+            // Update wire routing for all moved modules
+            modulesToUpdate.forEach(function (mod) {
+                updateInterfacesInPlace(mod);
+            });
+            // Update subsystem halos in-place (no DOM removal)
             updateSubsystemHalosInPlace(sceneData);
         })
         .on('end', function (event, d) {
             if (!bridge) return;
 
-            // Update manual-override interface endpoints to the module's new
-            // position so user-placed pivot points are preserved. Interior points
-            // stay in their absolute workspace positions — the wire routes from
-            // the new module position through those pivots to the other pin.
+            // Update manual-override interface endpoints for ALL moved modules
+            // (interior pivot points were already shifted during drag)
             var pinLookup = buildPinLookup(sceneData);
             var movedPinIds = new Set();
-            sceneData.connectors.forEach(function (c) {
-                if (String(c.module_id) === String(d.id)) {
-                    c.pins.forEach(function (p) { movedPinIds.add(p.id); });
-                }
+            var movedModIds = selectedModuleIds.size > 0 ? selectedModuleIds : new Set([d.id]);
+            movedModIds.forEach(function (mid) {
+                sceneData.connectors.forEach(function (c) {
+                    if (String(c.module_id) === String(mid)) {
+                        c.pins.forEach(function (p) { movedPinIds.add(p.id); });
+                    }
+                });
             });
             var anyManualUpdated = false;
             sceneData.interfaces.forEach(function (iface) {
@@ -1785,22 +2134,33 @@ function dragBehavior() {
                     }
                 }
             });
-            // Re-render the interface layer so the user immediately sees their
-            // manual pivot points restored (instead of the A*-routed display
-            // that was shown during drag).
             if (anyManualUpdated) {
                 g.select('.interfaces-layer').remove();
                 renderInterfaces(sceneData, pinLookup, new Set());
+                // Re-apply selection highlight after re-render
+                g.selectAll('.interface-path').classed('selected', function () {
+                    return selectedInterfaceIds.has(Number(d3.select(this).attr('data-interface-id')));
+                });
             }
 
-            const payload = {};
-            payload[d.id] = { x: d.x, y: d.y };
-            bridge.save_module_positions(JSON.stringify(payload));
-            // NOTE: persistCurrentRoutes() is intentionally NOT called here.
-            // Module drag updates routing visually via updateInterfacesInPlace(),
-            // but persisting all routes would trigger permission errors for
-            // interfaces touching subsystems the user can't edit.  Routing is
-            // recomputed from current positions on next scene load anyway.
+            // Save positions of ALL moved modules
+            var payload = {};
+            movedModIds.forEach(function (mid) {
+                var mod = sceneData.modules.find(function (m) { return m.id === mid; });
+                if (mod) {
+                    payload[mid] = { x: mod.x, y: mod.y };
+                }
+            });
+            if (Object.keys(payload).length > 0) {
+                bridge.save_module_positions(JSON.stringify(payload));
+            }
+            // Persist routing so wires stay at their new positions on scene reload.
+            // The bridge silently skips interfaces the user can't edit.
+            persistCurrentRoutes();
+            // Force a full halo redraw to ensure bounds are correct after the drag
+            g.select('.subsystem-halos').remove();
+            renderSubsystemHalos(sceneData);
+            batchDragState = null;
         });
 }
 
