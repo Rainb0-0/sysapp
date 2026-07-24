@@ -2096,7 +2096,7 @@ function dragBehavior() {
             modulesToUpdate.forEach(function (mod) {
                 updateInterfacesInPlace(mod);
             });
-            // Update subsystem halos in-place (no DOM removal)
+            // Recalculate halo bounds from scratch using current module and wire positions
             updateSubsystemHalosInPlace(sceneData);
         })
         .on('end', function (event, d) {
