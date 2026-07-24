@@ -289,9 +289,6 @@ function render(scene) {
         if (typeof c.y !== 'number' || isNaN(c.y)) c.y = 0;
     });
 
-    // Draw faint grid background (before everything else)
-    renderGridBackground();
-
     const pinLookup = buildPinLookup(scene);
 
     // Draw subsystem halos next (behind modules and wires)
@@ -308,52 +305,6 @@ function render(scene) {
     }
 }
 render.hasFitOnce = false;
-
-// ---------------------------------------------------------------------
-// Faint grid background — graph-paper-style grid lines at GRID_SIZE intervals
-// ---------------------------------------------------------------------
-function renderGridBackground() {
-    // Use a <pattern> so the grid tiles efficiently without creating
-    // thousands of individual line elements. The pattern is defined once
-    // and fills an infinite-looking background rect.
-    var defs = g.select('defs.grid-defs').node();
-    if (!defs) {
-        defs = g.append('defs').attr('class', 'grid-defs').node();
-    }
-
-    // Only create the pattern if it doesn't already exist on the SVG
-    var patternId = 'grid-pattern-' + GRID_SIZE;
-    var existing = g.select('pattern#' + patternId).node();
-    if (!existing) {
-        var pattern = d3.select(defs).append('pattern')
-            .attr('id', patternId)
-            .attr('width', GRID_SIZE)
-            .attr('height', GRID_SIZE)
-            .attr('patternUnits', 'userSpaceOnUse');
-
-        // Crosshair grid lines: horiz + vert lines from origin
-        pattern.append('path')
-            .attr('d', 'M ' + GRID_SIZE + ' 0 L 0 0 0 ' + GRID_SIZE)
-            .attr('fill', 'none')
-            .attr('stroke', 'rgba(255, 255, 255, 0.04)')
-            .attr('stroke-width', 0.5);
-    }
-
-    // A large background rect with the pattern fill — sits behind everything
-    // Use a fixed large size rather than viewport-dependent so pan/zoom
-    // always sees grid lines.
-    var bg = g.select('.grid-bg').node();
-    if (!bg) {
-        g.insert('rect', ':first-child')
-            .attr('class', 'grid-bg')
-            .attr('x', -10000)
-            .attr('y', -10000)
-            .attr('width', 20000)
-            .attr('height', 20000)
-            .attr('fill', 'url(#' + patternId + ')')
-            .attr('pointer-events', 'none');
-    }
-}
 
 // ---------------------------------------------------------------------
 // ---------------------------------------------------------------------
@@ -1013,6 +964,11 @@ function startConnectDrag(pinId, localX, localY, moduleSelection) {
 
     connectDrag = { fromPinId: pinId, fromPoint: startAbs, tempPath: tempPath };
 
+    // Lock cursor to crosshair during connect drag so it does not flicker
+    // between grab (SVG default) and crosshair (pin-circle) when hovering
+    // over target pins.
+    document.body.classList.add('dragging-connection');
+
     svg.on('mousemove.connect', function (event) {
         if (!connectDrag) return;
         const [mx, my] = d3.pointer(event, g.node());
@@ -1063,6 +1019,8 @@ function cancelConnectDrag() {
     connectDrag = null;
     svg.on('mousemove.connect', null);
     svg.on('mouseup.connect', null);
+    // Release custom cursor so SVG/pin defaults take over again
+    document.body.classList.remove('dragging-connection');
 }
 
 // ---------------------------------------------------------------------
@@ -1215,6 +1173,18 @@ function showPinContextMenu(event, pinDatum, connectorDatum) {
     ]);
 }
 
+function showInterfaceContextMenu(event, iface) {
+    showContextMenu(event, [
+        { icon: '\uD83D\uDDD1\uFE0F', label: 'Delete Connection', action: function () { deleteInterfaceConfirm(iface); }, shortcut: 'Del' },
+    ]);
+}
+
+function deleteInterfaceConfirm(iface) {
+    if (bridge && confirm('Delete this connection?')) {
+        bridge.delete_interface(iface.id);
+    }
+}
+
 function showInterfaceDragHandleContextMenu(event, ifaceId, pointIndex, scene) {
     // Find the interface by ID
     var iface = null;
@@ -1254,18 +1224,24 @@ function removePivotFromInterface(ifaceId, pointIndex) {
     
     if (!iface || !iface.points || iface.points.length <= 2) return;
     
-    // Remove the interior point at the given index
+    // Remove the interior point at the given index (virtual — runtime only)
     iface.points.splice(pointIndex, 1);
     
-    // Mark as manual override since the user modified the path
-    iface._manualOverride = true;
-    
-    // Persist the updated routes
-    persistCurrentRoutes();
+    // If only 2 points remain (start + end), clear manual override so
+    // the wire falls back to A* routing on next full re-render.  This
+    // prevents a stale manual flag with no pivots (which would bypass
+    // A* and potentially display a diagonal).
+    if (iface.points.length <= 2) {
+        iface._manualOverride = false;
+        iface.manual_override = false;
+    }
     
     // Re-render the interface layer
     g.select('.interfaces-layer').remove();
     renderInterfaces(sceneData, buildPinLookup(sceneData), new Set());
+    
+    // Persist the removal to DB so the change survives tab switches
+    persistCurrentRoutes();
 }
 
 function renameModulePrompt(moduleDatum) {
@@ -1333,6 +1309,22 @@ function openPinOrderDialog(connectorDatum) {
     bridge.request_pin_order_dialog(connectorDatum.id, connectorDatum.name, JSON.stringify(pinNames));
 }
 
+// ---------------------------------------------------------------------
+// Helper: copy manual interface points and update endpoints to match
+// current pin positions from pinLookup.  Also prunes any interior points
+// that became collinear after the endpoint move.
+// ---------------------------------------------------------------------
+function updateManualEndpoints(iface, pinLookup) {
+    var pts = iface.points.map(function (p) {
+        return Array.isArray(p) ? [p[0], p[1]] : [p.x, p.y];
+    });
+    var pinA = pinLookup[iface.from_pin];
+    var pinB = pinLookup[iface.to_pin];
+    if (pinA) pts[0] = [pinA.x, pinA.y];
+    if (pinB) pts[pts.length - 1] = [pinB.x, pinB.y];
+    return removeCollinearPoints(pts);
+}
+
 const ROUTE_MARGIN = 14; // must stay < CONNECTOR_STUB so pins sit outside inflated obstacle rects
 const ROUTE_LEAD = 16;
 
@@ -1357,8 +1349,9 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
         var points = null;
 
         if (isManual && iface.points && iface.points.length >= 2) {
-            // Use the saved manual points as-is — do NOT recompute via A*
-            points = iface.points;
+            // Use the saved manual pivot points, but update endpoints to
+            // match current pin positions so wires follow moved connectors.
+            points = updateManualEndpoints(iface, pinLookup);
         } else {
             // Decide if this interface needs fresh A* routing
             var needsRecompute = !movedPinIds; // null → full recompute
@@ -1383,10 +1376,15 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
         iface.points = points;
 
         const line = d3.line().x(p => p[0] !== undefined ? p[0] : p.x).y(p => p[1] !== undefined ? p[1] : p.y);
+        // Display the path through enforceOrthogonalRoute so diagonal segments
+        // from user-placed pivots are automatically rendered with bend points.
+        // The stored points (iface.points) are NOT modified — bend points are
+        // display-only and never persisted.
+        var displayPoints = isManual ? enforceOrthogonalRoute(points) : points;
         var path = interfaceGroup.append('path')
             .attr('class', 'interface-path')
             .attr('data-interface-id', iface.id)
-            .attr('d', line(points))
+            .attr('d', line(displayPoints))
             .on('click', function (event) {
                 event.stopPropagation();
                 selectedModuleId = null;
@@ -1395,66 +1393,77 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
                 g.selectAll('.interface-path').classed('selected', function () {
                     return Number(d3.select(this).attr('data-interface-id')) === iface.id;
                 });
+            })
+            .on('contextmenu', function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                showInterfaceContextMenu(event, iface);
             });
 
-        // --- Wire dragging: add draggable handles at each interior vertex ---
-        for (var i = 0; i < points.length; i++) {
-            if (i === 0 || i === points.length - 1) continue;
+        // --- Wire dragging: show draggable handles only at interior vertices
+        // of user-created manual overrides (persisted from DB).
+        // A*-computed waypoints and virtual pivots get NO handles — they
+        // are routing aids, not user-placed pivots.
+        var isManual = (iface.manual_override || iface._manualOverride);
+        if (isManual) {
+            for (var i = 0; i < points.length; i++) {
+                if (i === 0 || i === points.length - 1) continue;
 
-            (function (pi) {
-                var pt = points[pi];
-                var cx = pt[0] !== undefined ? pt[0] : pt.x;
-                var cy = pt[1] !== undefined ? pt[1] : pt.y;
+                (function (pi) {
+                    var pt = points[pi];
+                    var cx = pt[0] !== undefined ? pt[0] : pt.x;
+                    var cy = pt[1] !== undefined ? pt[1] : pt.y;
 
-                interfaceGroup.append('circle')
-                    .attr('class', 'interface-drag-handle')
-                    .attr('data-interface-id', iface.id)
-                    .attr('data-point-index', pi)
-                    .attr('cx', cx)
-                    .attr('cy', cy)
-                    .attr('r', 10)
-                    .attr('fill', 'transparent')
-                    .attr('stroke', 'var(--accent)')
-                    .attr('stroke-width', 1.5)
-                    .attr('stroke-dasharray', '2,2')
-                    .attr('cursor', 'move')
-                    .attr('opacity', 0)
-                    .on('mouseenter', function () { d3.select(this).attr('opacity', 0.6); })
-                    .on('mouseleave', function () { d3.select(this).attr('opacity', 0); })
-                    .on('contextmenu', function (event) {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        showInterfaceDragHandleContextMenu(event, iface.id, pi, sceneData);
-                    })
-                    .call(d3.drag()
-                        .on('start', function (event) {
-                            event.sourceEvent.stopPropagation();
-                            d3.select(this).raise().attr('opacity', 0.9).attr('fill', 'rgba(91, 141, 239, 0.35)');
+                    interfaceGroup.append('circle')
+                        .attr('class', 'interface-drag-handle')
+                        .attr('data-interface-id', iface.id)
+                        .attr('data-point-index', pi)
+                        .attr('cx', cx)
+                        .attr('cy', cy)
+                        .attr('r', 10)
+                        .attr('fill', 'transparent')
+                        .attr('stroke', 'var(--accent)')
+                        .attr('stroke-width', 1.5)
+                        .attr('stroke-dasharray', '2,2')
+                        .attr('cursor', 'move')
+                        .attr('opacity', 0)
+                        .on('mouseenter', function () { d3.select(this).attr('opacity', 0.6); })
+                        .on('mouseleave', function () { d3.select(this).attr('opacity', 0); })
+                        .on('contextmenu', function (event) {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            showInterfaceDragHandleContextMenu(event, iface.id, pi, sceneData);
                         })
-                        .on('drag', function (event) {
-                            // Use d3.pointer to get coords in scene (g) space
-                            var pt = d3.pointer(event.sourceEvent, g.node());
-                            var newX = snapToGrid(pt[0]);
-                            var newY = snapToGrid(pt[1]);
-                            points[pi] = [newX, newY];
-                            iface.points = points;
-                            d3.select(this).attr('cx', newX).attr('cy', newY);
-                            // Show the orthogonal preview live during drag
-                            path.attr('d', line(enforceOrthogonalRoute(points)));
-                        })
-                        .on('end', function () {
-                            d3.select(this).attr('opacity', 0.6).attr('fill', 'transparent');
-                            iface._manualOverride = true;
-                            // Enforce orthogonal route — insert bend points
-                            // wherever a diagonal segment was created by the drag
-                            iface.points = enforceOrthogonalRoute(iface.points);
-                            // Update the path immediately so the user sees the
-                            // orthogonal result without waiting for a re-render
-                            path.attr('d', line(iface.points));
-                            persistCurrentRoutes();
-                        })
-                    );
-            })(i);
+                        .call(d3.drag()
+                            .on('start', function (event) {
+                                event.sourceEvent.stopPropagation();
+                                d3.select(this).raise().attr('opacity', 0.9).attr('fill', 'rgba(91, 141, 239, 0.35)');
+                            })
+                            .on('drag', function (event) {
+                                var pt = d3.pointer(event.sourceEvent, g.node());
+                                var newX = snapToGrid(pt[0]);
+                                var newY = snapToGrid(pt[1]);
+                                points[pi] = [newX, newY];
+                                iface.points = points;
+                                d3.select(this).attr('cx', newX).attr('cy', newY);
+                                path.attr('d', line(enforceOrthogonalRoute(points)));
+                            })
+                            .on('end', function () {
+                                d3.select(this).attr('opacity', 0.6).attr('fill', 'transparent');
+                                // Remove collinear waypoints — our stored points should only
+                                // contain the actual user-placed pivots, not intermediate
+                                // points that lie on a straight line between other points.
+                                var cleanPoints = removeCollinearPoints(iface.points);
+                                iface.points = cleanPoints;
+                                // Display with orthogonal enforcement (bend points are
+                                // computed on-the-fly for display only, never stored).
+                                var displayPts = enforceOrthogonalRoute(iface.points);
+                                path.attr('d', line(displayPts));
+                                persistCurrentRoutes();
+                            })
+                        );
+                })(i);
+            }
         }
 
         // --- Drag any point ON the path (not just vertices) to reroute ---
@@ -1569,21 +1578,30 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
                     if (!dragState.hadDrag) {
                         points.splice(dragState.pointIndex, 1);
                         iface.points = points;
-                        path.attr('d', line(points));
+                        // Display via orthogonal enforcement so the path stays clean
+                        path.attr('d', line(enforceOrthogonalRoute(points)));
                         dragState = null;
                         return;
                     }
                     
                     if (iface && iface.points && iface.points.length > 2) {
+                        // User placed a pivot point on the wire — this IS a
+                        // user-interacted point. Store it (without any bend points
+                        // that enforceOrthogonalRoute might insert) and mark as
+                        // manual override so the route is preserved.
+                        // Collinear waypoints are pruned so stored points contain
+                        // only the meaningful routing information.
+                        var cleanPoints = removeCollinearPoints(iface.points);
+                        iface.points = cleanPoints;
                         iface._manualOverride = true;
-                        // Enforce orthogonal route — insert bend points
-                        // wherever a diagonal segment was created by the drag
-                        iface.points = enforceOrthogonalRoute(iface.points);
-                        persistCurrentRoutes();
-                        // Re-render the interface layer to show proper drag handles
-                        // at all vertices (including the newly created one)
+                        // Re-render the interface layer — renderInterfaces will
+                        // display through enforceOrthogonalRoute for a clean
+                        // orthogonal path while keeping stored points pristine.
                         g.select('.interfaces-layer').remove();
                         renderInterfaces(sceneData, buildPinLookup(sceneData), new Set());
+                        // Persist the new pivot to DB immediately so it survives
+                        // tab switches / scene reloads.
+                        persistCurrentRoutes();
                     }
                     dragState = null;
                 })
@@ -1600,7 +1618,25 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
 // (horizontal + vertical segments only) even when pivot points are dragged
 // to positions that don't align with their neighbors.
 function enforceOrthogonalRoute(pts) {
-    if (!pts || pts.length < 3) return pts;
+    if (!pts || pts.length < 2) return pts;
+
+    // Special case: 2-point diagonal — insert a single bend so even
+    // a manual route with only endpoints (no user pivots) displays
+    // as horizontal-then-vertical rather than a straight diagonal.
+    if (pts.length === 2) {
+        var p0 = pts[0], p1 = pts[1];
+        var x0 = Array.isArray(p0) ? p0[0] : (p0.x !== undefined ? p0.x : 0);
+        var y0 = Array.isArray(p0) ? p0[1] : (p0.y !== undefined ? p0.y : 0);
+        var x1 = Array.isArray(p1) ? p1[0] : (p1.x !== undefined ? p1.x : 0);
+        var y1 = Array.isArray(p1) ? p1[1] : (p1.y !== undefined ? p1.y : 0);
+        if (Math.abs(x0 - x1) > 0.001 && Math.abs(y0 - y1) > 0.001) {
+            // Diagonal: insert bend at (x0, y1) — go horizontal first, then vertical
+            var bend = Array.isArray(p0) ? [x0, y1] : { x: x0, y: y1 };
+            return [pts[0], bend, pts[1]];
+        }
+        return pts;
+    }
+
     var result = [pts[0]];
     for (var i = 1; i < pts.length; i++) {
         var prev = result[result.length - 1];
@@ -1618,6 +1654,41 @@ function enforceOrthogonalRoute(pts) {
         }
         result.push(cur);
     }
+    return result;
+}
+
+// ---------------------------------------------------------------------
+// Remove pivot points that lie on a straight line between neighbors.
+// A point is collinear (unnecessary) when it shares the same x-coordinate
+// with both neighbors (vertical line) OR the same y-coordinate with both
+// neighbors (horizontal line). Such points add zero routing information
+// and can be safely pruned.
+// ---------------------------------------------------------------------
+function removeCollinearPoints(points) {
+    if (!points || points.length < 3) return points;
+    var result = [points[0]];
+    for (var i = 1; i < points.length - 1; i++) {
+        var prev = result[result.length - 1];
+        var cur = points[i];
+        var next = points[i + 1];
+        var px = Array.isArray(prev) ? prev[0] : prev.x;
+        var py = Array.isArray(prev) ? prev[1] : prev.y;
+        var cx = Array.isArray(cur) ? cur[0] : cur.x;
+        var cy = Array.isArray(cur) ? cur[1] : cur.y;
+        var nx = Array.isArray(next) ? next[0] : next.x;
+        var ny = Array.isArray(next) ? next[1] : next.y;
+
+        // Same x (vertical line) or same y (horizontal line) with both neighbors?
+        var sameX = (Math.abs(px - cx) <= 0.001 && Math.abs(cx - nx) <= 0.001);
+        var sameY = (Math.abs(py - cy) <= 0.001 && Math.abs(cy - ny) <= 0.001);
+
+        if (sameX || sameY) {
+            // This point is collinear — skip it; the line runs straight through
+            continue;
+        }
+        result.push(cur);
+    }
+    result.push(points[points.length - 1]);
     return result;
 }
 
@@ -1662,6 +1733,46 @@ function dragBehavior() {
         })
         .on('end', function (event, d) {
             if (!bridge) return;
+
+            // Update manual-override interface endpoints to the module's new
+            // position so user-placed pivot points are preserved. Interior points
+            // stay in their absolute workspace positions — the wire routes from
+            // the new module position through those pivots to the other pin.
+            var pinLookup = buildPinLookup(sceneData);
+            var movedPinIds = new Set();
+            sceneData.connectors.forEach(function (c) {
+                if (String(c.module_id) === String(d.id)) {
+                    c.pins.forEach(function (p) { movedPinIds.add(p.id); });
+                }
+            });
+            var anyManualUpdated = false;
+            sceneData.interfaces.forEach(function (iface) {
+                if ((iface._manualOverride || iface.manual_override) && iface.points && iface.points.length >= 2) {
+                    var updated = false;
+                    var pinA = pinLookup[iface.from_pin];
+                    var pinB = pinLookup[iface.to_pin];
+                    if (movedPinIds.has(iface.from_pin) && pinA) {
+                        iface.points[0] = [pinA.x, pinA.y];
+                        updated = true;
+                    }
+                    if (movedPinIds.has(iface.to_pin) && pinB) {
+                        iface.points[iface.points.length - 1] = [pinB.x, pinB.y];
+                        updated = true;
+                    }
+                    if (updated) {
+                        iface.points = removeCollinearPoints(iface.points);
+                        anyManualUpdated = true;
+                    }
+                }
+            });
+            // Re-render the interface layer so the user immediately sees their
+            // manual pivot points restored (instead of the A*-routed display
+            // that was shown during drag).
+            if (anyManualUpdated) {
+                g.select('.interfaces-layer').remove();
+                renderInterfaces(sceneData, pinLookup, new Set());
+            }
+
             const payload = {};
             payload[d.id] = { x: d.x, y: d.y };
             bridge.save_module_positions(JSON.stringify(payload));
@@ -1889,8 +2000,12 @@ function persistCurrentRoutes() {
 
     sceneData.interfaces.forEach(function (iface) {
         if ((iface._manualOverride || iface.manual_override) && iface.points && iface.points.length >= 2) {
-            // Use the user-dragged manual points directly
-            payload[iface.id] = { points: iface.points, manual_override: true, locked: false };
+            // Clean collinear waypoints before saving — only the actual user-placed
+            // pivots get persisted. Intermediate points on straight lines add no
+            // routing information and would otherwise multiply on repeated edits.
+            var cleanPoints = removeCollinearPoints(iface.points);
+            iface.points = cleanPoints;
+            payload[iface.id] = { points: cleanPoints, manual_override: true, locked: false };
         } else {
             // Compute the route via A* orthogonal router
             const a = pinLookup[iface.from_pin];
@@ -1930,28 +2045,26 @@ function updateInterfacesInPlace(movedModule) {
         if (hiddenPins.has(iface.from_pin) || hiddenPins.has(iface.to_pin)) return;
         if (!movedPinIds.has(iface.from_pin) && !movedPinIds.has(iface.to_pin)) return;
 
-        // For manually overridden wires: update only the endpoints to follow moved
-        // pins, preserving the interior points the user positioned.
-        if (iface.manual_override || iface._manualOverride) {
+        // For manual-override wires, preserve the user's pivot points and
+        // only update the endpoints that connect to the moved module's pins.
+        // The interior pivots stay in their absolute workspace positions —
+        // the wire routes from the new pin position through those pivots to
+        // the other pin.  Display via enforceOrthogonalRoute so bend points
+        // are computed on-the-fly and never stored.
+        // For auto-routed wires, compute a fresh A* route.
+        var isManual = (iface._manualOverride || iface.manual_override);
+        var points;
+
+        if (isManual && iface.points && iface.points.length >= 2) {
+            points = updateManualEndpoints(iface, pinLookup);
+            points = enforceOrthogonalRoute(points);
+        } else {
             var a = pinLookup[iface.from_pin];
             var b = pinLookup[iface.to_pin];
-            if (a && b && iface.points && iface.points.length >= 2) {
-                // Update first and last point to match moved pin positions
-                iface.points[0] = [a.x, a.y];
-                iface.points[iface.points.length - 1] = [b.x, b.y];
-                // Update SVG path in-place
-                var lineMaker = d3.line().x(function (p) { return p[0]; }).y(function (p) { return p[1]; });
-                var p = g.select('.interface-path[data-interface-id="' + iface.id + '"]');
-                if (p.node()) p.attr('d', lineMaker(iface.points));
-            }
-            return;
+            if (!a || !b) return;
+            points = computeRoutePoints(a, b, obstacleRects);
         }
 
-        var a = pinLookup[iface.from_pin];
-        var b = pinLookup[iface.to_pin];
-        if (!a || !b) return;
-
-        var points = computeRoutePoints(a, b, obstacleRects);
         if (!points || points.length < 2) return;
 
         const line = d3.line().x(p => p[0] !== undefined ? p[0] : p.x).y(p => p[1] !== undefined ? p[1] : p.y);
@@ -2004,7 +2117,7 @@ function getExportBounds() {
 }
 
 function fitView() {
-    if (!g.node()) return;
+    if (!g.node() || !sceneData) return;
     try {
         requestAnimationFrame(() => {
             const parent = svg.node().getBoundingClientRect();
@@ -2012,24 +2125,57 @@ function fitView() {
             const height = parent.height;
             if (width <= 0 || height <= 0) return;
 
-            const bbox = g.node().getBBox();
-            if (!isFinite(bbox.width) || !isFinite(bbox.height) ||
-                bbox.width <= 0 || bbox.height <= 0) {
+            // Compute bounding box from actual scene data (modules + interfaces)
+            // instead of g.node().getBBox() which includes the giant grid
+            // background rect (20000x20000), making fitView zoom out to nothing.
+            var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+            sceneData.modules.forEach(function (m) {
+                var mx = Number(m.x) || 0;
+                var my = Number(m.y) || 0;
+                var mw = Math.max(Number(m.width) || 120, 120);
+                var mh = Math.max(Number(m.height) || 60, 60);
+                if (mx < minX) minX = mx;
+                if (my < minY) minY = my;
+                if (mx + mw > maxX) maxX = mx + mw;
+                if (my + mh > maxY) maxY = my + mh;
+            });
+
+            sceneData.interfaces.forEach(function (iface) {
+                if (!iface.points) return;
+                iface.points.forEach(function (pt) {
+                    var x = pt[0] !== undefined ? pt[0] : (pt.x !== undefined ? pt.x : 0);
+                    var y = pt[1] !== undefined ? pt[1] : (pt.y !== undefined ? pt.y : 0);
+                    if (x < minX) minX = x;
+                    if (y < minY) minY = y;
+                    if (x > maxX) maxX = x;
+                    if (y > maxY) maxY = y;
+                });
+            });
+
+            if (!isFinite(minX) || !isFinite(maxX) || maxX <= minX || maxY <= minY) {
+                // No content — center on origin with a default zoom
+                svg.transition()
+                    .duration(650)
+                    .call(zoom.transform, d3.zoomIdentity.translate(width / 2, height / 2).scale(0.5));
                 return;
             }
 
-            const padX = Math.max(8, width * 0.01);
-            const padY = Math.max(8, height * 0.01);
+            var bboxW = maxX - minX;
+            var bboxH = maxY - minY;
 
-            const scaleX = (width - 2 * padX) / bbox.width;
-            const scaleY = (height - 2 * padY) / bbox.height;
+            const pad = 40;
+            const scaleX = (width - 2 * pad) / bboxW;
+            const scaleY = (height - 2 * pad) / bboxH;
             let scale = Math.min(scaleX, scaleY);
 
             const minK = 0.1, maxK = 6;
             scale = Math.max(minK, Math.min(maxK, scale));
 
-            const tx = (width / 2) - scale * (bbox.x + bbox.width / 2);
-            const ty = (height / 2) - scale * (bbox.y + bbox.height / 2);
+            const cx = (minX + maxX) / 2;
+            const cy = (minY + maxY) / 2;
+            const tx = (width / 2) - scale * cx;
+            const ty = (height / 2) - scale * cy;
 
             svg.transition()
                 .duration(650)

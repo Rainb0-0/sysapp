@@ -43,6 +43,15 @@
   }
   svg:active { cursor: grabbing; }
 
+  /* ========= Connect Drag State ========= */
+  body.dragging-connection,
+  body.dragging-connection * {
+    cursor: crosshair !important;
+  }
+  body.dragging-connection .pin-circle {
+    cursor: crosshair !important;
+  }
+
   /* ========= Module Styles ========= */
   .module-box { cursor: move; }
   .module-box:hover .resize-handle {
