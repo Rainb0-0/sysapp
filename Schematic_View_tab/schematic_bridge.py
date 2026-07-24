@@ -211,46 +211,64 @@ class SchematicBridge(QObject):
         positions_json example:
           '{"1": {"x": 120.0, "y": 80.0}, "2": {"x": 340.0, "y": 80.0}}'
         (JS object keys are always strings, so we cast back to int here.)
+
+        Only saves positions for modules whose subsystem the current user can
+        edit.  Modules the user cannot edit are silently skipped so the save
+        never fails with a misleading permission toast.
         """
         try:
             raw: Dict[str, Any] = json.loads(positions_json)
-            positions = {int(mod_id): pos for mod_id, pos in raw.items()}
+            all_positions = {int(mod_id): pos for mod_id, pos in raw.items()}
 
-            # Permission: collect all unique subsystem IDs
-            sub_ids: Set[int] = set()
-            for mod_id in positions:
+            allowed_positions: Dict[int, Any] = {}
+            denied = 0
+            for mod_id, pos in all_positions.items():
                 sid = get_module_subsystem_id(mod_id)
-                if sid is not None:
-                    sub_ids.add(sid)
-            if not self._check_all_subsystems("module.edit", sub_ids, "edit module positions"):
-                return
+                if auth.is_logged_in() and auth.has_perm("module.edit") and can_edit_subsystem(sid):
+                    allowed_positions[mod_id] = pos
+                else:
+                    denied += 1
 
-            persist_module_positions(positions)
-            self.save_finished.emit(True, f"{len(positions)} module position(s) saved")
+            if allowed_positions:
+                persist_module_positions(allowed_positions)
+                msg = f"{len(allowed_positions)} module position(s) saved"
+                if denied:
+                    msg += f" ({denied} skipped — no permission)"
+                self.save_finished.emit(True, msg)
+            elif denied:
+                self.save_finished.emit(False, "You don't have permission to save any of these positions.")
         except Exception as e:
             self.save_finished.emit(False, f"Failed to save module positions: {e}")
 
     @pyqtSlot(str)
     def save_connector_positions(self, positions_json: str):
         """Save connector positions. Each entry can include x, y, and optionally side.
-        Example: '{"1": {"x": 100, "y": 50, "side": "right"}}'"""
+        Example: '{"1": {"x": 100, "y": 50, "side": "right"}}'
+
+        Only saves positions for connectors whose subsystem the current user can
+        edit.  Unauthorised connectors are silently skipped.
+        """
         try:
             raw: Dict[str, Any] = json.loads(positions_json)
-            positions = {int(conn_id): pos for conn_id, pos in raw.items()}
+            all_positions = {int(conn_id): pos for conn_id, pos in raw.items()}
 
-            # Permission: collect all unique subsystem IDs
-            sub_ids: Set[int] = set()
-            for conn_id in positions:
+            allowed_positions: Dict[int, Any] = {}
+            denied = 0
+            for conn_id, pos in all_positions.items():
                 sid = get_connector_subsystem_id(conn_id)
-                if sid is not None:
-                    sub_ids.add(sid)
-            if not self._check_all_subsystems("connector.edit", sub_ids, "edit connector positions"):
-                return
+                if auth.is_logged_in() and auth.has_perm("connector.edit") and can_edit_subsystem(sid):
+                    allowed_positions[conn_id] = pos
+                else:
+                    denied += 1
 
-            persist_connector_positions(positions)
-            self.save_finished.emit(
-                True, f"{len(positions)} connector position(s) saved"
-            )
+            if allowed_positions:
+                persist_connector_positions(allowed_positions)
+                msg = f"{len(allowed_positions)} connector position(s) saved"
+                if denied:
+                    msg += f" ({denied} skipped — no permission)"
+                self.save_finished.emit(True, msg)
+            elif denied:
+                self.save_finished.emit(False, "You don't have permission to save any of these positions.")
         except Exception as e:
             self.save_finished.emit(False, f"Failed to save connector positions: {e}")
 
@@ -263,28 +281,41 @@ class SchematicBridge(QObject):
           '{"12": {"points": [[x,y], [x,y]], "manual_override": true,
                     "edit_count": 3, "locked": false}}'
         routing_persistence.py itself needs NO changes for this to work.
+
+        Only saves routing for interfaces the current user can edit.
+        Interfaces belonging to uneditable subsystems are silently skipped
+        so dragging an editable module never produces a spurious permission
+        toast about a completely unrelated interface.
         """
         try:
             raw: Dict[str, Any] = json.loads(routing_json)
-            interface_data = {}
+            all_interface_data: Dict[int, Any] = {}
             for iface_id, payload in raw.items():
                 if isinstance(payload, dict) and "points" in payload:
                     payload = dict(payload)
                     payload["points"] = [tuple(p) for p in payload["points"]]
-                    interface_data[int(iface_id)] = payload
+                    all_interface_data[int(iface_id)] = payload
                 else:
-                    interface_data[int(iface_id)] = [tuple(p) for p in payload]
+                    all_interface_data[int(iface_id)] = [tuple(p) for p in payload]
 
-            # Permission: collect all unique subsystem IDs
-            sub_ids: Set[int] = set()
-            for iface_id in interface_data:
+            # Permission: check each interface individually, skip unauthorised ones
+            allowed_data: Dict[int, Any] = {}
+            denied = 0
+            for iface_id, data in all_interface_data.items():
                 sids = get_interface_subsystem_ids(iface_id)
-                sub_ids.update(sids)
-            if not self._check_all_subsystems("interface.edit", sub_ids, "edit routing"):
-                return
+                if auth.is_logged_in() and auth.has_perm("interface.edit") and all(can_edit_subsystem(s) for s in sids):
+                    allowed_data[iface_id] = data
+                else:
+                    denied += 1
 
-            save_enhanced_interface_data(interface_data)
-            self.save_finished.emit(True, f"{len(interface_data)} route(s) saved")
+            if allowed_data:
+                save_enhanced_interface_data(allowed_data)
+                msg = f"{len(allowed_data)} route(s) saved"
+                if denied:
+                    msg += f" ({denied} skipped — no permission)"
+                self.save_finished.emit(True, msg)
+            elif denied:
+                self.save_finished.emit(False, "You don't have permission to save any of these routes.")
         except Exception as e:
             self.save_finished.emit(False, f"Failed to save routing: {e}")
 
@@ -359,7 +390,8 @@ class SchematicBridge(QObject):
             self.save_finished.emit(False, f"Failed to rename module: {e}")
 
     @pyqtSlot(str, result=int)
-    def create_module(self, name: str, subsystem_id: int = -1):
+    def create_module(self, name: str, subsystem_id: int = -1,
+                       mass: float = 0.0, power: float = 0.0, color: str = ""):
         try:
             sid = subsystem_id if subsystem_id >= 0 else None
             # For module creation without a subsystem, we check the permission
@@ -371,7 +403,8 @@ class SchematicBridge(QObject):
                 self.save_finished.emit(False, "You don't have permission to create modules.")
                 return -1
 
-            new_id = persist_create_module(name, subsystem_id=sid)
+            c = color if color else None
+            new_id = persist_create_module(name, subsystem_id=sid, mass=mass, power=power, color=c)
             if new_id is None:
                 self.save_finished.emit(False, "Could not create module")
                 return -1

@@ -461,9 +461,13 @@ class SchematicViewTab(QWidget):
             self.tree_selector.apply_selection(saved_selection)
 
     def add_module(self):
-        from PyQt5.QtWidgets import QInputDialog, QComboBox, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QDialogButtonBox
+        from PyQt5.QtWidgets import (
+            QComboBox, QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+            QDialogButtonBox, QLineEdit, QDoubleSpinBox,
+        )
         from PyQt5.QtGui import QColor, QPixmap, QPainter
         from database import get_connection, get_current_project_id
+        from auth_manager import auth
 
         # Color palette matching the Architecture View tab
         COLOR_MAP = {
@@ -476,49 +480,83 @@ class SchematicViewTab(QWidget):
             "Gray": "#5D5A5A",
         }
 
-        # First, ask for the module name
-        name, ok = QInputDialog.getText(self, "New Module", "Module name:")
-        if not ok or not name.strip():
+        project_id = get_current_project_id()
+        if project_id is None:
             return
 
-        # Load subsystems for the dropdown
-        project_id = get_current_project_id()
+        # Load subsystems, filtered by user access
         subsystems = []
-        selected_subsystem_id = None
-        selected_color = "#33A444"  # Default color
-        if project_id is not None:
-            try:
-                with get_connection() as conn:
-                    cur = conn.cursor()
-                    cur.execute(
-                        "SELECT id, name FROM subsystems WHERE project_id = %s ORDER BY name",
-                        (project_id,),
-                    )
-                    subsystems = cur.fetchall()
-            except Exception:
-                pass
+        try:
+            with get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, name FROM subsystems WHERE project_id = %s ORDER BY name",
+                    (project_id,),
+                )
+                all_ss = cur.fetchall()
 
+            if auth.is_system() or not auth.is_logged_in():
+                subsystems = all_ss
+            else:
+                allowed = auth.allowed_subsystems_current or auth.allowed_subsystems
+                if not allowed:
+                    subsystems = all_ss
+                else:
+                    subsystems = [(sid, name) for sid, name in all_ss if sid in allowed]
+        except Exception:
+            pass
+
+        # ---- Single dialog for name, mass, power, subsystem, colour ----
         dialog = QDialog(self)
         dialog.setWindowTitle("New Module")
         layout = QVBoxLayout(dialog)
 
-        label = QLabel('Create module "' + name.strip() + '":')
-        layout.addWidget(label)
+        # Module name
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("Enter module name…")
+        layout.addWidget(QLabel("Module Name:"))
+        layout.addWidget(name_edit)
 
-        # Subsystem row (only if subsystems exist)
+        # Mass (kg)
+        mass_spin = QDoubleSpinBox()
+        mass_spin.setRange(0.0, 1e9)
+        mass_spin.setDecimals(3)
+        mass_spin.setValue(0.0)
+        mass_spin.setSingleStep(0.1)
+        mass_row = QHBoxLayout()
+        mass_row.addWidget(QLabel("Mass (kg):"))
+        mass_row.addWidget(mass_spin)
+        mass_row.addStretch()
+        layout.addLayout(mass_row)
+
+        # Power (mW)
+        power_spin = QDoubleSpinBox()
+        power_spin.setRange(0.0, 1e9)
+        power_spin.setDecimals(2)
+        power_spin.setValue(0.0)
+        power_spin.setSingleStep(1.0)
+        power_row = QHBoxLayout()
+        power_row.addWidget(QLabel("Power (mW):"))
+        power_row.addWidget(power_spin)
+        power_row.addStretch()
+        layout.addLayout(power_row)
+
+        # Subsystem dropdown (only if subsystems exist)
+        sub_combo = None
         if subsystems:
-            sub_layout = QHBoxLayout()
-            sub_layout.addWidget(QLabel("Subsystem:"))
-            combo = QComboBox()
+            sub_row = QHBoxLayout()
+            sub_row.addWidget(QLabel("Subsystem:"))
+            sub_combo = QComboBox()
+            sub_combo.addItem("(None)", None)
             for ss_id, ss_name in subsystems:
-                combo.addItem(ss_name, ss_id)
-            sub_layout.addWidget(combo)
-            sub_layout.addStretch()
-            layout.addLayout(sub_layout)
+                sub_combo.addItem(ss_name, ss_id)
+            sub_row.addWidget(sub_combo)
+            sub_row.addStretch()
+            layout.addLayout(sub_row)
 
         # Color row
-        color_layout = QHBoxLayout()
-        color_layout.addWidget(QLabel("Color:"))
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color:"))
         color_combo = QComboBox()
         color_swatch = QLabel()
         color_swatch.setFixedSize(20, 20)
@@ -539,62 +577,52 @@ class SchematicViewTab(QWidget):
         color_combo.currentIndexChanged.connect(_update_swatch)
         _update_swatch()
 
-        color_layout.addWidget(color_combo)
-        color_layout.addWidget(color_swatch)
-        color_layout.addStretch()
-        layout.addLayout(color_layout)
+        color_row.addWidget(color_combo)
+        color_row.addWidget(color_swatch)
+        color_row.addStretch()
+        layout.addLayout(color_row)
 
+        # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
 
         if dialog.exec_() != QDialog.Accepted:
-            return  # User cancelled - abort entirely
+            return
 
-        if subsystems:
-            selected_subsystem_id = combo.currentData()
+        name = name_edit.text().strip()
+        if not name:
+            return
+
+        mass = mass_spin.value()
+        power = power_spin.value()
+        selected_subsystem_id = sub_combo.currentData() if sub_combo else None
         selected_color = color_combo.currentData()
 
         # Permission check before creating the module
         if not guard_write("module.create", selected_subsystem_id, parent=self):
             return
 
-        # Create module via bridge with just name (matches @pyqtSlot(str))
-        new_id = self.bridge.create_module(name.strip())
-
-        # Update subsystem and color directly in the DB
-        if new_id > 0:
-            try:
-                with get_connection() as conn:
-                    cur = conn.cursor()
-                    if selected_subsystem_id is not None:
-                        cur.execute(
-                            "UPDATE modules SET subsystem_id = %s, color = %s WHERE id = %s AND project_id = %s",
-                            (selected_subsystem_id, selected_color, new_id, project_id),
-                        )
-                    else:
-                        cur.execute(
-                            "UPDATE modules SET color = %s WHERE id = %s AND project_id = %s",
-                            (selected_color, new_id, project_id),
-                        )
-                    conn.commit()
-            except Exception:
-                pass
+        # Create module via bridge with all parameters
+        new_id = self.bridge.create_module(
+            name,
+            subsystem_id=selected_subsystem_id if selected_subsystem_id is not None else -1,
+            mass=mass,
+            power=power,
+            color=selected_color,
+        )
 
         # Position the new module to avoid overlapping existing modules
-        if new_id > 0:
-            _place_module_without_overlap(new_id, name.strip())
+        if new_id and new_id > 0:
+            _place_module_without_overlap(new_id, name)
 
         # Force refresh the scene and the tree selector immediately.
-        # The new module is injected into the saved selection so it gets
-        # auto-checked and appears on screen.
         self.bridge.get_scene_data()
 
         if hasattr(self, "tree_selector") and hasattr(self.tree_selector, "refresh_tree"):
             saved_selection = self.tree_selector.get_checked_ids()
-            # Include the newly created module so it shows up on screen
-            if new_id > 0 and new_id not in saved_selection["modules"]:
+            if new_id and new_id > 0 and new_id not in saved_selection["modules"]:
                 saved_selection["modules"].append(new_id)
             self.tree_selector.refresh_tree(emit_selection=False)
             self.tree_selector.apply_selection(saved_selection)

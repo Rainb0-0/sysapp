@@ -1150,6 +1150,8 @@ function removeContextMenu() {
 }
 
 function showModuleContextMenu(event, moduleDatum) {
+    // If the module is not editable, show no context menu at all.
+    if (moduleDatum.editable === false) return;
     showContextMenu(event, [
         { icon: '\u2795', label: 'Add Connector', action: function () { addConnectorPrompt(moduleDatum); }, shortcut: 'N' },
         { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renameModulePrompt(moduleDatum); } },
@@ -1158,6 +1160,9 @@ function showModuleContextMenu(event, moduleDatum) {
 }
 
 function showConnectorContextMenu(event, connectorDatum) {
+    // Derive editability from the parent module
+    var parentModule = sceneData.modules.find(function (m) { return String(m.id) === String(connectorDatum.module_id); });
+    if (!parentModule || parentModule.editable === false) return;
     showContextMenu(event, [
         { icon: '\uD83D\uDD04', label: 'Reorder Pins', action: function () { openPinOrderDialog(connectorDatum); } },
         { icon: '\u2795', label: 'Add Pin', action: function () { addPinPrompt(connectorDatum); }, shortcut: 'N' },
@@ -1167,6 +1172,9 @@ function showConnectorContextMenu(event, connectorDatum) {
 }
 
 function showPinContextMenu(event, pinDatum, connectorDatum) {
+    // Derive editability from the parent module
+    var parentModule = sceneData.modules.find(function (m) { return String(m.id) === String(connectorDatum.module_id); });
+    if (!parentModule || parentModule.editable === false) return;
     showContextMenu(event, [
         { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renamePinPrompt(pinDatum); } },
         { icon: '\u274C', label: 'Delete', action: function () { deletePinConfirm(pinDatum); }, shortcut: 'Del' },
@@ -1174,6 +1182,8 @@ function showPinContextMenu(event, pinDatum, connectorDatum) {
 }
 
 function showInterfaceContextMenu(event, iface) {
+    // Only show the context menu if the interface is editable
+    if (iface.editable === false) return;
     showContextMenu(event, [
         { icon: '\uD83D\uDDD1\uFE0F', label: 'Delete Connection', action: function () { deleteInterfaceConfirm(iface); }, shortcut: 'Del' },
     ]);
@@ -1194,6 +1204,9 @@ function showInterfaceDragHandleContextMenu(event, ifaceId, pointIndex, scene) {
             break;
         }
     }
+    
+    // Only show the context menu if the interface is editable
+    if (!iface || iface.editable === false) return;
     
     if (!iface || !iface.points || iface.points.length <= 3) {
         // Can't remove a pivot if there are only 2 endpoints + 0 interior points,
@@ -1401,11 +1414,12 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
             });
 
         // --- Wire dragging: show draggable handles only at interior vertices
-        // of user-created manual overrides (persisted from DB).
+        // of user-created manual overrides (persisted from DB) that the
+        // current user has permission to edit.
         // A*-computed waypoints and virtual pivots get NO handles — they
         // are routing aids, not user-placed pivots.
         var isManual = (iface.manual_override || iface._manualOverride);
-        if (isManual) {
+        if (isManual && iface.editable !== false) {
             for (var i = 0; i < points.length; i++) {
                 if (i === 0 || i === points.length - 1) continue;
 
@@ -1469,7 +1483,9 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
         // --- Drag any point ON the path (not just vertices) to reroute ---
         // When user clicks and drags on a path segment, a new waypoint is
         // inserted at that position and becomes draggable.
+        // Non-editable interfaces get no path drag behavior.
         (function (iface, points, path, interfaceGroup, line) {
+            if (iface.editable === false) return;
             var dragState = null;
 
             function distToSegmentSq(px, py, ax, ay, bx, by) {
@@ -1719,6 +1735,10 @@ function computeRoutePoints(fromPin, toPin, obstacleRects) {
 // ---------------------------------------------------------------------
 function dragBehavior() {
     return d3.drag()
+        .filter(function (event, d) {
+            // Only allow dragging of editable modules
+            return d.editable !== false;
+        })
         .on('start', function (event, d) {
             d3.select(this).raise();
         })
@@ -1776,7 +1796,11 @@ function dragBehavior() {
             const payload = {};
             payload[d.id] = { x: d.x, y: d.y };
             bridge.save_module_positions(JSON.stringify(payload));
-            persistCurrentRoutes();
+            // NOTE: persistCurrentRoutes() is intentionally NOT called here.
+            // Module drag updates routing visually via updateInterfacesInPlace(),
+            // but persisting all routes would trigger permission errors for
+            // interfaces touching subsystems the user can't edit.  Routing is
+            // recomputed from current positions on next scene load anyway.
         });
 }
 
@@ -1786,6 +1810,10 @@ function dragBehavior() {
 // ---------------------------------------------------------------------
 function resizeBehavior(direction) {
     return d3.drag()
+        .filter(function (event, d) {
+            // Only allow resizing of editable modules
+            return d.editable !== false;
+        })
         .on('start', function (event, d) {
             event.sourceEvent.stopPropagation();
             d3.select(this).raise();
@@ -2300,6 +2328,10 @@ function enableConnectorSideDrag(group, c, module) {
     var dragState = { currentSide: normalizeSide(c.side), hadDrag: false };
 
     group.call(d3.drag()
+        .filter(function () {
+            // Only allow dragging on editable modules
+            return module.editable !== false;
+        })
         .on('start', function (event) {
             event.sourceEvent.stopPropagation();
             dragState.currentSide = normalizeSide(c.side);

@@ -31,7 +31,14 @@ get_complete_layout(module_ids, connector_ids, interface_ids) returns:
 
 from typing import Dict, List, Any, Optional, Tuple, Set
 
-from database import get_connection, get_current_project_id, get_complete_layout
+from database import (
+    get_connection,
+    get_current_project_id,
+    get_complete_layout,
+    get_interface_subsystem_ids,
+)
+from auth_manager import auth
+from access_control import can_edit_subsystem
 
 # Matches the defaults actually used in schematic_graphics.py's ModuleGraphics(...)
 DEFAULT_MODULE_WIDTH = 160.0
@@ -265,6 +272,14 @@ def load_schematic_scene(
             else:
                 module_color = SUBSYSTEM_COLORS[idx % len(SUBSYSTEM_COLORS)]
 
+            # Check whether the current user can edit this module's subsystem.
+            # can_edit_subsystem() already handles system admins and None.
+            can_edit = (
+                auth.is_logged_in()
+                and auth.has_perm("module.edit")
+                and can_edit_subsystem(subsystem_id)
+            )
+
             scene["modules"].append({
                 "id": mod_id,
                 "name": name,
@@ -276,6 +291,7 @@ def load_schematic_scene(
                 "subsystem_id": subsystem_id,
                 "mass": mass,
                 "power": power,
+                "editable": can_edit,
             })
 
         # ---------------- Assemble connectors + pins ----------------
@@ -311,12 +327,22 @@ def load_schematic_scene(
                 else:
                     points, meta = [], {}
 
+                # Determine if the user can edit this interface (both
+                # connected subsystems must be editable).
+                iface_sids = get_interface_subsystem_ids(iface_id)
+                iface_can_edit = (
+                    auth.is_logged_in()
+                    and auth.has_perm("interface.edit")
+                    and all(can_edit_subsystem(s) for s in iface_sids)
+                )
+
                 scene["interfaces"].append({
                     "id": iface_id,
                     "from_pin": pin1_id,
                     "to_pin": pin2_id,
                     "color": color,
                     "points": [[x, y] for x, y in points],
+                    "editable": iface_can_edit,
                     **meta,
                 })
 
@@ -511,7 +537,9 @@ def create_module(name: str, x: float = 40.0, y: float = 40.0,
                    width: float = DEFAULT_MODULE_WIDTH,
                    height: float = DEFAULT_MODULE_HEIGHT,
                    color: Optional[str] = None,
-                   subsystem_id: Optional[int] = None) -> Optional[int]:
+                   subsystem_id: Optional[int] = None,
+                   mass: float = 0.0,
+                   power: float = 0.0) -> Optional[int]:
     """Insert a new module and return its id."""
     project_id = get_current_project_id()
     if project_id is None or not name.strip():
@@ -521,8 +549,8 @@ def create_module(name: str, x: float = 40.0, y: float = 40.0,
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO modules (project_id, name, color, pos_x, pos_y, width, height, mass, power, subsystem_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 0, %s) RETURNING id",
-            (project_id, name.strip(), color, x, y, width, height, subsystem_id),
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (project_id, name.strip(), color, x, y, width, height, mass, power, subsystem_id),
         )
         new_id = cur.fetchone()[0]
         conn.commit()
@@ -546,6 +574,11 @@ def create_connector(module_id: int, name: str, side: str = "top",
             (project_id, module_id, name.strip(), color, side),
         )
         new_id = cur.fetchone()[0]
+        # Update the module's connector count
+        cur.execute(
+            "UPDATE modules SET num_connectors = num_connectors + 1 WHERE id = %s AND project_id = %s",
+            (module_id, project_id),
+        )
         conn.commit()
         return new_id
 
@@ -585,6 +618,14 @@ def delete_connector(connector_id: int) -> None:
 
     with get_connection() as conn:
         cur = conn.cursor()
+        # Grab the module_id before deleting so we can update num_connectors
+        cur.execute(
+            "SELECT module_id FROM connectors WHERE id = %s AND project_id = %s",
+            (connector_id, project_id),
+        )
+        row = cur.fetchone()
+        module_id = row[0] if row else None
+
         cur.execute(
             "SELECT id FROM pins WHERE connector_id = %s AND project_id = %s",
             (connector_id, project_id),
@@ -610,6 +651,12 @@ def delete_connector(connector_id: int) -> None:
             "DELETE FROM connectors WHERE id = %s AND project_id = %s",
             (connector_id, project_id),
         )
+        # Decrement the module's connector count
+        if module_id is not None:
+            cur.execute(
+                "UPDATE modules SET num_connectors = GREATEST(0, num_connectors - 1) WHERE id = %s AND project_id = %s",
+                (module_id, project_id),
+            )
         conn.commit()
 
 

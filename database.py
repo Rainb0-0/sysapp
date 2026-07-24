@@ -1295,6 +1295,7 @@ def seed_auth_basics():
             "module.create", "module.edit", "module.delete",
             "connector.create", "connector.edit", "connector.delete",
             "pin.create", "pin.edit", "pin.delete",
+            "interface.create", "interface.edit", "interface.delete",
             "export.excel", "export.image", "export.pdf",
         ]:
             assign_permission_to_role("subsystem_admin", code)
