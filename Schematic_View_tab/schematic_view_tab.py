@@ -460,18 +460,31 @@ class SchematicViewTab(QWidget):
             self.tree_selector.apply_selection(saved_selection)
 
     def add_module(self):
-        from PyQt5.QtWidgets import QInputDialog, QComboBox, QDialog, QVBoxLayout, QLabel, QDialogButtonBox
+        from PyQt5.QtWidgets import QInputDialog, QComboBox, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QDialogButtonBox
+        from PyQt5.QtGui import QColor, QPixmap, QPainter
         from database import get_connection, get_current_project_id
+
+        # Color palette matching the Architecture View tab
+        COLOR_MAP = {
+            "Default": "#33A444",
+            "Red": "#FF0000",
+            "Blue": "#0000FF",
+            "Yellow": "#FFFF00",
+            "Purple": "#800080",
+            "Orange": "#FFA500",
+            "Gray": "#5D5A5A",
+        }
 
         # First, ask for the module name
         name, ok = QInputDialog.getText(self, "New Module", "Module name:")
         if not ok or not name.strip():
             return
 
-        # Then, ask which subsystem the module should belong to
+        # Load subsystems for the dropdown
         project_id = get_current_project_id()
         subsystems = []
         selected_subsystem_id = None
+        selected_color = "#33A444"  # Default color
         if project_id is not None:
             try:
                 with get_connection() as conn:
@@ -484,41 +497,82 @@ class SchematicViewTab(QWidget):
             except Exception:
                 pass
 
+        dialog = QDialog(self)
+        dialog.setWindowTitle("New Module")
+        layout = QVBoxLayout(dialog)
+
+        label = QLabel('Create module "' + name.strip() + '":')
+        layout.addWidget(label)
+
+        # Subsystem row (only if subsystems exist)
         if subsystems:
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Select Subsystem")
-            layout = QVBoxLayout(dialog)
-
-            label = QLabel('Choose a subsystem for module "' + name.strip() + '":')
-            layout.addWidget(label)
-
+            sub_layout = QHBoxLayout()
+            sub_layout.addWidget(QLabel("Subsystem:"))
             combo = QComboBox()
-            combo.addItem("-- None --", None)
             for ss_id, ss_name in subsystems:
                 combo.addItem(ss_name, ss_id)
-            layout.addWidget(combo)
+            sub_layout.addWidget(combo)
+            sub_layout.addStretch()
+            layout.addLayout(sub_layout)
 
-            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            buttons.accepted.connect(dialog.accept)
-            buttons.rejected.connect(dialog.reject)
-            layout.addWidget(buttons)
+        # Color row
+        color_layout = QHBoxLayout()
+        color_layout.addWidget(QLabel("Color:"))
+        color_combo = QComboBox()
+        color_swatch = QLabel()
+        color_swatch.setFixedSize(20, 20)
 
-            if dialog.exec_() != QDialog.Accepted:
-                return  # User cancelled - abort entirely
+        for color_name, color_hex in COLOR_MAP.items():
+            color_combo.addItem(color_name, color_hex)
+
+        def _update_swatch():
+            c = QColor(color_combo.currentData())
+            pm = QPixmap(20, 20)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setBrush(c)
+            p.drawRoundedRect(0, 0, 19, 19, 4, 4)
+            p.end()
+            color_swatch.setPixmap(pm)
+
+        color_combo.currentIndexChanged.connect(_update_swatch)
+        _update_swatch()
+
+        color_layout.addWidget(color_combo)
+        color_layout.addWidget(color_swatch)
+        color_layout.addStretch()
+        layout.addLayout(color_layout)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return  # User cancelled - abort entirely
+
+        if subsystems:
             selected_subsystem_id = combo.currentData()
+        selected_color = color_combo.currentData()
 
         # Create module via bridge with just name (matches @pyqtSlot(str))
         new_id = self.bridge.create_module(name.strip())
 
-        # If a subsystem was selected, update it directly in the DB
-        if new_id > 0 and selected_subsystem_id is not None:
+        # Update subsystem and color directly in the DB
+        if new_id > 0:
             try:
                 with get_connection() as conn:
                     cur = conn.cursor()
-                    cur.execute(
-                        "UPDATE modules SET subsystem_id = %s WHERE id = %s AND project_id = %s",
-                        (selected_subsystem_id, new_id, project_id),
-                    )
+                    if selected_subsystem_id is not None:
+                        cur.execute(
+                            "UPDATE modules SET subsystem_id = %s, color = %s WHERE id = %s AND project_id = %s",
+                            (selected_subsystem_id, selected_color, new_id, project_id),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE modules SET color = %s WHERE id = %s AND project_id = %s",
+                            (selected_color, new_id, project_id),
+                        )
                     conn.commit()
             except Exception:
                 pass
