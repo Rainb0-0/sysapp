@@ -767,6 +767,11 @@ class ModuleWiringApp(QMainWindow):
             self.statusBar().showMessage("🖥️ Exited full screen mode", 2000)
         else:
             self.showFullScreen()
+            # Force the menu bar to stay visible — on some platforms (Linux/X11
+            # in particular) showFullScreen() can hide the menu bar behind the
+            # central widget while leaving its mouse-area interactive, producing
+            # an invisible-but-clickable menu bar.
+            self.menuBar().show()
             self.statusBar().showMessage("🖥️ Entered full screen mode", 2000)
 
     def _export_csv(self):

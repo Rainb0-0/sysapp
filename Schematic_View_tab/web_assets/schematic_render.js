@@ -2116,8 +2116,30 @@ function getExportBounds() {
     return JSON.stringify({ widthPx, heightPx });
 }
 
-function fitView() {
+// ---------------------------------------------------------------------
+// Zoom state save/restore for export — saves the current d3-zoom transform
+// before resizing for PDF/PNG export, so the user's view can be restored
+// without any visible animation or size change.
+// ---------------------------------------------------------------------
+function getZoomState() {
+    if (!g || !g.node()) return '{"x":0,"y":0,"k":1}';
+    var t = d3.zoomTransform(g.node());
+    return JSON.stringify({x: t.x, y: t.y, k: t.k});
+}
+
+function setZoomState(json) {
+    if (!g || !g.node() || !svg) return;
+    try {
+        var state = JSON.parse(json);
+        svg.call(zoom.transform, d3.zoomIdentity.translate(state.x, state.y).scale(state.k));
+    } catch (e) {
+        console.error('Error in setZoomState:', e);
+    }
+}
+
+function fitView(duration) {
     if (!g.node() || !sceneData) return;
+    if (duration === undefined) duration = 650;
     try {
         requestAnimationFrame(() => {
             const parent = svg.node().getBoundingClientRect();
@@ -2156,7 +2178,7 @@ function fitView() {
             if (!isFinite(minX) || !isFinite(maxX) || maxX <= minX || maxY <= minY) {
                 // No content — center on origin with a default zoom
                 svg.transition()
-                    .duration(650)
+                    .duration(duration)
                     .call(zoom.transform, d3.zoomIdentity.translate(width / 2, height / 2).scale(0.5));
                 return;
             }
@@ -2178,7 +2200,7 @@ function fitView() {
             const ty = (height / 2) - scale * cy;
 
             svg.transition()
-                .duration(650)
+                .duration(duration)
                 .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
         });
     } catch (e) {
@@ -2422,3 +2444,5 @@ window.fitView = fitView;
 window.getExportBounds = getExportBounds;
 window.setExportOverlayVisible = setExportOverlayVisible;
 window.triggerSaveLayout = triggerSaveLayout;
+window.getZoomState = getZoomState;
+window.setZoomState = setZoomState;

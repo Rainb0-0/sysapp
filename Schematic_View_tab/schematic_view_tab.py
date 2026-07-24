@@ -679,16 +679,12 @@ class SchematicViewTab(QWidget):
                 QMarginsF(0, 0, 0, 0),
             )
 
-            self.web_view.resize(width_px, height_px)
+            # Save the current zoom state so we can restore it after export
             self.web_view.page().runJavaScript(
-                "if (typeof fitView === 'function') fitView();"
-            )
-            QTimer.singleShot(
-                800,
-                lambda: self.web_view.page().printToPdf(
-                    self._handle_pdf_export_finished,
-                    page_layout,
-                ),
+                "if (typeof getZoomState === 'function') { return getZoomState(); } "
+                'return \'{"x":0,"y":0,"k":1}\';',
+                lambda zoom_json: self._resize_and_export(width_px, height_px,
+                                                           page_layout, zoom_json),
             )
         except Exception as e:
             if progress is not None:
@@ -698,6 +694,18 @@ class SchematicViewTab(QWidget):
             )
             self._pending_pdf_path = None
             self._pending_pdf_progress = None
+
+    def _resize_and_export(self, width_px, height_px, page_layout, zoom_json):
+        """Resize webview, instant-fit, and export to PDF."""
+        self._saved_zoom_state = zoom_json
+        self.web_view.resize(width_px, height_px)
+        self.web_view.page().runJavaScript(
+            "if (typeof fitView === 'function') fitView(0);",
+            lambda _: self.web_view.page().printToPdf(
+                self._handle_pdf_export_finished,
+                page_layout,
+            ),
+        )
 
     def _handle_pdf_export_finished(self, data):
         progress = getattr(self, "_pending_pdf_progress", None)
@@ -711,9 +719,24 @@ class SchematicViewTab(QWidget):
             with open(file_path, "wb") as f:
                 f.write(pdf_bytes)
 
-            self.web_view.resize(
-                getattr(self, "_pending_pdf_original_size", self.web_view.size())
+            # Restore the webview to its original size and saved zoom state
+            original_size = getattr(
+                self, "_pending_pdf_original_size", self.web_view.size()
             )
+            self.web_view.resize(original_size)
+
+            zoom_state = getattr(self, "_saved_zoom_state", None)
+            if zoom_state:
+                self.web_view.page().runJavaScript(
+                    "if (typeof setZoomState === 'function') setZoomState('"
+                    + zoom_state.replace("\\", "\\\\").replace("'", "\\'")
+                    + "');"
+                )
+            else:
+                self.web_view.page().runJavaScript(
+                    "if (typeof fitView === 'function') fitView();"
+                )
+
             self.web_view.page().runJavaScript(
                 "if (typeof setExportOverlayVisible === 'function') setExportOverlayVisible(true);"
             )
