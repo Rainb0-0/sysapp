@@ -506,8 +506,15 @@ class ActiveUsersDialog(QDialog):
         except Exception:
             all_users = []
 
-        # Build a quick lookup for last_seen/online
-        last_by_user = {r["username"]: (r["last_seen"], r["online"]) for r in active_rows}
+        # Build a quick lookup for last_seen/online.
+        # Results are ordered by last_seen DESC, so the first row per user
+        # is the most recent session. Keep only that one to avoid stale
+        # old sessions (which linger with is_active=TRUE) overwriting the
+        # current online status.
+        last_by_user = {}
+        for r in active_rows:
+            if r["username"] not in last_by_user:
+                last_by_user[r["username"]] = (r["last_seen"], r["online"])
 
         # Fill table with ALL users (to show grey for offline)
         self.tbl_presence.setRowCount(len(all_users))

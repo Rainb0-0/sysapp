@@ -910,6 +910,10 @@ class ModuleWiringApp(QMainWindow):
 
     def closeEvent(self, event):
         """Handles application close event."""
+        # End user session so last_seen stops appearing online
+        if auth.is_logged_in():
+            auth.logout()
+
         # Save window position
         geometry = self.geometry()
         config_manager.set_window_geometry(
