@@ -5,9 +5,9 @@
     "font_scale": 1.0,
     "window_geometry": {
       "x": 0,
-      "y": 0,
+      "y": 69,
       "width": 1280,
-      "height": 800
+      "height": 731
     },
     "splitter_sizes": [
       300,

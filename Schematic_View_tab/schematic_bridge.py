@@ -19,11 +19,19 @@ On the JS side, after `new QWebChannel(qt.webChannelTransport, ...)`,
 """
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Set
 
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 
-from database import get_current_project_id
+from database import (
+    get_current_project_id,
+    get_module_subsystem_id,
+    get_connector_subsystem_id,
+    get_pin_subsystem_id,
+    get_interface_subsystem_ids,
+)
+from auth_manager import auth
+from access_control import can_edit_subsystem
 from styles.style_manager import style_manager
 from styles.theme_manager import theme_manager
 
@@ -71,6 +79,53 @@ class SchematicBridge(QObject):
         self._host_widget = None
 
         style_manager.theme_changed.connect(self._on_theme_changed)
+
+    # ------------------------------------------------------------------
+    # Permission helpers
+    # ------------------------------------------------------------------
+    def _check_perm(self, perm_code: str, subsystem_id: int | None, action_desc: str) -> bool:
+        """
+        Check permission code + subsystem scope. Emits save_finished on
+        failure so the JS front-end sees a toast / status message.
+        Returns True if the operation is allowed.
+        """
+        if not auth.is_logged_in():
+            self.save_finished.emit(False, "You must sign in first to edit.")
+            return False
+        if not auth.has_perm(perm_code):
+            self.save_finished.emit(False, f"You don't have permission to {action_desc}.")
+            return False
+        if not can_edit_subsystem(subsystem_id):
+            if subsystem_id is None:
+                self.save_finished.emit(False, "Cannot determine subsystem for this operation.")
+            else:
+                self.save_finished.emit(False, "You don't have permission to modify this subsystem.")
+            return False
+        return True
+
+    def _check_all_subsystems(self, perm_code: str, subsystem_ids: Set[int], action_desc: str) -> bool:
+        """
+        Check permission + ALL subsystems in the set. Fails if any one is
+        not editable by the current user.
+        """
+        if not auth.is_logged_in():
+            self.save_finished.emit(False, "You must sign in first to edit.")
+            return False
+        if not auth.has_perm(perm_code):
+            self.save_finished.emit(False, f"You don't have permission to {action_desc}.")
+            return False
+        if auth.is_system():
+            return True
+        if not subsystem_ids:
+            # No subsystem scope to check — could be unassigned items
+            return True
+        for sid in subsystem_ids:
+            if not can_edit_subsystem(sid):
+                self.save_finished.emit(
+                    False, "You don't have permission to modify one or more subsystems."
+                )
+                return False
+        return True
 
     # ------------------------------------------------------------------
     # Loading
@@ -160,6 +215,16 @@ class SchematicBridge(QObject):
         try:
             raw: Dict[str, Any] = json.loads(positions_json)
             positions = {int(mod_id): pos for mod_id, pos in raw.items()}
+
+            # Permission: collect all unique subsystem IDs
+            sub_ids: Set[int] = set()
+            for mod_id in positions:
+                sid = get_module_subsystem_id(mod_id)
+                if sid is not None:
+                    sub_ids.add(sid)
+            if not self._check_all_subsystems("module.edit", sub_ids, "edit module positions"):
+                return
+
             persist_module_positions(positions)
             self.save_finished.emit(True, f"{len(positions)} module position(s) saved")
         except Exception as e:
@@ -172,6 +237,16 @@ class SchematicBridge(QObject):
         try:
             raw: Dict[str, Any] = json.loads(positions_json)
             positions = {int(conn_id): pos for conn_id, pos in raw.items()}
+
+            # Permission: collect all unique subsystem IDs
+            sub_ids: Set[int] = set()
+            for conn_id in positions:
+                sid = get_connector_subsystem_id(conn_id)
+                if sid is not None:
+                    sub_ids.add(sid)
+            if not self._check_all_subsystems("connector.edit", sub_ids, "edit connector positions"):
+                return
+
             persist_connector_positions(positions)
             self.save_finished.emit(
                 True, f"{len(positions)} connector position(s) saved"
@@ -200,6 +275,14 @@ class SchematicBridge(QObject):
                 else:
                     interface_data[int(iface_id)] = [tuple(p) for p in payload]
 
+            # Permission: collect all unique subsystem IDs
+            sub_ids: Set[int] = set()
+            for iface_id in interface_data:
+                sids = get_interface_subsystem_ids(iface_id)
+                sub_ids.update(sids)
+            if not self._check_all_subsystems("interface.edit", sub_ids, "edit routing"):
+                return
+
             save_enhanced_interface_data(interface_data)
             self.save_finished.emit(True, f"{len(interface_data)} route(s) saved")
         except Exception as e:
@@ -217,6 +300,14 @@ class SchematicBridge(QObject):
         up the real routed path.
         """
         try:
+            # Permission: check both pins' subsystem IDs
+            sid1 = get_pin_subsystem_id(pin1_id)
+            sid2 = get_pin_subsystem_id(pin2_id)
+            if sid1 is not None and not self._check_perm("interface.create", sid1, "create connections"):
+                return -1
+            if sid2 is not None and not self._check_perm("interface.create", sid2, "create connections"):
+                return -1
+
             new_id = persist_create_interface(pin1_id, pin2_id, color or None)
             if new_id is None:
                 self.save_finished.emit(False, "Could not create connection")
@@ -230,6 +321,11 @@ class SchematicBridge(QObject):
     @pyqtSlot(int)
     def delete_interface(self, interface_id: int):
         try:
+            # Permission: check all involved subsystem IDs
+            sids = get_interface_subsystem_ids(interface_id)
+            if not self._check_all_subsystems("interface.delete", sids, "delete connections"):
+                return
+
             persist_delete_interface(interface_id)
             self.save_finished.emit(True, "Connection deleted")
             self.get_scene_data()
@@ -239,6 +335,10 @@ class SchematicBridge(QObject):
     @pyqtSlot(int)
     def delete_module(self, module_id: int):
         try:
+            sid = get_module_subsystem_id(module_id)
+            if not self._check_perm("module.delete", sid, "delete modules"):
+                return
+
             persist_delete_module(module_id)
             self.save_finished.emit(True, "Module deleted")
             self.get_scene_data()
@@ -248,6 +348,10 @@ class SchematicBridge(QObject):
     @pyqtSlot(int, str)
     def rename_module(self, module_id: int, new_name: str):
         try:
+            sid = get_module_subsystem_id(module_id)
+            if not self._check_perm("module.edit", sid, "rename modules"):
+                return
+
             persist_rename_module(module_id, new_name)
             self.save_finished.emit(True, "Module renamed")
             self.get_scene_data()
@@ -258,6 +362,15 @@ class SchematicBridge(QObject):
     def create_module(self, name: str, subsystem_id: int = -1):
         try:
             sid = subsystem_id if subsystem_id >= 0 else None
+            # For module creation without a subsystem, we check the permission
+            # but skip the subsystem scope gate (since there's no target).
+            if not auth.is_logged_in():
+                self.save_finished.emit(False, "You must sign in first to create modules.")
+                return -1
+            if not auth.has_perm("module.create"):
+                self.save_finished.emit(False, "You don't have permission to create modules.")
+                return -1
+
             new_id = persist_create_module(name, subsystem_id=sid)
             if new_id is None:
                 self.save_finished.emit(False, "Could not create module")
@@ -275,6 +388,10 @@ class SchematicBridge(QObject):
     @pyqtSlot(int, str, str, result=int)
     def create_connector(self, module_id: int, name: str, side: str):
         try:
+            sid = get_module_subsystem_id(module_id)
+            if not self._check_perm("connector.create", sid, "create connectors"):
+                return -1
+
             new_id = persist_create_connector(module_id, name, side)
             if new_id is None:
                 self.save_finished.emit(False, "Could not create connector")
@@ -289,6 +406,10 @@ class SchematicBridge(QObject):
     @pyqtSlot(int, str)
     def rename_connector(self, connector_id: int, new_name: str):
         try:
+            sid = get_connector_subsystem_id(connector_id)
+            if not self._check_perm("connector.edit", sid, "rename connectors"):
+                return
+
             persist_rename_connector(connector_id, new_name)
             self.save_finished.emit(True, "Connector renamed")
             self.get_scene_data()
@@ -298,6 +419,10 @@ class SchematicBridge(QObject):
     @pyqtSlot(int, str)
     def set_connector_side(self, connector_id: int, side: str):
         try:
+            sid = get_connector_subsystem_id(connector_id)
+            if not self._check_perm("connector.edit", sid, "change connector side"):
+                return
+
             persist_set_connector_side(connector_id, side)
             self.save_finished.emit(True, "Connector side updated")
             self.get_scene_data()
@@ -307,6 +432,10 @@ class SchematicBridge(QObject):
     @pyqtSlot(int)
     def delete_connector(self, connector_id: int):
         try:
+            sid = get_connector_subsystem_id(connector_id)
+            if not self._check_perm("connector.delete", sid, "delete connectors"):
+                return
+
             persist_delete_connector(connector_id)
             self.save_finished.emit(True, "Connector deleted")
             self.get_scene_data()
@@ -319,6 +448,10 @@ class SchematicBridge(QObject):
     @pyqtSlot(int, str, result=int)
     def create_pin(self, connector_id: int, name: str):
         try:
+            sid = get_connector_subsystem_id(connector_id)
+            if not self._check_perm("pin.create", sid, "create pins"):
+                return -1
+
             new_id = persist_create_pin(connector_id, name)
             if new_id is None:
                 self.save_finished.emit(False, "Could not create pin")
@@ -333,6 +466,10 @@ class SchematicBridge(QObject):
     @pyqtSlot(int, str)
     def rename_pin(self, pin_id: int, new_name: str):
         try:
+            sid = get_pin_subsystem_id(pin_id)
+            if not self._check_perm("pin.edit", sid, "rename pins"):
+                return
+
             persist_rename_pin(pin_id, new_name)
             self.save_finished.emit(True, "Pin renamed")
             self.get_scene_data()
@@ -342,6 +479,10 @@ class SchematicBridge(QObject):
     @pyqtSlot(int)
     def delete_pin(self, pin_id: int):
         try:
+            sid = get_pin_subsystem_id(pin_id)
+            if not self._check_perm("pin.delete", sid, "delete pins"):
+                return
+
             persist_delete_pin(pin_id)
             self.save_finished.emit(True, "Pin deleted")
             self.get_scene_data()
@@ -367,6 +508,11 @@ class SchematicBridge(QObject):
         except Exception:
             pin_names = []
         if not pin_names:
+            return
+
+        # Permission check
+        sid = get_connector_subsystem_id(connector_id)
+        if not self._check_perm("pin.edit", sid, "reorder pins"):
             return
 
         host = getattr(self, "_host_widget", None)

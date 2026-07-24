@@ -54,6 +54,7 @@ from styles.theme_manager import theme_manager
 from Schematic_View_tab.schematic_bridge import SchematicBridge
 from Schematic_View_tab.schematic_tree_selector import SchematicTreeSelector
 from Schematic_View_tab.mode.mode_web_panel import ModeWebPanel
+from access_control import guard_write, guard_export
 
 # ---------------------------------------------------------------------------
 # Grid layout constants for auto-positioning new modules (mirrors
@@ -555,6 +556,10 @@ class SchematicViewTab(QWidget):
             selected_subsystem_id = combo.currentData()
         selected_color = color_combo.currentData()
 
+        # Permission check before creating the module
+        if not guard_write("module.create", selected_subsystem_id, parent=self):
+            return
+
         # Create module via bridge with just name (matches @pyqtSlot(str))
         new_id = self.bridge.create_module(name.strip())
 
@@ -619,6 +624,8 @@ class SchematicViewTab(QWidget):
     #  and ceil()+buffer mm sizing to avoid a phantom extra page)
     # ------------------------------------------------------------------
     def export_to_pdf(self):
+        if not guard_export(parent=self):
+            return
         try:
             file_path, _ = QFileDialog.getSaveFileName(
                 self,
@@ -765,6 +772,8 @@ class SchematicViewTab(QWidget):
     # maximum zlib compression (quality=100 for lossless PNG).
     # ------------------------------------------------------------------
     def export_to_png(self):
+        if not guard_export(parent=self):
+            return
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Schematic to PNG",

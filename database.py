@@ -1405,6 +1405,39 @@ def guard_or_raise(user_id: int, perm_code: str, target_subsystem_id: int | None
             pass
         raise UnauthorizedError(f"Denied: {perm_code} on subsystem={target_subsystem_id}")
 
+def get_interface_pins(interface_id: int) -> tuple[int | None, int | None]:
+    """
+    Return (pin1_id, pin2_id) for the given interface.
+    Returns (None, None) if not found.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT pin1_id, pin2_id FROM interfaces WHERE id = %s",
+            (interface_id,),
+        )
+        r = cur.fetchone()
+        return (r[0], r[1]) if r else (None, None)
+
+
+def get_interface_subsystem_ids(interface_id: int) -> set[int]:
+    """
+    Return the set of subsystem IDs associated with the modules
+    connected by this interface (via its two pins).
+    """
+    pin1_id, pin2_id = get_interface_pins(interface_id)
+    ids = set()
+    if pin1_id is not None:
+        sid = get_pin_subsystem_id(pin1_id)
+        if sid is not None:
+            ids.add(sid)
+    if pin2_id is not None:
+        sid = get_pin_subsystem_id(pin2_id)
+        if sid is not None:
+            ids.add(sid)
+    return ids
+
+
 def get_subsystem_id_by_name(name: str) -> int | None:
     with get_connection() as conn:
         cur = conn.cursor()
