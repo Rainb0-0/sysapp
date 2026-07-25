@@ -11,6 +11,7 @@ import bcrypt
 from psycopg2.extras import Json
 import socket
 from datetime import timedelta
+from datetime import datetime
 
 # -----------------------------------------------------------------------------
 # Database configuration (ENV first; UI dialog can override via set_db_config)
@@ -1743,3 +1744,440 @@ def delete_project_guarded(user_id: int, project_id: int) -> tuple[bool, str]:
         except Exception:
             pass
         return False, f"Failed to delete project: {e}"
+
+
+# =============================================================================
+# Full Project Export / Import (JSON dump / restore)
+# =============================================================================
+
+
+def export_project_data(project_id: int) -> dict:
+    """
+    Export ALL data for a project as a nested dictionary, suitable for
+    JSON serialisation.  Auth tables (users, roles, etc.) are system-wide
+    and are NOT included — the export is purely project-scoped.
+    """
+    _ensure_project_selected()
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            data: dict = {}
+
+            # ── project ──
+            cur.execute(
+                "SELECT id, name, created_at, description FROM projects WHERE id = %s",
+                (project_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"Project {project_id} not found")
+            data["project"] = {
+                "id": row[0],
+                "name": row[1],
+                "created_at": row[2].isoformat() if row[2] else None,
+                "description": row[3],
+            }
+
+            # ── subsystems ──
+            cur.execute(
+                "SELECT id, name, project_id FROM subsystems WHERE project_id = %s ORDER BY id",
+                (project_id,),
+            )
+            data["subsystems"] = [
+                {"id": r[0], "name": r[1], "project_id": r[2]} for r in cur.fetchall()
+            ]
+            subsystem_ids = [s["id"] for s in data["subsystems"]]
+
+            # ── modules ──
+            cur.execute(
+                """SELECT id, name, subsystem_id, project_id, mass, power,
+                           num_connectors, color, photo, pos_x, pos_y,
+                           width, height
+                    FROM modules WHERE project_id = %s ORDER BY id""",
+                (project_id,),
+            )
+            cols = [
+                "id", "name", "subsystem_id", "project_id", "mass", "power",
+                "num_connectors", "color", "photo", "pos_x", "pos_y",
+                "width", "height",
+            ]
+            data["modules"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            module_ids = [m["id"] for m in data["modules"]]
+
+            # ── connectors ──
+            cur.execute(
+                """SELECT id, name, module_id, project_id, number_of_pins,
+                           color, pos_x, pos_y, width, height, side
+                    FROM connectors WHERE project_id = %s ORDER BY id""",
+                (project_id,),
+            )
+            cols = [
+                "id", "name", "module_id", "project_id", "number_of_pins",
+                "color", "pos_x", "pos_y", "width", "height", "side",
+            ]
+            data["connectors"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            connector_ids = [c["id"] for c in data["connectors"]]
+
+            # ── pins ──
+            if connector_ids:
+                placeholders = ",".join("%s" for _ in connector_ids)
+                cur.execute(
+                    """SELECT id, name, connector_id, project_id, pin_number,
+                               pin_type, is_ground, value, current, description
+                        FROM pins
+                        WHERE connector_id IN ({}) AND project_id = %s
+                        ORDER BY id""".format(placeholders),
+                    (*connector_ids, project_id),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, name, connector_id, project_id, pin_number,
+                               pin_type, is_ground, value, current, description
+                        FROM pins WHERE project_id = %s ORDER BY id""",
+                    (project_id,),
+                )
+            cols = [
+                "id", "name", "connector_id", "project_id", "pin_number",
+                "pin_type", "is_ground", "value", "current", "description",
+            ]
+            data["pins"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # ── interfaces ──
+            cur.execute(
+                """SELECT id, pin1_id, pin2_id, project_id, interface_type,
+                           color, pos_x, pos_y, rotation
+                    FROM interfaces WHERE project_id = %s ORDER BY id""",
+                (project_id,),
+            )
+            cols = [
+                "id", "pin1_id", "pin2_id", "project_id", "interface_type",
+                "color", "pos_x", "pos_y", "rotation",
+            ]
+            data["interfaces"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            interface_ids = [i["id"] for i in data["interfaces"]]
+
+            # ── interface_points ──
+            if interface_ids:
+                placeholders = ",".join("%s" for _ in interface_ids)
+                cur.execute(
+                    """SELECT id, interface_id, project_id, point_index, x, y, description
+                        FROM interface_points
+                        WHERE interface_id IN ({}) AND project_id = %s
+                        ORDER BY interface_id, point_index""".format(placeholders),
+                    (*interface_ids, project_id),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, interface_id, project_id, point_index, x, y, description
+                        FROM interface_points WHERE project_id = %s
+                        ORDER BY interface_id, point_index""",
+                    (project_id,),
+                )
+            cols = ["id", "interface_id", "project_id", "point_index", "x", "y", "description"]
+            data["interface_points"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # ── modes ──
+            cur.execute(
+                "SELECT id, name, project_id, data FROM modes WHERE project_id = %s ORDER BY id",
+                (project_id,),
+            )
+            cols = ["id", "name", "project_id", "data"]
+            data["modes"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+            mode_names = [m["name"] for m in data["modes"]]
+
+            # ── mode_modules ──
+            if mode_names:
+                cur.execute(
+                    """SELECT id, mode_name, module_id, project_id
+                        FROM mode_modules
+                        WHERE mode_name = ANY(%s) AND project_id = %s
+                        ORDER BY id""",
+                    (mode_names, project_id),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, mode_name, module_id, project_id
+                        FROM mode_modules WHERE project_id = %s ORDER BY id""",
+                    (project_id,),
+                )
+            cols = ["id", "mode_name", "module_id", "project_id"]
+            data["mode_modules"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # ── mode_positions ──
+            if mode_names:
+                cur.execute(
+                    """SELECT id, mode_name, item_type, item_id, project_id,
+                               pos_x, pos_y, width, height, rotation
+                        FROM mode_positions
+                        WHERE mode_name = ANY(%s) AND project_id = %s
+                        ORDER BY id""",
+                    (mode_names, project_id),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, mode_name, item_type, item_id, project_id,
+                               pos_x, pos_y, width, height, rotation
+                        FROM mode_positions WHERE project_id = %s ORDER BY id""",
+                    (project_id,),
+                )
+            cols = [
+                "id", "mode_name", "item_type", "item_id", "project_id",
+                "pos_x", "pos_y", "width", "height", "rotation",
+            ]
+            data["mode_positions"] = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # ── version & metadata ──
+            data["_export_meta"] = {
+                "version": "1.0",
+                "exported_at": datetime.now().isoformat(),
+                "description": "System Architecture full project export",
+            }
+
+            return data
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to export project data: {e}") from e
+
+
+def import_project_data(project_id: int, data: dict) -> tuple[bool, str]:
+    """
+    Import full project data from a dictionary previously returned by
+    export_project_data().  **Existing project data for this project_id
+    will be replaced.**  Auth-level tables (users, roles, etc.) are
+    never touched.
+
+    Returns (ok: bool, message: str).
+    """
+    _ensure_project_selected()
+    try:
+        with get_connection() as conn:
+            conn.autocommit = False
+            cur = conn.cursor()
+
+            # ── 1. Validate structure ──
+            required = [
+                "subsystems", "modules", "connectors", "pins",
+                "interfaces", "interface_points", "modes",
+                "mode_modules", "mode_positions",
+            ]
+            for key in required:
+                if key not in data:
+                    conn.rollback()
+                    return False, f"Missing required section '{key}' in import data"
+
+            # ── 2. Clear existing project data (reverse FK order) ──
+            # mode_positions
+            cur.execute("DELETE FROM mode_positions WHERE project_id = %s", (project_id,))
+            # mode_modules
+            cur.execute("DELETE FROM mode_modules WHERE project_id = %s", (project_id,))
+            # modes
+            cur.execute("DELETE FROM modes WHERE project_id = %s", (project_id,))
+            # interface_points
+            cur.execute("DELETE FROM interface_points WHERE project_id = %s", (project_id,))
+            # interfaces
+            cur.execute("DELETE FROM interfaces WHERE project_id = %s", (project_id,))
+            # pins
+            cur.execute("DELETE FROM pins WHERE project_id = %s", (project_id,))
+            # connectors
+            cur.execute("DELETE FROM connectors WHERE project_id = %s", (project_id,))
+            # modules
+            cur.execute("DELETE FROM modules WHERE project_id = %s", (project_id,))
+            # subsystems
+            cur.execute("DELETE FROM subsystems WHERE project_id = %s", (project_id,))
+
+            # ── 3. Import subsystems ──
+            for s in data["subsystems"]:
+                cur.execute(
+                    "INSERT INTO subsystems (id, name, project_id) VALUES (%s, %s, %s)"
+                    " ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+                    (s["id"], s["name"], project_id),
+                )
+
+            # ── 4. Import modules ──
+            for m in data["modules"]:
+                cur.execute(
+                    """INSERT INTO modules
+                       (id, name, subsystem_id, project_id, mass, power,
+                        num_connectors, color, photo, pos_x, pos_y, width, height)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (id) DO UPDATE SET
+                         name        = EXCLUDED.name,
+                         subsystem_id = EXCLUDED.subsystem_id,
+                         mass        = EXCLUDED.mass,
+                         power       = EXCLUDED.power,
+                         num_connectors = EXCLUDED.num_connectors,
+                         color       = EXCLUDED.color,
+                         photo       = EXCLUDED.photo,
+                         pos_x       = EXCLUDED.pos_x,
+                         pos_y       = EXCLUDED.pos_y,
+                         width       = EXCLUDED.width,
+                         height      = EXCLUDED.height""",
+                    (
+                        m["id"], m["name"], m["subsystem_id"], project_id,
+                        m.get("mass", 0.0), m.get("power", 0.0),
+                        m.get("num_connectors", 0), m.get("color", "#C8C8FF"),
+                        m.get("photo"), m.get("pos_x", 0), m.get("pos_y", 0),
+                        m.get("width", 120), m.get("height", 80),
+                    ),
+                )
+
+            # ── 5. Import connectors ──
+            for c in data["connectors"]:
+                cur.execute(
+                    """INSERT INTO connectors
+                       (id, name, module_id, project_id, number_of_pins,
+                        color, pos_x, pos_y, width, height, side)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (id) DO UPDATE SET
+                         name          = EXCLUDED.name,
+                         module_id     = EXCLUDED.module_id,
+                         number_of_pins = EXCLUDED.number_of_pins,
+                         color         = EXCLUDED.color,
+                         pos_x         = EXCLUDED.pos_x,
+                         pos_y         = EXCLUDED.pos_y,
+                         width         = EXCLUDED.width,
+                         height        = EXCLUDED.height,
+                         side          = EXCLUDED.side""",
+                    (
+                        c["id"], c["name"], c["module_id"], project_id,
+                        c.get("number_of_pins", 0), c.get("color", "#C8C8FF"),
+                        c.get("pos_x", 0), c.get("pos_y", 0),
+                        c.get("width", 60), c.get("height", 20),
+                        c.get("side", "top"),
+                    ),
+                )
+
+            # ── 6. Import pins ──
+            for p in data["pins"]:
+                cur.execute(
+                    """INSERT INTO pins
+                       (id, name, connector_id, project_id, pin_number,
+                        pin_type, is_ground, value, current, description)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (id) DO UPDATE SET
+                         name         = EXCLUDED.name,
+                         connector_id = EXCLUDED.connector_id,
+                         pin_number   = EXCLUDED.pin_number,
+                         pin_type     = EXCLUDED.pin_type,
+                         is_ground    = EXCLUDED.is_ground,
+                         value        = EXCLUDED.value,
+                         current      = EXCLUDED.current,
+                         description  = EXCLUDED.description""",
+                    (
+                        p["id"], p["name"], p["connector_id"], project_id,
+                        p.get("pin_number"), p.get("pin_type"),
+                        p.get("is_ground", False), p.get("value"),
+                        p.get("current", 0.0), p.get("description"),
+                    ),
+                )
+
+            # ── 7. Import interfaces ──
+            for i in data["interfaces"]:
+                cur.execute(
+                    """INSERT INTO interfaces
+                       (id, pin1_id, pin2_id, project_id, interface_type,
+                        color, pos_x, pos_y, rotation)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (id) DO UPDATE SET
+                         pin1_id        = EXCLUDED.pin1_id,
+                         pin2_id        = EXCLUDED.pin2_id,
+                         interface_type = EXCLUDED.interface_type,
+                         color          = EXCLUDED.color,
+                         pos_x          = EXCLUDED.pos_x,
+                         pos_y          = EXCLUDED.pos_y,
+                         rotation       = EXCLUDED.rotation""",
+                    (
+                        i["id"], i["pin1_id"], i["pin2_id"], project_id,
+                        i.get("interface_type"), i.get("color", "#C8C8FF"),
+                        i.get("pos_x", 0), i.get("pos_y", 0),
+                        i.get("rotation", 0),
+                    ),
+                )
+
+            # ── 8. Import interface_points ──
+            for ip in data["interface_points"]:
+                cur.execute(
+                    """INSERT INTO interface_points
+                       (id, interface_id, project_id, point_index, x, y, description)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (id) DO UPDATE SET
+                         interface_id = EXCLUDED.interface_id,
+                         point_index  = EXCLUDED.point_index,
+                         x            = EXCLUDED.x,
+                         y            = EXCLUDED.y,
+                         description  = EXCLUDED.description""",
+                    (
+                        ip["id"], ip["interface_id"], project_id,
+                        ip["point_index"], ip["x"], ip["y"],
+                        ip.get("description"),
+                    ),
+                )
+
+            # ── 9. Import modes ──
+            for m in data["modes"]:
+                cur.execute(
+                    """INSERT INTO modes (id, name, project_id, data)
+                       VALUES (%s,%s,%s,%s)
+                       ON CONFLICT (id) DO UPDATE SET
+                         name = EXCLUDED.name,
+                         data = EXCLUDED.data""",
+                    (m["id"], m["name"], project_id, m.get("data", "{}")),
+                )
+
+            # ── 10. Import mode_modules ──
+            for mm in data["mode_modules"]:
+                cur.execute(
+                    """INSERT INTO mode_modules (id, mode_name, module_id, project_id)
+                       VALUES (%s,%s,%s,%s)
+                       ON CONFLICT (id) DO UPDATE SET
+                         mode_name  = EXCLUDED.mode_name,
+                         module_id  = EXCLUDED.module_id""",
+                    (mm["id"], mm["mode_name"], mm["module_id"], project_id),
+                )
+
+            # ── 11. Import mode_positions ──
+            for mp in data["mode_positions"]:
+                cur.execute(
+                    """INSERT INTO mode_positions
+                       (id, mode_name, item_type, item_id, project_id,
+                        pos_x, pos_y, width, height, rotation)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (id) DO UPDATE SET
+                         mode_name  = EXCLUDED.mode_name,
+                         item_type  = EXCLUDED.item_type,
+                         item_id    = EXCLUDED.item_id,
+                         pos_x      = EXCLUDED.pos_x,
+                         pos_y      = EXCLUDED.pos_y,
+                         width      = EXCLUDED.width,
+                         height     = EXCLUDED.height,
+                         rotation   = EXCLUDED.rotation""",
+                    (
+                        mp["id"], mp["mode_name"], mp["item_type"],
+                        mp["item_id"], project_id,
+                        mp.get("pos_x", 0), mp.get("pos_y", 0),
+                        mp.get("width", 0), mp.get("height", 0),
+                        mp.get("rotation", 0),
+                    ),
+                )
+
+            # ── 12. Reset sequences to avoid PK conflicts on future inserts ──
+            seq_tables = [
+                "subsystems", "modules", "connectors", "pins",
+                "interfaces", "interface_points", "modes",
+                "mode_modules", "mode_positions",
+            ]
+            for tbl in seq_tables:
+                cur.execute(
+                    f"SELECT setval(pg_get_serial_sequence('{tbl}', 'id'), "
+                    f"COALESCE(MAX(id), 0) + 1, false) FROM {tbl}"
+                )
+
+            conn.commit()
+            return True, "Project data imported successfully"
+
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, f"Failed to import project data: {e}"

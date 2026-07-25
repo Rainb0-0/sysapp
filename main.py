@@ -24,15 +24,20 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QInputDialog,
+    QFileDialog,
 )
 from PyQt5.QtGui import QFont, QIcon
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 
+import json
 import database
 from database import (
     apply_auth_migration,
     seed_auth_basics,
     seed_subsystem_admins_from_db,
+    export_project_data,
+    import_project_data,
+    get_current_project_id,
 )
 
 from project_dialogs import ProjectSelectionDialog, LoginDialog
@@ -595,6 +600,14 @@ class ModuleWiringApp(QMainWindow):
         self.export_excel_action.setEnabled(False)
         export_menu.addAction(self.export_excel_action)
 
+        export_menu.addSeparator()
+
+        self.export_json_action = QAction("📦 Export Project (JSON)", self)
+        self.export_json_action.setStatusTip("Export entire project to a JSON file")
+        self.export_json_action.triggered.connect(self._export_project_json)
+        self.export_json_action.setEnabled(False)
+        export_menu.addAction(self.export_json_action)
+
         # Import submenu
         import_menu = tools_menu.addMenu("📥 &Import")
 
@@ -609,6 +622,14 @@ class ModuleWiringApp(QMainWindow):
         self.import_excel_action.triggered.connect(self._import_excel)
         self.import_excel_action.setEnabled(False)
         import_menu.addAction(self.import_excel_action)
+
+        import_menu.addSeparator()
+
+        self.import_json_action = QAction("📦 Import Project (JSON)", self)
+        self.import_json_action.setStatusTip("Import entire project from a JSON file")
+        self.import_json_action.triggered.connect(self._import_project_json)
+        self.import_json_action.setEnabled(False)
+        import_menu.addAction(self.import_json_action)
 
         tools_menu.addSeparator()
 
@@ -654,8 +675,10 @@ class ModuleWiringApp(QMainWindow):
         self.refresh_action.setEnabled(has_project)
         self.export_csv_action.setEnabled(has_project)
         self.export_excel_action.setEnabled(has_project)
+        self.export_json_action.setEnabled(has_project)
         self.import_csv_action.setEnabled(has_project)
         self.import_excel_action.setEnabled(has_project)
+        self.import_json_action.setEnabled(has_project)
 
     def _apply_menubar_style(self):
         """Applies style to the menu bar."""
@@ -893,6 +916,129 @@ class ModuleWiringApp(QMainWindow):
             "📊 Import Excel",
             "Excel import functionality is not yet implemented.",
         )
+
+    # ── JSON Project Export ────────────────────────────────────────────────
+
+    def _export_project_json(self):
+        """Export the entire current project as a structured JSON file."""
+        if not self.current_project:
+            QMessageBox.warning(self, "⚠️ No Project", "Please open a project first.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "📦 Export Project — Choose destination",
+            f"{self.current_project.replace(' ', '_')}_export.json",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return  # user cancelled
+
+        try:
+            project_id = get_current_project_id()
+            if not project_id:
+                raise RuntimeError("No project is currently selected.")
+
+            data = export_project_data(project_id)
+
+            # Write with nice formatting
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+
+            QMessageBox.information(
+                self,
+                "✅ Export Successful",
+                f"Project **{self.current_project}** exported to:\n{file_path}",
+            )
+            self.statusBar().showMessage(f"📦 Project exported to {file_path}", 5000)
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "❌ Export Error",
+                f"Failed to export project:\n\n{str(e)}",
+            )
+
+    # ── JSON Project Import ────────────────────────────────────────────────
+
+    def _import_project_json(self):
+        """Import project data from a JSON file, replacing current project data."""
+        if not self.current_project:
+            QMessageBox.warning(self, "⚠️ No Project", "Please open a project first.")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "📦 Import Project — Choose JSON file",
+            "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return  # user cancelled
+
+        # Confirm — this is destructive
+        reply = QMessageBox.warning(
+            self,
+            "⚠️ Confirm Import",
+            "This will **replace all current data** for project\n"
+            + f'"{self.current_project}" with the data from:\n'
+            + f"{file_path}\n\n"
+            + "This action cannot be undone. Proceed?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # Top-level validation
+            if not isinstance(data, dict):
+                raise ValueError("Invalid format: expected a JSON object at root.")
+            if "_export_meta" not in data:
+                raise ValueError(
+                    "This file does not appear to be a valid System Architecture "
+                    "project export (missing _export_meta)."
+                )
+
+            project_id = get_current_project_id()
+            if not project_id:
+                raise RuntimeError("No project is currently selected.")
+
+            success, message = import_project_data(project_id, data)
+
+            if success:
+                QMessageBox.information(
+                    self,
+                    "✅ Import Successful",
+                    f"Project **{self.current_project}** restored from:\n{file_path}",
+                )
+                self.statusBar().showMessage(
+                    f"📦 Project imported from {file_path}", 5000
+                )
+                # Refresh all tabs so the user sees the imported data
+                self._refresh_everything()
+            else:
+                QMessageBox.critical(
+                    self,
+                    "❌ Import Failed",
+                    f"Could not import project data:\n\n{message}",
+                )
+
+        except json.JSONDecodeError as e:
+            QMessageBox.critical(
+                self,
+                "❌ Invalid JSON",
+                f"The selected file is not valid JSON:\n\n{str(e)}",
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "❌ Import Error",
+                f"Failed to import project:\n\n{str(e)}",
+            )
 
     def _show_settings(self):
         """Shows settings window."""
