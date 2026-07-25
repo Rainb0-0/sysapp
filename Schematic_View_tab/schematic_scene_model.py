@@ -558,7 +558,8 @@ def create_module(name: str, x: float = 40.0, y: float = 40.0,
 
 
 def create_connector(module_id: int, name: str, side: str = "top",
-                      color: Optional[str] = None) -> Optional[int]:
+                      color: Optional[str] = None,
+                      number_of_pins: int = 0) -> Optional[int]:
     project_id = get_current_project_id()
     if project_id is None or not name.strip():
         return None
@@ -569,9 +570,9 @@ def create_connector(module_id: int, name: str, side: str = "top",
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO connectors (project_id, module_id, name, color, side) "
-            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-            (project_id, module_id, name.strip(), color, side),
+            "INSERT INTO connectors (project_id, module_id, name, color, side, number_of_pins) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+            (project_id, module_id, name.strip(), color, side, number_of_pins),
         )
         new_id = cur.fetchone()[0]
         # Update the module's connector count
@@ -664,7 +665,12 @@ def delete_connector(connector_id: int) -> None:
 # Pins
 # ---------------------------------------------------------------------
 
-def create_pin(connector_id: int, name: str) -> Optional[int]:
+def create_pin(connector_id: int, name: str,
+               pin_type: Optional[str] = None,
+               is_ground: bool = False,
+               value: Optional[float] = None,
+               current: Optional[float] = None,
+               description: Optional[str] = None) -> Optional[int]:
     project_id = get_current_project_id()
     if project_id is None or not name.strip():
         return None
@@ -679,9 +685,11 @@ def create_pin(connector_id: int, name: str) -> Optional[int]:
         next_number = cur.fetchone()[0]
 
         cur.execute(
-            "INSERT INTO pins (project_id, connector_id, name, pin_number) "
-            "VALUES (%s, %s, %s, %s) RETURNING id",
-            (project_id, connector_id, name.strip(), next_number),
+            "INSERT INTO pins (project_id, connector_id, name, pin_number, "
+            "pin_type, is_ground, value, current, description) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (project_id, connector_id, name.strip(), next_number,
+             pin_type, is_ground, value, current, description),
         )
         new_id = cur.fetchone()[0]
         conn.commit()
@@ -721,6 +729,115 @@ def delete_pin(pin_id: int) -> None:
         cur.execute(
             "DELETE FROM pins WHERE id = %s AND project_id = %s",
             (pin_id, project_id),
+        )
+        conn.commit()
+
+
+def update_module(module_id: int, name: Optional[str] = None,
+                   mass: Optional[float] = None,
+                   power: Optional[float] = None,
+                   color: Optional[str] = None,
+                   subsystem_id: Optional[int] = None) -> None:
+    """Update a module's fields. Only non-None values are updated."""
+    project_id = get_current_project_id()
+    if project_id is None:
+        return
+
+    updates = {}
+    if name is not None:
+        updates["name"] = name.strip()
+    if mass is not None:
+        updates["mass"] = mass
+    if power is not None:
+        updates["power"] = power
+    if color is not None:
+        updates["color"] = color if color else None
+    if subsystem_id is not None:
+        updates["subsystem_id"] = subsystem_id
+
+    if not updates:
+        return
+
+    set_clause = ", ".join(f"{k} = %s" for k in updates)
+    values = list(updates.values()) + [module_id, project_id]
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE modules SET {set_clause} WHERE id = %s AND project_id = %s",
+            values,
+        )
+        conn.commit()
+
+
+def update_connector(connector_id: int, name: Optional[str] = None,
+                     color: Optional[str] = None,
+                     side: Optional[str] = None,
+                     number_of_pins: Optional[int] = None) -> None:
+    """Update a connector's fields. Only non-None values are updated."""
+    project_id = get_current_project_id()
+    if project_id is None:
+        return
+
+    VALID_SIDES = {"left", "right", "top", "bottom"}
+    updates = {}
+    if name is not None:
+        updates["name"] = name.strip()
+    if color is not None:
+        updates["color"] = color if color else None
+    if side is not None and side in VALID_SIDES:
+        updates["side"] = side
+    if number_of_pins is not None:
+        updates["number_of_pins"] = number_of_pins
+
+    if not updates:
+        return
+
+    set_clause = ", ".join(f"{k} = %s" for k in updates)
+    values = list(updates.values()) + [connector_id, project_id]
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE connectors SET {set_clause} WHERE id = %s AND project_id = %s",
+            values,
+        )
+        conn.commit()
+
+
+def update_pin(pin_id: int, name: Optional[str] = None,
+               pin_type: Optional[str] = None,
+               is_ground: Optional[bool] = None,
+               value: Optional[float] = None,
+               description: Optional[str] = None) -> None:
+    """Update a pin's fields. Only non-None values are updated."""
+    project_id = get_current_project_id()
+    if project_id is None:
+        return
+
+    updates = {}
+    if name is not None:
+        updates["name"] = name.strip()
+    if pin_type is not None:
+        updates["pin_type"] = pin_type if pin_type else None
+    if is_ground is not None:
+        updates["is_ground"] = is_ground
+    if value is not None:
+        updates["value"] = value
+    if description is not None:
+        updates["description"] = description if description else None
+
+    if not updates:
+        return
+
+    set_clause = ", ".join(f"{k} = %s" for k in updates)
+    values = list(updates.values()) + [pin_id, project_id]
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE pins SET {set_clause} WHERE id = %s AND project_id = %s",
+            values,
         )
         conn.commit()
 

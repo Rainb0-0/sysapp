@@ -275,6 +275,144 @@
     height: 1px; background: rgba(255,255,255,0.08);
     margin: 4px 0;
   }
+  /* ======= Modal Dialog ======= */
+  .modal-overlay {
+    position: fixed; inset: 0; z-index: 20000;
+    background: rgba(0,0,0,0.6);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    animation: modal-fade-in 0.15s ease-out;
+  }
+  @keyframes modal-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .modal-dialog {
+    background: var(--primary-dark);
+    border: 1px solid var(--primary-light);
+    border-radius: 12px;
+    padding: 24px 28px;
+    min-width: 380px;
+    max-width: 460px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+    animation: modal-slide-in 0.2s ease-out;
+  }
+  @keyframes modal-slide-in {
+    from { opacity: 0; transform: translateY(12px) scale(0.97); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  .modal-dialog h3 {
+    color: var(--accent);
+    font-size: 16px; font-weight: 600;
+    margin: 0 0 16px 0;
+    padding-bottom: 10px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .modal-field {
+    margin-bottom: 12px;
+  }
+
+  .modal-field label {
+    display: block;
+    color: var(--text-primary);
+    font-size: 12px; font-weight: 500;
+    margin-bottom: 4px;
+    opacity: 0.8;
+  }
+
+  .modal-field input[type="text"],
+  .modal-field input[type="number"],
+  .modal-field select {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--primary-light);
+    border-radius: 6px;
+    background: rgba(0,0,0,0.3);
+    color: var(--text-primary);
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.15s ease;
+    box-sizing: border-box;
+  }
+  .modal-field input:focus,
+  .modal-field select:focus {
+    border-color: var(--accent);
+  }
+
+  .modal-field input[type="checkbox"] {
+    margin-right: 6px;
+    accent-color: var(--accent);
+  }
+
+  .modal-field .checkbox-row {
+    display: flex; align-items: center; gap: 6px;
+    color: var(--text-primary);
+    font-size: 13px;
+  }
+
+  .modal-field select option {
+    background: var(--primary-dark);
+    color: var(--text-primary);
+  }
+
+  .modal-field .color-presets {
+    display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px;
+  }
+  .modal-field .color-swatch {
+    width: 26px; height: 26px; border-radius: 50%;
+    border: 2px solid transparent;
+    cursor: pointer;
+    transition: transform 0.12s ease, border-color 0.12s ease;
+  }
+  .modal-field .color-swatch:hover {
+    transform: scale(1.15);
+  }
+  .modal-field .color-swatch.selected {
+    border-color: #ffffff;
+    transform: scale(1.15);
+    box-shadow: 0 0 6px rgba(255,255,255,0.3);
+  }
+
+  .modal-actions {
+    display: flex; justify-content: flex-end; gap: 8px;
+    margin-top: 18px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .modal-btn {
+    padding: 7px 18px;
+    border-radius: 6px;
+    font-size: 12px; font-weight: 600;
+    cursor: pointer;
+    transition: background 0.12s ease, transform 0.1s ease;
+    border: none;
+  }
+  .modal-btn:active {
+    transform: scale(0.97);
+  }
+  .modal-btn-cancel {
+    background: rgba(255,255,255,0.08);
+    color: var(--text-primary);
+  }
+  .modal-btn-cancel:hover {
+    background: rgba(255,255,255,0.15);
+  }
+  .modal-btn-primary {
+    background: var(--accent);
+    color: #ffffff;
+  }
+  .modal-btn-primary:hover {
+    background: #4a7de0;
+  }
+  .modal-btn-primary:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
 </style>
 </head>
 <body>

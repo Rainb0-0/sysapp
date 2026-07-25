@@ -43,6 +43,9 @@ from Schematic_View_tab.schematic_scene_model import (
     delete_interface as persist_delete_interface,
     delete_module as persist_delete_module,
     rename_module as persist_rename_module,
+    update_module as persist_update_module,
+    update_connector as persist_update_connector,
+    update_pin as persist_update_pin,
     create_module as persist_create_module,
     create_connector as persist_create_connector,
     rename_connector as persist_rename_connector,
@@ -389,13 +392,14 @@ class SchematicBridge(QObject):
         except Exception as e:
             self.save_finished.emit(False, f"Failed to rename module: {e}")
 
-    @pyqtSlot(str, result=int)
+    @pyqtSlot(str, int, float, float, str, result=int)
     def create_module(self, name: str, subsystem_id: int = -1,
                        mass: float = 0.0, power: float = 0.0, color: str = ""):
         try:
-            sid = subsystem_id if subsystem_id >= 0 else None
-            # For module creation without a subsystem, we check the permission
-            # but skip the subsystem scope gate (since there's no target).
+            # Require a valid subsystem — modules cannot exist outside subsystems
+            if subsystem_id < 0 or subsystem_id is None:
+                self.save_finished.emit(False, "A subsystem must be selected to create a module.")
+                return -1
             if not auth.is_logged_in():
                 self.save_finished.emit(False, "You must sign in first to create modules.")
                 return -1
@@ -404,7 +408,7 @@ class SchematicBridge(QObject):
                 return -1
 
             c = color if color else None
-            new_id = persist_create_module(name, subsystem_id=sid, mass=mass, power=power, color=c)
+            new_id = persist_create_module(name, subsystem_id=subsystem_id, mass=mass, power=power, color=c)
             if new_id is None:
                 self.save_finished.emit(False, "Could not create module")
                 return -1
@@ -415,17 +419,79 @@ class SchematicBridge(QObject):
             self.save_finished.emit(False, f"Failed to create module: {e}")
             return -1
 
+    @pyqtSlot(int, str, float, float, str, int)
+    def update_module(self, module_id: int, name: str = "",
+                       mass: float = -1, power: float = -1,
+                       color: str = "", subsystem_id: int = -1):
+        """Update module fields from JS."""
+        try:
+            sid = get_module_subsystem_id(module_id)
+            if not self._check_perm("module.edit", sid, "edit modules"):
+                return
+
+            n = name if name else None
+            m = mass if mass >= 0 else None
+            p = power if power >= 0 else None
+            c = color if color else None
+            s = subsystem_id if subsystem_id >= 0 else None
+            persist_update_module(module_id, name=n, mass=m, power=p, color=c, subsystem_id=s)
+            self.save_finished.emit(True, "Module updated")
+            self.get_scene_data()
+        except Exception as e:
+            self.save_finished.emit(False, f"Failed to update module: {e}")
+
+    @pyqtSlot(int, str, str, str, int)
+    def update_connector(self, connector_id: int, name: str = "",
+                          color: str = "", side: str = "", number_of_pins: int = -1):
+        """Update connector fields from JS."""
+        try:
+            sid = get_connector_subsystem_id(connector_id)
+            if not self._check_perm("connector.edit", sid, "edit connectors"):
+                return
+
+            n = name if name else None
+            c = color if color else None
+            s = side if side else None
+            npins = number_of_pins if number_of_pins >= 0 else None
+            persist_update_connector(connector_id, name=n, color=c, side=s, number_of_pins=npins)
+            self.save_finished.emit(True, "Connector updated")
+            self.get_scene_data()
+        except Exception as e:
+            self.save_finished.emit(False, f"Failed to update connector: {e}")
+
+    @pyqtSlot(int, str, str, bool, float, str)
+    def update_pin(self, pin_id: int, name: str = "",
+                    pin_type: str = "", is_ground: bool = False,
+                    value: float = 0.0, description: str = ""):
+        """Update pin fields from JS."""
+        try:
+            sid = get_pin_subsystem_id(pin_id)
+            if not self._check_perm("pin.edit", sid, "edit pins"):
+                return
+
+            n = name if name else None
+            pt = pin_type if pin_type else None
+            desc = description if description else None
+            val = value if value != 0.0 else None
+            persist_update_pin(pin_id, name=n, pin_type=pt, is_ground=is_ground, value=val, description=desc)
+            self.save_finished.emit(True, "Pin updated")
+            self.get_scene_data()
+        except Exception as e:
+            self.save_finished.emit(False, f"Failed to update pin: {e}")
+
     # ------------------------------------------------------------------
     # Editing: connectors
     # ------------------------------------------------------------------
-    @pyqtSlot(int, str, str, result=int)
-    def create_connector(self, module_id: int, name: str, side: str):
+    @pyqtSlot(int, str, str, str, int, result=int)
+    def create_connector(self, module_id: int, name: str, side: str,
+                          color: str = "", number_of_pins: int = 0):
         try:
             sid = get_module_subsystem_id(module_id)
             if not self._check_perm("connector.create", sid, "create connectors"):
                 return -1
 
-            new_id = persist_create_connector(module_id, name, side)
+            c = color if color else None
+            new_id = persist_create_connector(module_id, name, side, color=c, number_of_pins=number_of_pins)
             if new_id is None:
                 self.save_finished.emit(False, "Could not create connector")
                 return -1
@@ -478,14 +544,26 @@ class SchematicBridge(QObject):
     # ------------------------------------------------------------------
     # Editing: pins
     # ------------------------------------------------------------------
-    @pyqtSlot(int, str, result=int)
-    def create_pin(self, connector_id: int, name: str):
+    @pyqtSlot(int, str, str, bool, float, float, str, result=int)
+    def create_pin(self, connector_id: int, name: str,
+                    pin_type: str = "", is_ground: bool = False,
+                    value: float = 0.0, current: float = 0.0,
+                    description: str = ""):
         try:
             sid = get_connector_subsystem_id(connector_id)
             if not self._check_perm("pin.create", sid, "create pins"):
                 return -1
 
-            new_id = persist_create_pin(connector_id, name)
+            pt = pin_type if pin_type else None
+            desc = description if description else None
+            val = value if value != 0.0 else None
+            cur = current if current != 0.0 else None
+            new_id = persist_create_pin(connector_id, name,
+                                         pin_type=pt,
+                                         is_ground=is_ground,
+                                         value=val,
+                                         current=cur,
+                                         description=desc)
             if new_id is None:
                 self.save_finished.emit(False, "Could not create pin")
                 return -1

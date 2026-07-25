@@ -55,6 +55,15 @@ const SIDE_AXIS = {
     bottom: { normal: { x: 0, y: 1 }, tangent: { x: 1, y: 0 } },
 };
 
+function hexToRgba(hex, alpha) {
+    if (!hex || hex.length < 7) return 'rgba(39, 174, 96, ' + alpha + ')';
+    var r = parseInt(hex.slice(1, 3), 16);
+    var g = parseInt(hex.slice(3, 5), 16);
+    var b = parseInt(hex.slice(5, 7), 16);
+    if (isNaN(r) || isNaN(g) || isNaN(b)) return 'rgba(39, 174, 96, ' + alpha + ')';
+    return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+}
+
 function normalizeSide(side) {
     return SIDE_AXIS[side] ? side : 'top';
 }
@@ -266,6 +275,16 @@ function setupKeyboardShortcuts() {
         if (event.target === svg.node()) {
             clearSelection();
         }
+    });
+
+    // Right-click on empty canvas shows 'Add Module'
+    svg.on('contextmenu', function (event) {
+        if (event.target !== svg.node() && !event.target.classList.contains('scene-root')) return;
+        event.preventDefault();
+        event.stopPropagation();
+        showContextMenu(event, [
+            { icon: '\u2795', label: 'Add Module', action: function () { showModuleDialog(); } },
+        ]);
     });
 }
 
@@ -931,12 +950,21 @@ function renderModules(scene) {
             showModuleContextMenu(event, d);
         });
 
-    moduleSel.append('rect')
+    var modRect = moduleSel.append('rect')
         .attr('class', 'module-rect')
         .attr('width', d => Math.max(MODULE_MIN_WIDTH, d.width))
         .attr('height', d => Math.max(MODULE_MIN_HEIGHT, d.height))
         .attr('rx', 6).attr('ry', 6)
         .attr('fill', d => d.color || '#e67e22');
+
+    modRect.append('title')
+        .text(d => {
+            var info = d.name || 'Unnamed';
+            if (d.mass != null) info += ' | Mass: ' + d.mass;
+            if (d.power != null) info += ' | Power: ' + d.power;
+            if (d.subsystem_name) info += ' | Subsystem: ' + d.subsystem_name;
+            return info;
+        });
 
     moduleSel.append('text')
         .attr('class', 'module-label')
@@ -988,7 +1016,7 @@ function renderModules(scene) {
         const edge = connectorEdgeAnchor(module, c);
 
         // Use tree-view colors: orange for module fill, green for connector strokes, red for pins
-        const connectorColor = '#27ae60';   // tree view connector color
+        const connectorColor = c.color || '#27ae60';   // tree view connector color, fallback to green
         const pinColor = '#e74c3c';         // tree view pin color
 
         // Connector interactive group — contains visible line, handle, hitbox
@@ -1002,8 +1030,8 @@ function renderModules(scene) {
             .attr('x', bbox.x).attr('y', bbox.y)
             .attr('width', bbox.w).attr('height', bbox.h)
             .attr('rx', 6).attr('ry', 6)
-            .attr('fill', 'rgba(39, 174, 96, 0.08)')
-            .attr('stroke', 'rgba(39, 174, 96, 0.25)')
+            .attr('fill', hexToRgba(connectorColor, '0.08'))
+            .attr('stroke', hexToRgba(connectorColor, '0.25'))
             .attr('stroke-width', 1.5)
             .attr('pointer-events', 'none');
 
@@ -1018,13 +1046,14 @@ function renderModules(scene) {
 
         // Visible drag handle at the stub tip — diamond shape to distinguish from pin circles
         const handleSize = 6;
-        connGroup.append('path')
+        var connHandle = connGroup.append('path')
             .attr('class', 'connector-drag-handle')
             .attr('data-connector-id', c.id)
             .attr('d', `M${c.x},${c.y - handleSize} L${c.x + handleSize},${c.y} L${c.x},${c.y + handleSize} L${c.x - handleSize},${c.y} Z`)
-            .attr('fill', '#f39c12')
-            .attr('stroke', '#e67e22')
+            .attr('fill', connectorColor)
+            .attr('stroke', connectorColor)
             .attr('stroke-width', 1.5);
+        connHandle.append('title').text(c.name + ' | Side: ' + c.side + ' | Pins: ' + (c.pins ? c.pins.length : 0));
 
         // Connector name label near the drag handle
         const isHorizSide = (side === 'top' || side === 'bottom');
@@ -1075,13 +1104,14 @@ function renderModules(scene) {
             const px = mid.x + tangent.x * offset;
             const py = mid.y + tangent.y * offset;
 
-            parent.append('circle')
+            var pinCircle = parent.append('circle')
                 .attr('class', 'pin-circle')
                 .attr('data-pin-id', p.id)
                 .attr('cx', px).attr('cy', py)
                 .attr('fill', pinColor)
-                .attr('r', PIN_RADIUS)
-                .on('mousedown', function (event) {
+                .attr('r', PIN_RADIUS);
+            pinCircle.append('title').text(p.name + ' | Connector: ' + c.name);
+            pinCircle.on('mousedown', function (event) {
                     event.stopPropagation();
                     startConnectDrag(p.id, px, py, parent);
                 })
@@ -1392,6 +1422,7 @@ function showModuleContextMenu(event, moduleDatum) {
     if (moduleDatum.editable === false) return;
     showContextMenu(event, [
         { icon: '\u2795', label: 'Add Connector', action: function () { addConnectorPrompt(moduleDatum); }, shortcut: 'N' },
+        { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showModuleEditDialog(moduleDatum); } },
         { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renameModulePrompt(moduleDatum); } },
         { icon: '\u274C', label: 'Delete', action: function () { deleteModuleConfirm(moduleDatum); }, shortcut: 'Del' },
     ]);
@@ -1404,6 +1435,7 @@ function showConnectorContextMenu(event, connectorDatum) {
     showContextMenu(event, [
         { icon: '\uD83D\uDD04', label: 'Reorder Pins', action: function () { openPinOrderDialog(connectorDatum); } },
         { icon: '\u2795', label: 'Add Pin', action: function () { addPinPrompt(connectorDatum); }, shortcut: 'N' },
+        { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showConnectorEditDialog(connectorDatum); } },
         { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renameConnectorPrompt(connectorDatum); } },
         { icon: '\u274C', label: 'Delete', action: function () { deleteConnectorConfirm(connectorDatum); }, shortcut: 'Del' },
     ]);
@@ -1414,6 +1446,7 @@ function showPinContextMenu(event, pinDatum, connectorDatum) {
     var parentModule = sceneData.modules.find(function (m) { return String(m.id) === String(connectorDatum.module_id); });
     if (!parentModule || parentModule.editable === false) return;
     showContextMenu(event, [
+        { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showPinEditDialog(pinDatum, connectorDatum); } },
         { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renamePinPrompt(pinDatum); } },
         { icon: '\u274C', label: 'Delete', action: function () { deletePinConfirm(pinDatum); }, shortcut: 'Del' },
     ]);
@@ -1510,11 +1543,7 @@ function deleteModuleConfirm(moduleDatum) {
 
 function addConnectorPrompt(moduleDatum) {
     if (!bridge) return;
-    const name = prompt('Connector name:', 'J' + (sceneData.connectors.length + 1));
-    if (!name || !name.trim()) return;
-    const side = prompt('Side (left/right/top/bottom):', 'right');
-    if (!side) return;
-    bridge.create_connector(moduleDatum.id, name.trim(), side.trim().toLowerCase());
+    showConnectorDialog(moduleDatum);
 }
 
 function renameConnectorPrompt(connectorDatum) {
@@ -1532,10 +1561,7 @@ function deleteConnectorConfirm(connectorDatum) {
 
 function addPinPrompt(connectorDatum) {
     if (!bridge) return;
-    const name = prompt('Pin name:', 'PIN' + (connectorDatum.pins.length + 1));
-    if (name && name.trim()) {
-        bridge.create_pin(connectorDatum.id, name.trim());
-    }
+    showPinDialog(connectorDatum);
 }
 
 function renamePinPrompt(pinDatum) {
@@ -2838,3 +2864,737 @@ window.setExportOverlayVisible = setExportOverlayVisible;
 window.triggerSaveLayout = triggerSaveLayout;
 window.getZoomState = getZoomState;
 window.setZoomState = setZoomState;
+
+// ---------------------------------------------------------------------
+// Modal dialogs for Connector & Pin creation with all DB fields
+// ---------------------------------------------------------------------
+
+// Predefined connector colors matching the Architecture view
+const CONNECTOR_COLORS = [
+    { name: 'Default', hex: '#F8913C' },
+    { name: 'Red', hex: '#FF0000' },
+    { name: 'Green', hex: '#00FF00' },
+    { name: 'Blue', hex: '#0000FF' },
+    { name: 'Yellow', hex: '#FFFF00' },
+    { name: 'Purple', hex: '#800080' },
+    { name: 'Gray', hex: '#5D5A5A' },
+];
+function showConnectorDialog(moduleDatum) {
+    if (!bridge) return;
+    removeModal();
+
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+
+    var dialog = document.createElement('div');
+    dialog.className = 'modal-dialog';
+    dialog.innerHTML = '';
+
+    var title = document.createElement('h3');
+    title.textContent = 'Add Connector to ' + moduleDatum.name;
+    dialog.appendChild(title);
+
+    // Name field
+    var nameField = createModalField(dialog, 'Connector Name');
+    var nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.value = 'J' + (sceneData.connectors.length + 1);
+    nameInput.placeholder = 'Enter connector name';
+    nameField.appendChild(nameInput);
+
+    // Side selector
+    var sideField = createModalField(dialog, 'Side');
+    var sideSelect = document.createElement('select');
+    ['right', 'left', 'top', 'bottom'].forEach(function (s) {
+        var opt = document.createElement('option');
+        opt.value = s;
+        opt.textContent = s.charAt(0).toUpperCase() + s.slice(1);
+        if (s === 'right') opt.selected = true;
+        sideSelect.appendChild(opt);
+    });
+    sideField.appendChild(sideSelect);
+
+    // Number of pins
+    var pinsField = createModalField(dialog, 'Number of Pins');
+    var pinsInput = document.createElement('input');
+    pinsInput.type = 'number';
+    pinsInput.value = '1';
+    pinsInput.min = '0';
+    pinsInput.max = '100';
+    pinsField.appendChild(pinsInput);
+
+    // Color picker
+    var colorField = createModalField(dialog, 'Color');
+    var colorInput = document.createElement('input');
+    colorInput.type = 'hidden';
+    colorInput.value = '';
+    colorField.appendChild(colorInput);
+
+    var colorPresets = document.createElement('div');
+    colorPresets.className = 'color-presets';
+
+    var selectedSwatch = null;
+    CONNECTOR_COLORS.forEach(function (c) {
+        var swatch = document.createElement('div');
+        swatch.className = 'color-swatch';
+        swatch.style.backgroundColor = c.hex;
+        if (c.name === 'Default') {
+            swatch.classList.add('selected');
+            selectedSwatch = swatch;
+            colorInput.value = c.hex;
+        }
+        swatch.addEventListener('click', function () {
+            if (selectedSwatch) selectedSwatch.classList.remove('selected');
+            swatch.classList.add('selected');
+            selectedSwatch = swatch;
+            colorInput.value = c.hex;
+        });
+        colorPresets.appendChild(swatch);
+    });
+
+    // Custom color input
+    var customColorRow = document.createElement('div');
+    customColorRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:6px;';
+
+    var customColorLabel = document.createElement('span');
+    customColorLabel.textContent = 'Custom:';
+    customColorLabel.style.cssText = 'color:var(--text-primary);font-size:11px;opacity:0.7;';
+    customColorRow.appendChild(customColorLabel);
+
+    var customColorInput = document.createElement('input');
+    customColorInput.type = 'color';
+    customColorInput.value = '#F8913C';
+    customColorInput.style.cssText = 'width:32px;height:26px;border:none;border-radius:4px;cursor:pointer;background:none;padding:0;';
+    customColorInput.addEventListener('input', function () {
+        if (selectedSwatch) selectedSwatch.classList.remove('selected');
+        selectedSwatch = null;
+        colorInput.value = customColorInput.value;
+    });
+    customColorRow.appendChild(customColorInput);
+
+    colorField.appendChild(colorPresets);
+    colorField.appendChild(customColorRow);
+
+    // Actions
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'modal-btn modal-btn-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', removeModal);
+    actions.appendChild(cancelBtn);
+
+    var createBtn = document.createElement('button');
+    createBtn.className = 'modal-btn modal-btn-primary';
+    createBtn.textContent = 'Create Connector';
+    createBtn.addEventListener('click', function () {
+        var name = nameInput.value.trim();
+        if (!name) { showToast('Connector name is required', 'error'); return; }
+        var side = sideSelect.value;
+        var numPins = parseInt(pinsInput.value, 10) || 0;
+        var color = colorInput.value || '';
+        removeModal();
+        bridge.create_connector(moduleDatum.id, name, side, color, numPins);
+    });
+    actions.appendChild(createBtn);
+
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    // Focus name input
+    setTimeout(function () { nameInput.focus(); }, 100);
+
+    // Close on overlay click (outside dialog)
+    overlay.addEventListener('click', function (e) {
+
+    // Document-level Escape handler (works reliably regardless of focus)
+    _modalEscHandler = function (e) {
+        if (e.key === "Escape") removeModal();
+    };
+    document.addEventListener("keydown", _modalEscHandler);
+        if (e.target === overlay) removeModal();
+    });
+}
+
+function showPinDialog(connectorDatum) {
+    if (!bridge) return;
+    removeModal();
+
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+
+    var dialog = document.createElement('div');
+    dialog.className = 'modal-dialog';
+
+    var title = document.createElement('h3');
+    title.textContent = 'Add Pin to ' + connectorDatum.name;
+    dialog.appendChild(title);
+
+    // Name field
+    var nameField = createModalField(dialog, 'Pin Name');
+    var nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.value = 'PIN' + (connectorDatum.pins.length + 1);
+    nameInput.placeholder = 'Enter pin name';
+    nameField.appendChild(nameInput);
+
+    // Pin Type (Data / Voltage)
+    var typeField = createModalField(dialog, 'Pin Type');
+    var typeSelect = document.createElement('select');
+    ['Data', 'Voltage'].forEach(function (t) {
+        var opt = document.createElement('option');
+        opt.value = t;
+        opt.textContent = t;
+        typeSelect.appendChild(opt);
+    });
+    typeField.appendChild(typeSelect);
+
+    // Is Ground checkbox (only relevant for Voltage type)
+    var gndField = createModalField(dialog, '');
+    var gndRow = document.createElement('div');
+    gndRow.className = 'checkbox-row';
+    var gndCheck = document.createElement('input');
+    gndCheck.type = 'checkbox';
+    gndCheck.id = 'pin-is-ground';
+    var gndLabel = document.createElement('label');
+    gndLabel.htmlFor = 'pin-is-ground';
+    gndLabel.textContent = 'Is Ground (GND)';
+    gndRow.appendChild(gndCheck);
+    gndRow.appendChild(gndLabel);
+    gndField.appendChild(gndRow);
+
+    // Voltage value (only for non-ground Voltage type)
+    var voltField = createModalField(dialog, 'Voltage (V)');
+    var voltInput = document.createElement('input');
+    voltInput.type = 'number';
+    voltInput.value = '0';
+    voltInput.min = '0';
+    voltInput.step = '0.1';
+    voltInput.placeholder = 'e.g. 3.3';
+    voltField.appendChild(voltInput);
+
+    // Description
+    var descField = createModalField(dialog, 'Description (optional)');
+    var descInput = document.createElement('input');
+    descInput.type = 'text';
+    descInput.value = '';
+    descInput.placeholder = 'e.g. Main power input';
+    descField.appendChild(descInput);
+
+    // Show/hide voltage based on type and ground
+    function updateVoltageVisibility() {
+        var isVoltage = typeSelect.value === 'Voltage';
+        var isGnd = gndCheck.checked;
+        voltField.style.display = (isVoltage && !isGnd) ? '' : 'none';
+    }
+    typeSelect.addEventListener('change', function () {
+        if (typeSelect.value === 'Data') gndCheck.checked = false;
+        updateVoltageVisibility();
+    });
+    gndCheck.addEventListener('change', updateVoltageVisibility);
+    updateVoltageVisibility();
+
+    // Actions
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'modal-btn modal-btn-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', removeModal);
+    actions.appendChild(cancelBtn);
+
+    var createBtn = document.createElement('button');
+    createBtn.className = 'modal-btn modal-btn-primary';
+    createBtn.textContent = 'Create Pin';
+    createBtn.addEventListener('click', function () {
+        var name = nameInput.value.trim();
+        if (!name) { showToast('Pin name is required', 'error'); return; }
+        var pinType = typeSelect.value;
+        var isGround = gndCheck.checked;
+        var voltage = isGround ? 0 : (parseFloat(voltInput.value) || 0);
+        var description = descInput.value.trim();
+        removeModal();
+        bridge.create_pin(connectorDatum.id, name, pinType, isGround, voltage, 0.0, description);
+    });
+    actions.appendChild(createBtn);
+
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    // Focus name input
+    setTimeout(function () { nameInput.focus(); }, 100);
+
+    overlay.addEventListener('click', function (e) {
+
+    // Document-level Escape handler (works reliably regardless of focus)
+    _modalEscHandler = function (e) {
+        if (e.key === "Escape") removeModal();
+    };
+    document.addEventListener("keydown", _modalEscHandler);
+        if (e.target === overlay) removeModal();
+    });
+}
+
+function createModalField(parent, labelText) {
+    var field = document.createElement('div');
+    field.className = 'modal-field';
+    if (labelText) {
+        var label = document.createElement('label');
+        label.textContent = labelText;
+        field.appendChild(label);
+    }
+    parent.appendChild(field);
+    return field;
+}
+
+// Track active modal Escape handler for cleanup
+let _modalEscHandler = null;
+
+function removeModal() {
+    var existing = document.querySelector('.modal-overlay');
+    if (existing) existing.remove();
+    // Clean up document-level Escape listener
+    if (_modalEscHandler) {
+        document.removeEventListener('keydown', _modalEscHandler);
+        _modalEscHandler = null;
+    }
+}
+
+// ---------------------------------------------------------------------
+// Module Creation & Edit Dialogs
+// ---------------------------------------------------------------------
+
+const MODULE_COLORS = [
+    { name: 'Default', hex: '#33A444' },
+    { name: 'Red', hex: '#FF0000' },
+    { name: 'Blue', hex: '#0000FF' },
+    { name: 'Yellow', hex: '#FFFF00' },
+    { name: 'Purple', hex: '#800080' },
+    { name: 'Orange', hex: '#FFA500' },
+    { name: 'Gray', hex: '#5D5A5A' },
+];
+
+function showModuleDialog() {
+    if (!bridge) return;
+    removeModal();
+
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    var dialog = document.createElement('div');
+    dialog.className = 'modal-dialog';
+
+    var title = document.createElement('h3');
+    title.textContent = 'Create New Module';
+    dialog.appendChild(title);
+
+    // Name
+    var nameF = createModalField(dialog, 'Module Name');
+    var nameI = document.createElement('input');
+    nameI.type = 'text'; nameI.placeholder = 'Enter module name';
+    nameF.appendChild(nameI);
+
+    // Mass
+    var massF = createModalField(dialog, 'Mass (kg)');
+    var massI = document.createElement('input');
+    massI.type = 'number'; massI.value = '0'; massI.min = '0'; massI.step = '0.1';
+    massF.appendChild(massI);
+
+    // Power
+    var powerF = createModalField(dialog, 'Power (mW)');
+    var powerI = document.createElement('input');
+    powerI.type = 'number'; powerI.value = '0'; powerI.min = '0'; powerI.step = '0.1';
+    powerF.appendChild(powerI);
+
+    // Subsystem (required)
+    var hasSubsystems = sceneData.subsystems && sceneData.subsystems.length > 0;
+    var subSelect = null;
+    if (hasSubsystems) {
+        var subF = createModalField(dialog, 'Subsystem *');
+        subSelect = document.createElement('select');
+        var placeholderOpt = document.createElement('option');
+        placeholderOpt.value = ''; placeholderOpt.textContent = '— Select Subsystem —'; placeholderOpt.disabled = true; placeholderOpt.selected = true;
+        subSelect.appendChild(placeholderOpt);
+        sceneData.subsystems.forEach(function (ss) {
+            var opt = document.createElement('option');
+            opt.value = ss.id; opt.textContent = ss.name;
+            subSelect.appendChild(opt);
+        });
+        subF.appendChild(subSelect);
+    }
+
+    // Color
+    var colorF = createModalField(dialog, 'Color');
+    var colorI = document.createElement('input');
+    colorI.type = 'hidden'; colorI.value = '';
+    colorF.appendChild(colorI);
+    var cPresets = document.createElement('div');
+    cPresets.className = 'color-presets';
+    var selSwatch = null;
+    MODULE_COLORS.forEach(function (c) {
+        var sw = document.createElement('div');
+        sw.className = 'color-swatch';
+        sw.style.backgroundColor = c.hex;
+        if (c.name === 'Default') { sw.classList.add('selected'); selSwatch = sw; colorI.value = c.hex; }
+        sw.addEventListener('click', function () {
+            if (selSwatch) selSwatch.classList.remove('selected');
+            sw.classList.add('selected'); selSwatch = sw; colorI.value = c.hex;
+        });
+        cPresets.appendChild(sw);
+    });
+    var custRow = document.createElement('div');
+    custRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:6px;';
+    var custLab = document.createElement('span');
+    custLab.textContent = 'Custom:'; custLab.style.cssText = 'color:var(--text-primary);font-size:11px;opacity:0.7;';
+    custRow.appendChild(custLab);
+    var custCol = document.createElement('input');
+    custCol.type = 'color'; custCol.value = '#33A444';
+    custCol.style.cssText = 'width:32px;height:26px;border:none;border-radius:4px;cursor:pointer;background:none;padding:0;';
+    custCol.addEventListener('input', function () {
+        if (selSwatch) selSwatch.classList.remove('selected'); selSwatch = null;
+        colorI.value = custCol.value;
+    });
+    custRow.appendChild(custCol);
+    colorF.appendChild(cPresets);
+    colorF.appendChild(custRow);
+
+    // Actions
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'modal-btn modal-btn-cancel'; cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', removeModal);
+    actions.appendChild(cancelBtn);
+    var createBtn = document.createElement('button');
+    createBtn.className = 'modal-btn modal-btn-primary';
+    if (!hasSubsystems) {
+        createBtn.textContent = 'No Subsystems Available';
+        createBtn.disabled = true;
+        createBtn.style.opacity = '0.5';
+        createBtn.style.cursor = 'not-allowed';
+    } else {
+        createBtn.textContent = 'Create Module';
+    }
+    createBtn.addEventListener('click', function () {
+        var name = nameI.value.trim();
+        if (!name) { showToast('Module name is required', 'error'); return; }
+        if (!hasSubsystems) { showToast('You need to create a subsystem first', 'error'); return; }
+        var mass = parseFloat(massI.value) || 0;
+        var power = parseFloat(powerI.value) || 0;
+        var subId = subSelect ? parseInt(subSelect.value) : -1;
+        if (!subSelect || subId < 0) { showToast('A subsystem must be selected', 'error'); return; }
+        var color = colorI.value || '';
+        removeModal();
+        bridge.create_module(name, subId, mass, power, color);
+    });
+    actions.appendChild(createBtn);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    _modalEscHandler = function (e) { if (e.key === 'Escape') removeModal(); };
+    document.addEventListener('keydown', _modalEscHandler);
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) removeModal(); });
+    setTimeout(function () { nameI.focus(); }, 100);
+}
+
+function showModuleEditDialog(moduleDatum) {
+    if (!bridge) return;
+    removeModal();
+
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    var dialog = document.createElement('div');
+    dialog.className = 'modal-dialog';
+
+    var title = document.createElement('h3');
+    title.textContent = 'Edit Module: ' + moduleDatum.name;
+    dialog.appendChild(title);
+
+    var nameF = createModalField(dialog, 'Module Name');
+    var nameI = document.createElement('input');
+    nameI.type = 'text'; nameI.value = moduleDatum.name;
+    nameF.appendChild(nameI);
+
+    var massF = createModalField(dialog, 'Mass (kg)');
+    var massI = document.createElement('input');
+    massI.type = 'number'; massI.value = moduleDatum.mass || 0; massI.min = '0'; massI.step = '0.1';
+    massF.appendChild(massI);
+
+    var powerF = createModalField(dialog, 'Power (mW)');
+    var powerI = document.createElement('input');
+    powerI.type = 'number'; powerI.value = moduleDatum.power || 0; powerI.min = '0'; powerI.step = '0.1';
+    powerF.appendChild(powerI);
+
+    // Subsystem (required)
+    var hasSubsystems = sceneData.subsystems && sceneData.subsystems.length > 0;
+    var subSelect = null;
+    var dimSubWarning = null;
+    if (hasSubsystems) {
+        var subF = createModalField(dialog, 'Subsystem *');
+        subSelect = document.createElement('select');
+        sceneData.subsystems.forEach(function (ss) {
+            var opt = document.createElement('option');
+            opt.value = ss.id; opt.textContent = ss.name;
+            if (String(ss.id) === String(moduleDatum.subsystem_id)) opt.selected = true;
+            subSelect.appendChild(opt);
+        });
+        subF.appendChild(subSelect);
+    } else {
+        dimSubWarning = document.createElement('div');
+        dimSubWarning.style.cssText = 'color:var(--text-primary);font-size:11px;opacity:0.6;padding:8px 0;';
+        dimSubWarning.textContent = 'No subsystems available — subsystem assignment cannot be changed.';
+        dialog.appendChild(dimSubWarning);
+    }
+
+    // Color
+    var colorF = createModalField(dialog, 'Color');
+    var colorI = document.createElement('input');
+    colorI.type = 'hidden'; colorI.value = moduleDatum.color || '';
+    colorF.appendChild(colorI);
+    var cPresets = document.createElement('div');
+    cPresets.className = 'color-presets';
+    var selSwatch = null;
+    var curCol = moduleDatum.color || '#33A444';
+    MODULE_COLORS.forEach(function (c) {
+        var sw = document.createElement('div');
+        sw.className = 'color-swatch';
+        sw.style.backgroundColor = c.hex;
+        if (c.hex === curCol || (!curCol && c.name === 'Default')) {
+            sw.classList.add('selected'); selSwatch = sw; colorI.value = c.hex;
+        }
+        sw.addEventListener('click', function () {
+            if (selSwatch) selSwatch.classList.remove('selected');
+            sw.classList.add('selected'); selSwatch = sw; colorI.value = c.hex;
+        });
+        cPresets.appendChild(sw);
+    });
+    var custRow = document.createElement('div');
+    custRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:6px;';
+    var custLab = document.createElement('span');
+    custLab.textContent = 'Custom:'; custLab.style.cssText = 'color:var(--text-primary);font-size:11px;opacity:0.7;';
+    custRow.appendChild(custLab);
+    var custCol = document.createElement('input');
+    custCol.type = 'color'; custCol.value = curCol;
+    custCol.style.cssText = 'width:32px;height:26px;border:none;border-radius:4px;cursor:pointer;background:none;padding:0;';
+    custCol.addEventListener('input', function () {
+        if (selSwatch) selSwatch.classList.remove('selected'); selSwatch = null;
+        colorI.value = custCol.value;
+    });
+    custRow.appendChild(custCol);
+    colorF.appendChild(cPresets);
+    colorF.appendChild(custRow);
+
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'modal-btn modal-btn-cancel'; cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', removeModal);
+    actions.appendChild(cancelBtn);
+    var saveBtn = document.createElement('button');
+    saveBtn.className = 'modal-btn modal-btn-primary'; saveBtn.textContent = 'Save Changes';
+    saveBtn.addEventListener('click', function () {
+        var name = nameI.value.trim();
+        if (!name) { showToast('Module name is required', 'error'); return; }
+        var mass = parseFloat(massI.value) || 0;
+        var power = parseFloat(powerI.value) || 0;
+        var color = colorI.value || '';
+        var subId = subSelect ? parseInt(subSelect.value) : (moduleDatum.subsystem_id != null ? moduleDatum.subsystem_id : -1);
+        removeModal();
+        bridge.update_module(moduleDatum.id, name, mass, power, color, subId);
+    });
+    actions.appendChild(saveBtn);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    _modalEscHandler = function (e) { if (e.key === 'Escape') removeModal(); };
+    document.addEventListener('keydown', _modalEscHandler);
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) removeModal(); });
+    setTimeout(function () { nameI.focus(); }, 100);
+}
+
+function showConnectorEditDialog(connectorDatum) {
+    if (!bridge) return;
+    removeModal();
+
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    var dialog = document.createElement('div');
+    dialog.className = 'modal-dialog';
+
+    var title = document.createElement('h3');
+    title.textContent = 'Edit Connector: ' + connectorDatum.name;
+    dialog.appendChild(title);
+
+    var nameF = createModalField(dialog, 'Connector Name');
+    var nameI = document.createElement('input');
+    nameI.type = 'text'; nameI.value = connectorDatum.name;
+    nameF.appendChild(nameI);
+
+    var sideF = createModalField(dialog, 'Side');
+    var sideS = document.createElement('select');
+    ['right', 'left', 'top', 'bottom'].forEach(function (s) {
+        var opt = document.createElement('option');
+        opt.value = s; opt.textContent = s.charAt(0).toUpperCase() + s.slice(1);
+        if (s === (connectorDatum.side || 'right')) opt.selected = true;
+        sideS.appendChild(opt);
+    });
+    sideF.appendChild(sideS);
+
+    var pinsF = createModalField(dialog, 'Number of Pins');
+    var pinsI = document.createElement('input');
+    pinsI.type = 'number'; pinsI.value = connectorDatum.pins.length; pinsI.min = '0'; pinsI.max = '100';
+    pinsF.appendChild(pinsI);
+
+    // Color
+    var colorF = createModalField(dialog, 'Color');
+    var colorI = document.createElement('input');
+    colorI.type = 'hidden'; colorI.value = connectorDatum.color || '';
+    colorF.appendChild(colorI);
+    var cPresets = document.createElement('div');
+    cPresets.className = 'color-presets';
+    var selSwatch = null;
+    var curCol = connectorDatum.color || CONNECTOR_COLORS[0].hex;
+    CONNECTOR_COLORS.forEach(function (c) {
+        var sw = document.createElement('div');
+        sw.className = 'color-swatch';
+        sw.style.backgroundColor = c.hex;
+        if (c.hex === curCol) { sw.classList.add('selected'); selSwatch = sw; colorI.value = c.hex; }
+        sw.addEventListener('click', function () {
+            if (selSwatch) selSwatch.classList.remove('selected');
+            sw.classList.add('selected'); selSwatch = sw; colorI.value = c.hex;
+        });
+        cPresets.appendChild(sw);
+    });
+    var custRow = document.createElement('div');
+    custRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:6px;';
+    var custLab = document.createElement('span');
+    custLab.textContent = 'Custom:'; custLab.style.cssText = 'color:var(--text-primary);font-size:11px;opacity:0.7;';
+    custRow.appendChild(custLab);
+    var custCol = document.createElement('input');
+    custCol.type = 'color'; custCol.value = curCol;
+    custCol.style.cssText = 'width:32px;height:26px;border:none;border-radius:4px;cursor:pointer;background:none;padding:0;';
+    custCol.addEventListener('input', function () {
+        if (selSwatch) selSwatch.classList.remove('selected'); selSwatch = null;
+        colorI.value = custCol.value;
+    });
+    custRow.appendChild(custCol);
+    colorF.appendChild(cPresets);
+    colorF.appendChild(custRow);
+
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'modal-btn modal-btn-cancel'; cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', removeModal);
+    actions.appendChild(cancelBtn);
+    var saveBtn = document.createElement('button');
+    saveBtn.className = 'modal-btn modal-btn-primary'; saveBtn.textContent = 'Save Changes';
+    saveBtn.addEventListener('click', function () {
+        var name = nameI.value.trim();
+        if (!name) { showToast('Connector name is required', 'error'); return; }
+        var side = sideS.value;
+        var numPins = parseInt(pinsI.value, 10) || 0;
+        var color = colorI.value || '';
+        removeModal();
+        bridge.update_connector(connectorDatum.id, name, color, side, numPins);
+    });
+    actions.appendChild(saveBtn);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    _modalEscHandler = function (e) { if (e.key === 'Escape') removeModal(); };
+    document.addEventListener('keydown', _modalEscHandler);
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) removeModal(); });
+    setTimeout(function () { nameI.focus(); }, 100);
+}
+
+function showPinEditDialog(pinDatum, connectorDatum) {
+    if (!bridge) return;
+    removeModal();
+
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    var dialog = document.createElement('div');
+    dialog.className = 'modal-dialog';
+
+    var title = document.createElement('h3');
+    title.textContent = 'Edit Pin: ' + pinDatum.name;
+    dialog.appendChild(title);
+
+    var nameF = createModalField(dialog, 'Pin Name');
+    var nameI = document.createElement('input');
+    nameI.type = 'text'; nameI.value = pinDatum.name;
+    nameF.appendChild(nameI);
+
+    var typeF = createModalField(dialog, 'Pin Type');
+    var typeS = document.createElement('select');
+    ['Data', 'Voltage'].forEach(function (t) {
+        var opt = document.createElement('option');
+        opt.value = t; opt.textContent = t;
+        typeS.appendChild(opt);
+    });
+    typeF.appendChild(typeS);
+
+    var gndF = createModalField(dialog, '');
+    var gndR = document.createElement('div');
+    gndR.className = 'checkbox-row';
+    var gndC = document.createElement('input');
+    gndC.type = 'checkbox'; gndC.id = 'edit-pin-gnd';
+    var gndL = document.createElement('label');
+    gndL.htmlFor = 'edit-pin-gnd'; gndL.textContent = 'Is Ground (GND)';
+    gndR.appendChild(gndC); gndR.appendChild(gndL);
+    gndF.appendChild(gndR);
+
+    var voltF = createModalField(dialog, 'Voltage (V)');
+    var voltI = document.createElement('input');
+    voltI.type = 'number'; voltI.value = '0'; voltI.min = '0'; voltI.step = '0.1';
+    voltF.appendChild(voltI);
+
+    var descF = createModalField(dialog, 'Description (optional)');
+    var descI = document.createElement('input');
+    descI.type = 'text'; descI.placeholder = 'e.g. Main power input';
+    descF.appendChild(descI);
+
+    function updateVis() {
+        voltF.style.display = (typeS.value === 'Voltage' && !gndC.checked) ? '' : 'none';
+    }
+    typeS.addEventListener('change', function () {
+        if (typeS.value === 'Data') gndC.checked = false;
+        updateVis();
+    });
+    gndC.addEventListener('change', updateVis);
+
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'modal-btn modal-btn-cancel'; cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', removeModal);
+    actions.appendChild(cancelBtn);
+    var saveBtn = document.createElement('button');
+    saveBtn.className = 'modal-btn modal-btn-primary'; saveBtn.textContent = 'Save Changes';
+    saveBtn.addEventListener('click', function () {
+        var name = nameI.value.trim();
+        if (!name) { showToast('Pin name is required', 'error'); return; }
+        var pinType = typeS.value;
+        var isGround = gndC.checked;
+        var voltage = isGround ? 0 : (parseFloat(voltI.value) || 0);
+        var description = descI.value.trim();
+        removeModal();
+        bridge.update_pin(pinDatum.id, name, pinType, isGround, voltage, description);
+    });
+    actions.appendChild(saveBtn);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    _modalEscHandler = function (e) { if (e.key === 'Escape') removeModal(); };
+    document.addEventListener('keydown', _modalEscHandler);
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) removeModal(); });
+    setTimeout(function () { nameI.focus(); }, 100);
+}
