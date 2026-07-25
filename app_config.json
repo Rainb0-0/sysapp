@@ -52,6 +52,14 @@
     "max_backups": 10,
     "vacuum_on_startup": false
   },
+  "database_connection": {
+    "configured": true,
+    "host": "localhost",
+    "port": 5432,
+    "database": "systemarchitecture",
+    "user": "postgres",
+    "password": ""
+  },
   "performance": {
     "max_undo_steps": 50,
     "cache_size": 100,

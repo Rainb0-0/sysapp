@@ -76,6 +76,14 @@ class ConfigManager(QObject):
                 "max_backups": 10,
                 "vacuum_on_startup": False
             },
+            "database_connection": {
+                "configured": False,
+                "host": "localhost",
+                "port": 5432,
+                "database": "systemarchitecture",
+                "user": "postgres",
+                "password": ""
+            },
             "performance": {
                 "max_undo_steps": 50,
                 "cache_size": 100,  # MB

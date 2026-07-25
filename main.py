@@ -35,10 +35,6 @@ from database import (
     seed_subsystem_admins_from_db,
 )
 
-apply_auth_migration()
-seed_auth_basics()
-seed_subsystem_admins_from_db("Aa123456")
-
 from project_dialogs import ProjectSelectionDialog, LoginDialog
 from project_dialogs import UserProfileDialog, ActiveUsersDialog
 from auth_manager import auth
@@ -66,6 +62,7 @@ class DatabaseConfigDialog(QDialog):
         self.setModal(True)
         self.resize(400, 300)
 
+        self._testing = False  # guard against re-entrant accept
         self.setup_ui()
         self.load_current_config()
 
@@ -108,11 +105,22 @@ class DatabaseConfigDialog(QDialog):
         self.setLayout(layout)
 
     def load_current_config(self):
-        cfg = getattr(database, "DB_CONFIG", {})
-        self.host_edit.setText(str(cfg.get("host", "localhost")))
-        self.port_edit.setText(str(cfg.get("port", 5432)))
-        self.database_edit.setText(str(cfg.get("database", "systemarchitecture")))
-        self.user_edit.setText(str(cfg.get("user", "postgres")))
+        """Load config from saved settings (app_config.json) or DB_CONFIG defaults."""
+        # Try saved config first
+        saved = config_manager.config_data.get("database_connection", {})
+        if saved.get("configured", False):
+            self.host_edit.setText(str(saved.get("host", "localhost")))
+            self.port_edit.setText(str(saved.get("port", 5432)))
+            self.database_edit.setText(str(saved.get("database", "systemarchitecture")))
+            self.user_edit.setText(str(saved.get("user", "postgres")))
+            self.password_edit.setText(str(saved.get("password", "")))
+        else:
+            # Fall back to DB_CONFIG defaults
+            cfg = getattr(database, "DB_CONFIG", {})
+            self.host_edit.setText(str(cfg.get("host", "localhost")))
+            self.port_edit.setText(str(cfg.get("port", 5432)))
+            self.database_edit.setText(str(cfg.get("database", "systemarchitecture")))
+            self.user_edit.setText(str(cfg.get("user", "postgres")))
 
     def test_connection(self):
         """Test database connection"""
@@ -134,6 +142,50 @@ class DatabaseConfigDialog(QDialog):
                 )
         except Exception as e:
             QMessageBox.critical(self, "❌ Error", f"Configuration error:\n{str(e)}")
+
+    def _save_config(self):
+        """Persist current dialog fields to app_config.json via config_manager."""
+        config_manager.set("database_connection.host", self.host_edit.text())
+        config_manager.set(
+            "database_connection.port", int(self.port_edit.text() or 5432)
+        )
+        config_manager.set("database_connection.database", self.database_edit.text())
+        config_manager.set("database_connection.user", self.user_edit.text())
+        config_manager.set("database_connection.password", self.password_edit.text())
+        config_manager.set("database_connection.configured", True)
+
+    def accept(self):
+        """Override accept: test connection first, only accept on success."""
+        if self._testing:
+            return
+        self._testing = True
+
+        try:
+            database.set_db_config(
+                host=self.host_edit.text(),
+                database=self.database_edit.text(),
+                user=self.user_edit.text(),
+                password=self.password_edit.text(),
+                port=int(self.port_edit.text() or 5432),
+            )
+
+            success, message = database.test_connection()
+            if success:
+                self._save_config()
+                super().accept()
+            else:
+                QMessageBox.warning(
+                    self,
+                    "⚠️ Connection Failed",
+                    f"Cannot save configuration — connection failed:\n{message}\n\n"
+                    f"Please fix the settings and try again.",
+                )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "❌ Error", f"Configuration error:\n{str(e)}"
+            )
+        finally:
+            self._testing = False
 
     def get_config(self):
         """Get configuration values"""
@@ -223,56 +275,94 @@ class ModuleWiringApp(QMainWindow):
         # Initialize database connection and show project selection
         self._initialize_database()
 
-    def _initialize_database(self):
-        """Initialize database connection"""
-        # Try to connect with default settings first
+    def _seed_auth(self):
+        """Create auth tables and seed default users (safe to call repeatedly)."""
         try:
-            success, message = database.test_connection()
-            if success:
-                self.db_configured = True
-                self.statusBar().showMessage("✅ Database connected successfully", 3000)
-                apply_auth_migration()
-                seed_auth_basics()
-                seed_subsystem_admins_from_db("Aa123456")
-                self._show_project_selection()
-                return
-
+            apply_auth_migration()
+            seed_auth_basics()
+            seed_subsystem_admins_from_db("Aa123456")
         except Exception as e:
-            pass  # Will show config dialog
+            print(f"Auth seeding deferred (DB not ready yet): {e}")
 
-        apply_auth_migration()
-        seed_auth_basics()
-        seed_subsystem_admins_from_db("Aa123456")
+    def _show_login_dialog(self) -> bool:
+        """Show the login dialog. Returns True if user logged in."""
+        dlg = LoginDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            return True
+        return False
 
-        # Show database configuration dialog
-        self._show_database_config()
+    def _initialize_database(self):
+        """Initialize database connection — try saved config first, else show dialog.
 
-    def _show_database_config(self):
-        """Show database configuration dialog"""
-        config_dialog = DatabaseConfigDialog(self)
-        if config_dialog.exec_() == QDialog.Accepted:
-            config = config_dialog.get_config()
+        Flow:
+          1. Try saved connection from app_config.json → seed + login + project selection
+          2. If no saved config or connection fails → show DB config dialog
+          3. On dialog accept → seed auth → login → project selection
+          4. On dialog cancel → stay on welcome screen (user can configure later via menu)
+        """
+        # 1. Try saved connection from app_config.json
+        db_conn = config_manager.config_data.get("database_connection", {})
+        if db_conn.get("configured", False):
             try:
-                database.set_db_config(**config)
+                database.set_db_config(
+                    host=db_conn.get("host", "localhost"),
+                    database=db_conn.get("database", "systemarchitecture"),
+                    user=db_conn.get("user", "postgres"),
+                    password=db_conn.get("password", ""),
+                    port=db_conn.get("port", 5432),
+                )
                 success, message = database.test_connection()
                 if success:
                     self.db_configured = True
                     self.statusBar().showMessage(
-                        "✅ Database configured successfully", 3000
+                        "✅ Database connected successfully", 3000
                     )
-                    self._show_project_selection()
-                else:
-                    QMessageBox.critical(
-                        self,
-                        "❌ Connection Failed",
-                        f"Failed to connect to database:\n{message}",
-                    )
-                    self.close()
-            except Exception as e:
-                QMessageBox.critical(self, "❌ Configuration Error", f"Error: {str(e)}")
-                self.close()
+                    self._seed_auth()
+                    if self._show_login_dialog():
+                        self._show_project_selection()
+                    else:
+                        self.statusBar().showMessage(
+                            "🔒 Please sign in via Profile > Logout to access projects.",
+                            5000,
+                        )
+                    return
+            except Exception:
+                pass  # Saved config failed, fall through to dialog
+
+        # 2. No saved working config — show DB configuration dialog
+        self._show_database_config()
+
+        # 3. If user configured successfully via dialog, seed auth and proceed
+        if self.db_configured:
+            self._seed_auth()
+            if self._show_login_dialog():
+                self._show_project_selection()
+            else:
+                self.statusBar().showMessage(
+                    "🔒 Please sign in via Profile > Logout to access projects.",
+                    5000,
+                )
+
+    def _show_database_config(self):
+        """Show database configuration dialog (from menu or initial setup).
+
+        The dialog now handles connection testing and saving config itself
+        (see DatabaseConfigDialog.accept). On Cancel the app stays open.
+        """
+        config_dialog = DatabaseConfigDialog(self)
+        if config_dialog.exec_() == QDialog.Accepted:
+            self.db_configured = True
+            self.statusBar().showMessage(
+                "✅ Database configured successfully", 3000
+            )
         else:
-            self.close()  # User cancelled
+            # User cancelled — don't close the app
+            if not self.db_configured:
+                self.statusBar().showMessage(
+                    "⚠️ Database not configured. "
+                    "Use File > Database Configuration to set up.",
+                    5000,
+                )
 
     def _show_welcome_widget(self):
         """Show a welcome widget when no project is loaded."""
@@ -1000,11 +1090,6 @@ if __name__ == "__main__":
 
     theme = config_manager.get_theme()
     style_manager.apply_theme(theme)
-
-    dlg = LoginDialog()
-    if dlg.exec_() != QDialog.Accepted:
-        # user cancelled or failed to login
-        sys.exit(0)
 
     app.setApplicationName("System Architecture")
     app.setApplicationVersion("3.0.0")
