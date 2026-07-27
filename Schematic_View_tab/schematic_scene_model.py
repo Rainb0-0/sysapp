@@ -189,15 +189,19 @@ def load_schematic_scene(
         if connector_id_list:
             conn_ph = ",".join(["%s"] * len(connector_id_list))
             cur.execute(
-                f"SELECT id, connector_id, name FROM pins "
+                f"SELECT id, connector_id, name, value, current, pin_type, is_ground FROM pins "
                 f"WHERE connector_id IN ({conn_ph}) AND project_id = %s ORDER BY pin_number",
                 (*connector_id_list, project_id),
             )
-            for pin_id, conn_id, pin_name in cur.fetchall():
+            for pin_id, conn_id, pin_name, pin_value, pin_current, pin_type, is_ground in cur.fetchall():
                 all_pin_ids_set.add(pin_id)
                 pin_data_by_connector.setdefault(conn_id, []).append({
                     "id": pin_id,
                     "name": pin_name,
+                    "voltage": pin_value,
+                    "current": pin_current,
+                    "pin_type": pin_type or "Data",
+                    "is_ground": bool(is_ground) if is_ground is not None else False,
                 })
 
         # Compute hidden_pins: if pin_ids is specified, pins NOT in it have wiring hidden
@@ -809,6 +813,7 @@ def update_pin(pin_id: int, name: Optional[str] = None,
                pin_type: Optional[str] = None,
                is_ground: Optional[bool] = None,
                value: Optional[float] = None,
+               current: Optional[float] = None,
                description: Optional[str] = None) -> None:
     """Update a pin's fields. Only non-None values are updated."""
     project_id = get_current_project_id()
@@ -824,6 +829,8 @@ def update_pin(pin_id: int, name: Optional[str] = None,
         updates["is_ground"] = is_ground
     if value is not None:
         updates["value"] = value
+    if current is not None:
+        updates["current"] = current
     if description is not None:
         updates["description"] = description if description else None
 

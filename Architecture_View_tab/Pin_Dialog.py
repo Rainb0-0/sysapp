@@ -163,7 +163,6 @@ class PinTableModel(QAbstractTableModel):
     def __init__(self, data=None, parent=None):
         super().__init__(parent)
         self._data = data or []
-        self._module_power = 0.0
 
     def rowCount(self, parent=QModelIndex()):
         return len(self._data)
@@ -180,7 +179,7 @@ class PinTableModel(QAbstractTableModel):
         if not index.isValid():
             return Qt.ItemIsEnabled
         col = index.column()
-        if col in (self.COL_NAME, self.COL_FORMAT, self.COL_VOLTAGE):
+        if col in (self.COL_NAME, self.COL_FORMAT, self.COL_VOLTAGE, self.COL_CURRENT):
             return Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
         return Qt.ItemIsSelectable | Qt.ItemIsEnabled
 
@@ -202,7 +201,7 @@ class PinTableModel(QAbstractTableModel):
             if col == self.COL_VOLTAGE:
                 return item.get("voltage", "")
             if col == self.COL_CURRENT:
-                return self._compute_current(item)
+                return item.get("current", "")
             if col == self.COL_SAVE:
                 return ""
         if role == Qt.EditRole:
@@ -215,7 +214,7 @@ class PinTableModel(QAbstractTableModel):
             if col == self.COL_VOLTAGE:
                 return item.get("voltage", "")
             if col == self.COL_CURRENT:
-                return self._compute_current(item)
+                return item.get("current", "")
             if col == self.COL_SAVE:
                 return ""
         return QVariant()
@@ -235,12 +234,12 @@ class PinTableModel(QAbstractTableModel):
                 return False
         elif col == self.COL_VOLTAGE:
             item["voltage"] = str(value).strip()
+        elif col == self.COL_CURRENT:
+            item["current"] = str(value).strip()
         else:
             return False
 
-        current_index = self.index(row, self.COL_CURRENT)
         self.dataChanged.emit(index, index)
-        self.dataChanged.emit(current_index, current_index)
         return True
 
     def insertRowItem(self, item):
@@ -263,22 +262,6 @@ class PinTableModel(QAbstractTableModel):
         if 0 <= row < len(self._data):
             return self._data[row]
         return None
-
-    def set_module_power(self, power):
-        self._module_power = float(power or 0.0)
-
-    def _compute_current(self, item):
-        fmt = item.get("format", "Data")
-        power_type = item.get("power_type", "VCC")
-        if fmt != "Power" or power_type != "VCC":
-            return "0.00"
-        try:
-            voltage = float(str(item.get("voltage", "")).strip())
-        except (ValueError, TypeError):
-            return "0.00"
-        if voltage == 0:
-            return "0.00"
-        return f"{(self._module_power / voltage):.2f}"
 
 
 class ButtonDelegate(QStyledItemDelegate):
@@ -359,6 +342,27 @@ class VoltageDelegate(QStyledItemDelegate):
         model.setData(index, editor.text().strip(), Qt.EditRole)
 
 
+class CurrentDelegate(QStyledItemDelegate):
+    def createEditor(self, parent, option, index):
+        editor = QLineEdit(parent)
+        validator = QDoubleValidator(parent)
+        validator.setNotation(QDoubleValidator.StandardNotation)
+        validator.setBottom(0.0)
+        editor.setValidator(validator)
+        return editor
+
+    def setEditorData(self, editor, index):
+        if not isinstance(editor, QLineEdit):
+            return
+        value = index.model().data(index, Qt.EditRole)
+        editor.setText(str(value) if value is not None else "")
+
+    def setModelData(self, editor, model, index):
+        if not isinstance(editor, QLineEdit):
+            return
+        model.setData(index, editor.text().strip(), Qt.EditRole)
+
+
 # -------------------------------------------------------------
 # Main Dialog
 # -------------------------------------------------------------
@@ -392,7 +396,6 @@ class PinDialog(QDialog):
         self._initial_pin_id = pin_data.get("id") if pin_data else None
         self._initial_module_id = None
         self._initial_subsystem_id = None
-        self.current_module_power = 0.0
 
         # find module & subsystem from connector
         if connector_id and self._ensure_project_selected():
@@ -600,6 +603,9 @@ class PinDialog(QDialog):
         )
         self.table.setItemDelegateForColumn(
             PinTableModel.COL_VOLTAGE, VoltageDelegate(self)
+        )
+        self.table.setItemDelegateForColumn(
+            PinTableModel.COL_CURRENT, CurrentDelegate(self)
         )
         self._save_delegate = ButtonDelegate("✓", self._is_row_dirty, self.table)
         self._save_delegate.clicked.connect(self._save_row)
@@ -872,14 +878,6 @@ class PinDialog(QDialog):
                 cap = result[0] if result else 0
 
                 cur.execute(
-                    "SELECT m.power FROM modules m JOIN connectors c ON m.id=c.module_id WHERE c.id=%s AND m.project_id=%s",
-                    (conn_id, project_id),
-                )
-                result = cur.fetchone()
-                self.current_module_power = result[0] if result else 0.0
-                self.model.set_module_power(self.current_module_power)
-
-                cur.execute(
                     "SELECT id,name,pin_type,is_ground,value,current FROM pins WHERE connector_id=%s AND project_id=%s ORDER BY pin_number",
                     (conn_id, project_id),
                 )
@@ -888,7 +886,12 @@ class PinDialog(QDialog):
                     power_t = "GND" if is_gnd else "VCC"
                     volt_str = (
                         f"{val:.2f}"
-                        if fmt == "Power" and not is_gnd and val is not None
+                        if val is not None
+                        else ""
+                    )
+                    curr_str = (
+                        f"{curr:.2f}"
+                        if curr is not None
                         else ""
                     )
                     rows.append(
@@ -898,6 +901,7 @@ class PinDialog(QDialog):
                             "format": fmt,
                             "power_type": power_t,
                             "voltage": volt_str,
+                            "current": curr_str,
                         }
                     )
         except Exception as e:
@@ -913,6 +917,7 @@ class PinDialog(QDialog):
                     "format": "Data",
                     "power_type": "VCC",
                     "voltage": "",
+                    "current": "",
                 }
             )
 
@@ -927,7 +932,7 @@ class PinDialog(QDialog):
     # ------------------------------------------------------------------
     # Row creation & change-tracking
     # ------------------------------------------------------------------
-    def _append_row(self, pid, name, fmt, power_t, volt):
+    def _append_row(self, pid, name, fmt, power_t, volt, curr):
         self.model.insertRowItem(
             {
                 "id": pid,
@@ -935,6 +940,7 @@ class PinDialog(QDialog):
                 "format": fmt,
                 "power_type": power_t,
                 "voltage": volt,
+                "current": curr,
             }
         )
 
@@ -959,6 +965,7 @@ class PinDialog(QDialog):
                 PinTableModel.COL_NAME,
                 PinTableModel.COL_FORMAT,
                 PinTableModel.COL_VOLTAGE,
+                PinTableModel.COL_CURRENT,
             )
             for col in changed_columns
         ):
@@ -966,24 +973,7 @@ class PinDialog(QDialog):
             if item is None:
                 return
 
-            if (
-                topLeft.column() == PinTableModel.COL_FORMAT
-                or bottomRight.column() == PinTableModel.COL_FORMAT
-            ):
-                fmt, power_t = item.get("format", "Data"), item.get("power_type", "VCC")
-                if fmt != "Power" or power_t != "VCC":
-                    if item.get("voltage", ""):
-                        item["voltage"] = ""
-                        self.model.dataChanged.emit(
-                            self.model.index(row, PinTableModel.COL_VOLTAGE),
-                            self.model.index(row, PinTableModel.COL_VOLTAGE),
-                        )
-
             self._mark_dirty(row)
-            self.model.dataChanged.emit(
-                self.model.index(row, PinTableModel.COL_CURRENT),
-                self.model.index(row, PinTableModel.COL_CURRENT),
-            )
 
     def _is_row_dirty(self, row):
         return row in self._changed_rows
@@ -1015,6 +1005,7 @@ class PinDialog(QDialog):
         fmt = item.get("format", "Data")
         ptype = item.get("power_type", "VCC")
         volt_str = str(item.get("voltage", "")).strip()
+        curr_str = str(item.get("current", "")).strip()
 
         try:
             voltage = float(volt_str) if volt_str else None
@@ -1022,16 +1013,23 @@ class PinDialog(QDialog):
             QMessageBox.warning(self, "Validation", "Voltage must be a number.")
             return
 
+        try:
+            numeric_current = float(curr_str) if curr_str else None
+        except ValueError:
+            QMessageBox.warning(self, "Validation", "Current must be a number.")
+            return
+
         conn_id = self.connector_combo.currentData()
         is_gnd = fmt == "Power" and ptype == "GND"
-        pin_type = "Voltage" if fmt == "Power" else fmt
+        # If a voltage value is entered, set pin_type to "Voltage" so it
+        # displays correctly in the Schematic View edit dialog.
+        # If grounded, always mark as "Voltage"/GND regardless of entered voltage.
+        if is_gnd or (volt_str and voltage is not None and voltage > 0):
+            pin_type = "Voltage"
+        else:
+            pin_type = fmt
 
         try:
-            numeric_current = None
-            if fmt == "Power" and ptype == "VCC" and voltage:
-                numeric_current = self.model._compute_current(item)
-                numeric_current = float(numeric_current)
-
             with get_connection() as conn:
                 cur = conn.cursor()
                 if item.get("id"):
@@ -1113,6 +1111,14 @@ class PinDialog(QDialog):
     # ------------------------------------------------------------------
     # OK handling
     # ------------------------------------------------------------------
+    def _shift_dirty_rows_after_removal(self, removed_row):
+        updated = set()
+        for row in self._changed_rows:
+            if row == removed_row:
+                continue
+            updated.add(row - 1 if row > removed_row else row)
+        self._changed_rows = updated
+
     def _attempt_save_and_exit(self):
         # --- Access guard: pin delete ---
         subsystem_id = getattr(self, "subsystem_id", None)
@@ -1185,13 +1191,6 @@ class PinDialog(QDialog):
         if rows_to_save:
             QMessageBox.information(self, "Saved", "All valid changes have been saved.")
         return True
-
-        updated = set()
-        for row in self._changed_rows:
-            if row == removed_row:
-                continue
-            updated.add(row - 1 if row > removed_row else row)
-        self._changed_rows = updated
 
     def _on_ok(self):
         if self._attempt_save_and_exit():

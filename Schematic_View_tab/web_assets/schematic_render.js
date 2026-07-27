@@ -918,6 +918,22 @@ function buildPinLookup(scene) {
     return lookup;
 }
 
+// Compute per-module pin power (sum of voltage * current for all pins of the module).
+// Voltage is in V, current is in mA → voltage * current = power in mW.
+function computeModulePinPower(modId, scene) {
+    var total = 0.0;
+    scene.connectors.forEach(function (c) {
+        if (String(c.module_id) === String(modId)) {
+            c.pins.forEach(function (p) {
+                var v = Number(p.voltage) || 0;
+                var i = Number(p.current) || 0;
+                total += v * i;
+            });
+        }
+    });
+    return total;
+}
+
 function renderModules(scene) {
     const moduleSel = g.selectAll('.module-box')
         .data(scene.modules, d => d.id)
@@ -962,6 +978,8 @@ function renderModules(scene) {
             var info = d.name || 'Unnamed';
             if (d.mass != null) info += ' | Mass: ' + d.mass;
             if (d.power != null) info += ' | Power: ' + d.power;
+            var pinPower = computeModulePinPower(d.id, scene);
+            if (pinPower > 0) info += ' | Pin Power: ' + pinPower.toFixed(1) + 'mW';
             if (d.subsystem_name) info += ' | Subsystem: ' + d.subsystem_name;
             return info;
         });
@@ -969,8 +987,24 @@ function renderModules(scene) {
     moduleSel.append('text')
         .attr('class', 'module-label')
         .attr('x', d => Math.max(MODULE_MIN_WIDTH, d.width) / 2)
-        .attr('y', d => Math.max(MODULE_MIN_HEIGHT, d.height) / 2)
+        .attr('y', d => Math.max(MODULE_MIN_HEIGHT, d.height) / 2 - 6)
         .text(d => d.name);
+
+    // Power info label: standalone module power (P) and calculated pin power
+    moduleSel.append('text')
+        .attr('class', 'module-power-label')
+        .attr('x', d => Math.max(MODULE_MIN_WIDTH, d.width) / 2)
+        .attr('y', d => Math.max(MODULE_MIN_HEIGHT, d.height) / 2 + 12)
+        .attr('text-anchor', 'middle')
+        .attr('fill', getComputedStyle(document.documentElement).getPropertyValue('--text-primary') || 'rgba(255,255,255,0.7)')
+        .attr('font-size', 10)
+        .attr('font-weight', '400')
+        .attr('font-family', '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif')
+        .text(d => {
+            var displayP = (d.power != null ? Number(d.power) : 0);
+            var pinP = computeModulePinPower(d.id, scene);
+            return 'P: ' + displayP.toFixed(1) + 'mW  ' + pinP.toFixed(1) + 'mW';
+        });
 
     // Resize handles (shown on hover via CSS)
     const handleSize = 14;
@@ -1423,7 +1457,6 @@ function showModuleContextMenu(event, moduleDatum) {
     showContextMenu(event, [
         { icon: '\u2795', label: 'Add Connector', action: function () { addConnectorPrompt(moduleDatum); }, shortcut: 'N' },
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showModuleEditDialog(moduleDatum); } },
-        { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renameModulePrompt(moduleDatum); } },
         { icon: '\u274C', label: 'Delete', action: function () { deleteModuleConfirm(moduleDatum); }, shortcut: 'Del' },
     ]);
 }
@@ -1436,7 +1469,6 @@ function showConnectorContextMenu(event, connectorDatum) {
         { icon: '\uD83D\uDD04', label: 'Reorder Pins', action: function () { openPinOrderDialog(connectorDatum); } },
         { icon: '\u2795', label: 'Add Pin', action: function () { addPinPrompt(connectorDatum); }, shortcut: 'N' },
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showConnectorEditDialog(connectorDatum); } },
-        { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renameConnectorPrompt(connectorDatum); } },
         { icon: '\u274C', label: 'Delete', action: function () { deleteConnectorConfirm(connectorDatum); }, shortcut: 'Del' },
     ]);
 }
@@ -1447,7 +1479,6 @@ function showPinContextMenu(event, pinDatum, connectorDatum) {
     if (!parentModule || parentModule.editable === false) return;
     showContextMenu(event, [
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showPinEditDialog(pinDatum, connectorDatum); } },
-        { icon: '\u270F\uFE0F', label: 'Rename', action: function () { renamePinPrompt(pinDatum); } },
         { icon: '\u274C', label: 'Delete', action: function () { deletePinConfirm(pinDatum); }, shortcut: 'Del' },
     ]);
 }
@@ -2270,7 +2301,12 @@ function resizeBehavior(direction) {
             // Update label position
             modGroup.select('.module-label')
                 .attr('x', w / 2)
-                .attr('y', h / 2);
+                .attr('y', h / 2 - 6);
+
+            // Update power label position
+            modGroup.select('.module-power-label')
+                .attr('x', w / 2)
+                .attr('y', h / 2 + 12);
 
             // Reposition all resize handles
             modGroup.select('.resize-nw').attr('x', -hh).attr('y', -hh);
@@ -3075,6 +3111,16 @@ function showPinDialog(connectorDatum) {
     voltInput.placeholder = 'e.g. 3.3';
     voltField.appendChild(voltInput);
 
+    // Current (mA)
+    var currField = createModalField(dialog, 'Current (mA)');
+    var currInput = document.createElement('input');
+    currInput.type = 'number';
+    currInput.value = '0';
+    currInput.min = '0';
+    currInput.step = '0.1';
+    currInput.placeholder = 'e.g. 500';
+    currField.appendChild(currInput);
+
     // Description
     var descField = createModalField(dialog, 'Description (optional)');
     var descInput = document.createElement('input');
@@ -3115,9 +3161,10 @@ function showPinDialog(connectorDatum) {
         var pinType = typeSelect.value;
         var isGround = gndCheck.checked;
         var voltage = isGround ? 0 : (parseFloat(voltInput.value) || 0);
+        var current = parseFloat(currInput.value) || 0;
         var description = descInput.value.trim();
         removeModal();
-        bridge.create_pin(connectorDatum.id, name, pinType, isGround, voltage, 0.0, description);
+        bridge.create_pin(connectorDatum.id, name, pinType, isGround, voltage, current, description);
     });
     actions.appendChild(createBtn);
 
@@ -3534,9 +3581,11 @@ function showPinEditDialog(pinDatum, connectorDatum) {
 
     var typeF = createModalField(dialog, 'Pin Type');
     var typeS = document.createElement('select');
+    var initialType = (pinDatum.pin_type || 'Data');
     ['Data', 'Voltage'].forEach(function (t) {
         var opt = document.createElement('option');
         opt.value = t; opt.textContent = t;
+        if (t === initialType) opt.selected = true;
         typeS.appendChild(opt);
     });
     typeF.appendChild(typeS);
@@ -3546,6 +3595,7 @@ function showPinEditDialog(pinDatum, connectorDatum) {
     gndR.className = 'checkbox-row';
     var gndC = document.createElement('input');
     gndC.type = 'checkbox'; gndC.id = 'edit-pin-gnd';
+    if (pinDatum.is_ground) gndC.checked = true;
     var gndL = document.createElement('label');
     gndL.htmlFor = 'edit-pin-gnd'; gndL.textContent = 'Is Ground (GND)';
     gndR.appendChild(gndC); gndR.appendChild(gndL);
@@ -3553,12 +3603,17 @@ function showPinEditDialog(pinDatum, connectorDatum) {
 
     var voltF = createModalField(dialog, 'Voltage (V)');
     var voltI = document.createElement('input');
-    voltI.type = 'number'; voltI.value = '0'; voltI.min = '0'; voltI.step = '0.1';
+    voltI.type = 'number'; voltI.value = (pinDatum.voltage != null ? pinDatum.voltage : '0'); voltI.min = '0'; voltI.step = '0.1';
     voltF.appendChild(voltI);
+
+    var currF = createModalField(dialog, 'Current (mA)');
+    var currI = document.createElement('input');
+    currI.type = 'number'; currI.value = (pinDatum.current != null ? pinDatum.current : '0'); currI.min = '0'; currI.step = '0.1';
+    currF.appendChild(currI);
 
     var descF = createModalField(dialog, 'Description (optional)');
     var descI = document.createElement('input');
-    descI.type = 'text'; descI.placeholder = 'e.g. Main power input';
+    descI.type = 'text'; descI.value = (pinDatum.description || ''); descI.placeholder = 'e.g. Main power input';
     descF.appendChild(descI);
 
     function updateVis() {
@@ -3569,6 +3624,7 @@ function showPinEditDialog(pinDatum, connectorDatum) {
         updateVis();
     });
     gndC.addEventListener('change', updateVis);
+    updateVis();
 
     var actions = document.createElement('div');
     actions.className = 'modal-actions';
@@ -3584,9 +3640,10 @@ function showPinEditDialog(pinDatum, connectorDatum) {
         var pinType = typeS.value;
         var isGround = gndC.checked;
         var voltage = isGround ? 0 : (parseFloat(voltI.value) || 0);
+        var current = parseFloat(currI.value) || 0;
         var description = descI.value.trim();
         removeModal();
-        bridge.update_pin(pinDatum.id, name, pinType, isGround, voltage, description);
+        bridge.update_pin(pinDatum.id, name, pinType, isGround, voltage, current, description);
     });
     actions.appendChild(saveBtn);
     dialog.appendChild(actions);

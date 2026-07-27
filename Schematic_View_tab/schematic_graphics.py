@@ -226,7 +226,12 @@ class SchematicGraphicsScene(QGraphicsScene):
             return 0.0, 0
             
     def update_all_statistics(self):
-        """Update all statistics: mass, power, and current"""
+        """Update all statistics: mass, display power, and current.
+        
+        Module power (from DB) is a standalone display value.
+        The actual power is calculated as: sum of all pin powers (voltage * current)
+        across all pins of displayed modules.
+        """
         from database import get_connection, get_current_project_id
         
         current_project_id = get_current_project_id()
@@ -240,9 +245,12 @@ class SchematicGraphicsScene(QGraphicsScene):
             return 0.0, 0.0, 0.0
         
         try:
-            # Calculate mass and power
+            # Calculate total mass (sum of module masses)
             total_mass = 0.0
-            total_power = 0.0
+            # Calculate display power (sum of module display powers)
+            total_display_power = 0.0
+            # Calculate actual power (sum of all pin voltages * currents)
+            total_calculated_power = 0.0
             
             if hasattr(self, 'module_graphics_items'):
                 with get_connection() as conn:
@@ -257,9 +265,21 @@ class SchematicGraphicsScene(QGraphicsScene):
                         if result:
                             mass, power = result
                             total_mass += mass or 0.0
-                            total_power += power or 0.0
+                            total_display_power += power or 0.0
+                        
+                        # Calculate actual power from pin voltages * currents
+                        cursor.execute(
+                            "SELECT value, current FROM pins "
+                            "WHERE connector_id IN (SELECT id FROM connectors WHERE module_id = %s) "
+                            "AND project_id = %s",
+                            (module_id, current_project_id)
+                        )
+                        for pin_val, pin_curr in cursor.fetchall():
+                            v = pin_val or 0.0
+                            c = pin_curr or 0.0
+                            total_calculated_power += v * c
             
-            # Calculate current
+            # Calculate current (from VCC pins)
             total_current, active_pins = self.calculate_total_current()
             
             # Update all labels
@@ -267,12 +287,12 @@ class SchematicGraphicsScene(QGraphicsScene):
                 self.total_mass_label.setText(f"Mass: {total_mass:.2f} kg")
             
             if self.total_power_label:
-                self.total_power_label.setText(f"Power: {total_power:.2f} W")
+                self.total_power_label.setText(f"Power: {total_calculated_power:.2f} W (display: {total_display_power:.2f})")
             
             if self.total_current_label:
                 self.total_current_label.setText(f"Current: {total_current:.2f} A")
             
-            return total_mass, total_power, total_current
+            return total_mass, total_calculated_power, total_current
             
         except Exception:
             return 0.0, 0.0, 0.0

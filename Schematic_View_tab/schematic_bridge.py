@@ -459,10 +459,11 @@ class SchematicBridge(QObject):
         except Exception as e:
             self.save_finished.emit(False, f"Failed to update connector: {e}")
 
-    @pyqtSlot(int, str, str, bool, float, str)
+    @pyqtSlot(int, str, str, bool, float, float, str)
     def update_pin(self, pin_id: int, name: str = "",
                     pin_type: str = "", is_ground: bool = False,
-                    value: float = 0.0, description: str = ""):
+                    value: float = 0.0, current: float = 0.0,
+                    description: str = ""):
         """Update pin fields from JS."""
         try:
             sid = get_pin_subsystem_id(pin_id)
@@ -473,7 +474,8 @@ class SchematicBridge(QObject):
             pt = pin_type if pin_type else None
             desc = description if description else None
             val = value if value != 0.0 else None
-            persist_update_pin(pin_id, name=n, pin_type=pt, is_ground=is_ground, value=val, description=desc)
+            cur = current if current != 0.0 else None
+            persist_update_pin(pin_id, name=n, pin_type=pt, is_ground=is_ground, value=val, current=cur, description=desc)
             self.save_finished.emit(True, "Pin updated")
             self.get_scene_data()
         except Exception as e:
