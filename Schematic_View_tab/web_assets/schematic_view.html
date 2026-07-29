@@ -126,12 +126,27 @@
   .interface-path {
     fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0.85;
     cursor: pointer; pointer-events: stroke;
-    transition: stroke-width 0.15s ease, opacity 0.15s ease;
+    transition: stroke-width 0.15s ease, opacity 0.15s ease, filter 0.3s ease;
   }
   .interface-path:hover { stroke-width: 3; opacity: 1; }
   .interface-path.selected {
     stroke-width: 3.5; opacity: 1;
     filter: drop-shadow(0 0 4px rgba(91, 141, 239, 0.4));
+  }
+  /* Power-related wires glow gold with a pulsing animation */
+  .interface-path.interface-powered {
+    stroke: #f1c40f;
+    stroke-width: 2.5;
+    filter: drop-shadow(0 0 5px rgba(241, 196, 15, 0.5));
+    animation: power-wire-pulse 2s ease-in-out infinite;
+  }
+  .interface-path.interface-powered:hover {
+    stroke-width: 3.5;
+    filter: drop-shadow(0 0 10px rgba(241, 196, 15, 0.85));
+  }
+  @keyframes power-wire-pulse {
+    0%, 100% { filter: drop-shadow(0 0 3px rgba(241, 196, 15, 0.4)); }
+    50%      { filter: drop-shadow(0 0 8px rgba(241, 196, 15, 0.75)); }
   }
   /* Show drag handles when hovering the interface path */
   .interface-path:hover ~ .interface-drag-handle,
@@ -191,6 +206,24 @@
     pointer-events: none; user-select: none;
     border: 1px solid rgba(255, 255, 255, 0.08);
     font-variant-numeric: tabular-nums;
+  }
+
+  /* ======= Power HUD (total connected pin power) ======= */
+  #power-hud {
+    position: absolute; top: 10px; right: 130px;
+    color: var(--text-primary);
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    padding: 4px 12px; border-radius: 8px; font-size: 11px;
+    pointer-events: none; user-select: none;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  #power-hud .hud-label {
+    opacity: 0.6;
+    margin-right: 4px;
   }
 
   /* ======= Loading Overlay ======= */
@@ -419,6 +452,7 @@
   <div id="scene-container">
     <svg id="schematic-svg"></svg>
     <div id="zoom-info">Zoom: 100%</div>
+    <div id="power-hud">⚡ 0.0 mW</div>
     <div id="hint-select" class="hidden">Click &amp; drag on empty canvas to rectangle-select</div>
     <div id="loading-overlay"><div class="spinner"></div></div>
   </div>

@@ -29,6 +29,10 @@ let _selectionDragCompleted = false;  // guard to prevent click handler from cle
 let connectDrag = null; // { fromPinId, tempPath }
 let toastCount = 0;
 
+// Cached power lookup tables — rebuilt once per render() call to avoid
+// O(connectors × modules × interfaces) work repeated for every module.
+let _powerLookupCache = null;
+
 const MODULE_MIN_WIDTH = 120;
 const MODULE_MIN_HEIGHT = 60;
 const PIN_RADIUS = 7;      // larger hitbox for easier pin-to-pin dragging
@@ -456,6 +460,9 @@ function selectAll() {
 function render(scene) {
     g.selectAll('*').remove();
 
+    // Clear cached power lookup so it gets rebuilt fresh for this scene
+    _powerLookupCache = null;
+
     // Normalize module dimensions once to prevent NaN from null/undefined DB values.
     // Use Number() coercion to catch truthy-but-non-numeric values (e.g. strings).
     scene.modules.forEach(function (m) {
@@ -521,6 +528,9 @@ function render(scene) {
 
     // Hide loading overlay once we have rendered content
     hideLoading();
+
+    // Update the power HUD with the current scene's total connected power
+    updatePowerHud(scene);
 
     if (!render.hasFitOnce) {
         setTimeout(() => { fitView(); render.hasFitOnce = true; }, 300);
@@ -924,20 +934,168 @@ function buildPinLookup(scene) {
     return lookup;
 }
 
-// Compute per-module pin power (sum of voltage * current for all pins of the module).
+// Build a Set of interface IDs where either connected pin belongs to the
+// "Power" subsystem. These wires should be visually highlighted (glow/gold).
+// Uses the cached _powerLookupCache.
+function _getPoweredInterfaceIds(scene) {
+    var lookup = _buildPowerLookup(scene);
+    if (lookup === null) return new Set();
+
+    var pinToSubsystem = lookup.pinToSubsystem;
+    var powerSubsystemId = lookup.powerSubsystemId;
+    var powered = new Set();
+
+    for (var ii = 0; ii < scene.interfaces.length; ii++) {
+        var iface = scene.interfaces[ii];
+        if (pinToSubsystem[iface.from_pin] === powerSubsystemId ||
+            pinToSubsystem[iface.to_pin] === powerSubsystemId) {
+            powered.add(iface.id);
+        }
+    }
+    return powered;
+}
+
+// Build reusable lookup tables for power calculations.
+// Caches result in _powerLookupCache so subsequent calls within the same
+// render cycle reuse it (avoids O(connectors × modules × interfaces) per module).
+// Caller MUST clear _powerLookupCache = null before a new render cycle.
+// Returns { pinToSubsystem, pinInterfaces, powerSubsystemId } or null if no Power subsystem.
+function _buildPowerLookup(scene) {
+    if (_powerLookupCache) return _powerLookupCache;
+
+    // 1. Find "Power" subsystem by name (case-insensitive)
+    var powerSubsystemId = null;
+    for (var si = 0; si < scene.subsystems.length; si++) {
+        if (scene.subsystems[si].name.toLowerCase() === 'power') {
+            powerSubsystemId = scene.subsystems[si].id;
+            break;
+        }
+    }
+    if (powerSubsystemId === null) {
+        _powerLookupCache = null;
+        return null;
+    }
+
+    // 2. Build module_id -> subsystem_id lookup ONCE (avoids inner loop over modules per connector)
+    var modSubsystemMap = {};
+    for (var mi = 0; mi < scene.modules.length; mi++) {
+        var mod = scene.modules[mi];
+        modSubsystemMap[mod.id] = mod.subsystem_id || 0;
+    }
+
+    // 3. Build pin_id -> subsystem_id (connector -> module -> subsystem)
+    var pinToSubsystem = {};
+    for (var ci = 0; ci < scene.connectors.length; ci++) {
+        var c = scene.connectors[ci];
+        var ssId = modSubsystemMap[c.module_id];
+        if (ssId === undefined) ssId = 0;
+        for (var pi = 0; pi < c.pins.length; pi++) {
+            pinToSubsystem[c.pins[pi].id] = ssId;
+        }
+    }
+
+    // 4. Build interface adjacency: pin_id -> [connected_pin_ids]
+    var pinInterfaces = {};
+    for (var ii = 0; ii < scene.interfaces.length; ii++) {
+        var iface = scene.interfaces[ii];
+        var fromP = iface.from_pin;
+        var toP = iface.to_pin;
+        if (!pinInterfaces[fromP]) pinInterfaces[fromP] = [];
+        pinInterfaces[fromP].push(toP);
+        if (!pinInterfaces[toP]) pinInterfaces[toP] = [];
+        pinInterfaces[toP].push(fromP);
+    }
+
+    _powerLookupCache = { pinToSubsystem: pinToSubsystem, pinInterfaces: pinInterfaces, powerSubsystemId: powerSubsystemId };
+    return _powerLookupCache;
+}
+
+// Compute per-module pin power — only counts pins connected via an interface
+// to a voltage pin belonging to the "Power" subsystem. Disconnected pins or
+// pins connected to non-Power subsystems contribute nothing.
 // Voltage is in V, current is in mA → voltage * current = power in mW.
 function computeModulePinPower(modId, scene) {
+    var lookup = _buildPowerLookup(scene);
+    if (lookup === null) return 0;
+
+    var pinToSubsystem = lookup.pinToSubsystem;
+    var pinInterfaces = lookup.pinInterfaces;
+    var powerSubsystemId = lookup.powerSubsystemId;
+
     var total = 0.0;
-    scene.connectors.forEach(function (c) {
-        if (String(c.module_id) === String(modId)) {
-            c.pins.forEach(function (p) {
-                var v = Number(p.voltage) || 0;
-                var i = Number(p.current) || 0;
+    for (var ci = 0; ci < scene.connectors.length; ci++) {
+        var c = scene.connectors[ci];
+        if (String(c.module_id) !== String(modId)) continue;
+        for (var pi = 0; pi < c.pins.length; pi++) {
+            var p = c.pins[pi];
+            var v = Number(p.voltage) || 0;
+            var i = Number(p.current) || 0;
+            if (v === 0 || i === 0) continue;
+
+            // Pin must be connected to something via an interface
+            var connectedPins = pinInterfaces[p.id];
+            if (!connectedPins) continue;
+
+            // At least one connected pin must belong to the Power subsystem
+            var hasPowerConnection = false;
+            for (var cp = 0; cp < connectedPins.length; cp++) {
+                if (pinToSubsystem[connectedPins[cp]] === powerSubsystemId) {
+                    hasPowerConnection = true;
+                    break;
+                }
+            }
+
+            if (hasPowerConnection) {
                 total += v * i;
-            });
+            }
         }
-    });
+    }
     return total;
+}
+
+// Compute the total connected pin power across ALL modules currently in the scene.
+function computeTotalScenePower(scene) {
+    var lookup = _buildPowerLookup(scene);
+    if (lookup === null) return 0;
+
+    var pinToSubsystem = lookup.pinToSubsystem;
+    var pinInterfaces = lookup.pinInterfaces;
+    var powerSubsystemId = lookup.powerSubsystemId;
+
+    var total = 0.0;
+    for (var ci = 0; ci < scene.connectors.length; ci++) {
+        var c = scene.connectors[ci];
+        for (var pi = 0; pi < c.pins.length; pi++) {
+            var p = c.pins[pi];
+            var v = Number(p.voltage) || 0;
+            var i = Number(p.current) || 0;
+            if (v === 0 || i === 0) continue;
+
+            var connectedPins = pinInterfaces[p.id];
+            if (!connectedPins) continue;
+
+            var hasPowerConnection = false;
+            for (var cp = 0; cp < connectedPins.length; cp++) {
+                if (pinToSubsystem[connectedPins[cp]] === powerSubsystemId) {
+                    hasPowerConnection = true;
+                    break;
+                }
+            }
+
+            if (hasPowerConnection) {
+                total += v * i;
+            }
+        }
+    }
+    return total;
+}
+
+// Update the power HUD in the top-right corner.
+function updatePowerHud(scene) {
+    var el = document.getElementById('power-hud');
+    if (!el) return;
+    var total = computeTotalScenePower(scene);
+    el.textContent = '⚡ ' + total.toFixed(1) + ' mW';
 }
 
 function renderModules(scene) {
@@ -996,7 +1154,7 @@ function renderModules(scene) {
         .attr('y', d => Math.max(MODULE_MIN_HEIGHT, d.height) / 2 - 6)
         .text(d => d.name);
 
-    // Power info label: standalone module power (P) and calculated pin power
+    // Power info label: standalone module power (P) and connected pin power
     moduleSel.append('text')
         .attr('class', 'module-power-label')
         .attr('x', d => Math.max(MODULE_MIN_WIDTH, d.width) / 2)
@@ -1009,7 +1167,7 @@ function renderModules(scene) {
         .text(d => {
             var displayP = (d.power != null ? Number(d.power) : 0);
             var pinP = computeModulePinPower(d.id, scene);
-            return 'P: ' + displayP.toFixed(1) + 'mW  ' + pinP.toFixed(1) + 'mW';
+            return 'P: ' + displayP.toFixed(1) + 'mW  ⚡' + pinP.toFixed(1) + 'mW';
         });
 
     // Resize handles (shown on hover via CSS)
@@ -1662,6 +1820,9 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
     // Build a set of hidden pin IDs for quick lookup
     const hiddenPins = new Set(scene.hidden_pins || []);
 
+    // Determine which interfaces are power-related (connected to Power subsystem)
+    var poweredInterfaceIds = _getPoweredInterfaceIds(scene);
+
     scene.interfaces.forEach(function (iface) {
         // Skip interfaces connected to hidden pins (unchecked in sidebar tree)
         if (hiddenPins.has(iface.from_pin) || hiddenPins.has(iface.to_pin)) return;
@@ -1704,8 +1865,9 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
         // The stored points (iface.points) are NOT modified — bend points are
         // display-only and never persisted.
         var displayPoints = isManual ? enforceOrthogonalRoute(points) : points;
+        var isPowerIface = poweredInterfaceIds.has(iface.id);
         var path = interfaceGroup.append('path')
-            .attr('class', 'interface-path')
+            .attr('class', isPowerIface ? 'interface-path interface-powered' : 'interface-path')
             .attr('data-interface-id', iface.id)
             .attr('d', line(displayPoints))
             .on('click', function (event) {
