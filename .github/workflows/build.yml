@@ -156,16 +156,23 @@ jobs:
     needs: [build-linux, build-windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # Explicit write permission on contents so GITHUB_TOKEN can
+    # create a Release and upload assets.
+    permissions:
+      contents: write
 
     steps:
       - name: 📥 Download all build artifacts
         uses: actions/download-artifact@v4
 
-      - name: 📦 Create GitHub Release & upload binaries
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            SystemArchitecture-Linux/SystemArchitecture
+      # Uses the official GitHub CLI (gh) which is pre-installed on
+      # every runner — no third-party action, no Node version worries.
+      - name: 📦 Create Release & upload binaries
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            SystemArchitecture-Linux/SystemArchitecture \
             SystemArchitecture-Windows/SystemArchitecture.exe
-          generate_release_notes: true
-          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
