@@ -24,6 +24,24 @@ def is_windows() -> bool:
     return platform.system().lower().startswith("win")
 
 
+# ── Console encoding fix for Windows ───────────────────────────
+# Windows consoles (cmd, PowerShell) default to cp1252, which
+# cannot encode emoji like ✅, ❌, 📁, etc.  Force UTF-8 on stdout
+# so the build script prints cleanly everywhere.
+#
+# Only called when the script runs as __main__; imports are safe.
+def _fix_console_encoding():
+    """Set stdout/stderr encoding to UTF-8 on Windows (Python 3.7+)."""
+    if not is_windows():
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except OSError:
+                pass  # e.g. pipe closed
+
+
 def add_data_arg(src: Path, dst: str) -> str:
     """
     Build a --add-data argument for PyInstaller with platform-specific separator.
@@ -243,6 +261,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main():
+    _fix_console_encoding()
+
     args = parse_args()
 
     if not check_python_version():
