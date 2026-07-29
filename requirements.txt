@@ -1,0 +1,15 @@
+# System Architecture - Python Dependencies
+# ===========================================
+# Core GUI framework
+PyQt5>=5.15.0
+PyQtWebEngine>=5.15.0
+
+# Database connectivity (PostgreSQL)
+# psycopg2-binary is used instead of psycopg2 for CI/ease of bundling
+psycopg2-binary>=2.9.0
+
+# Authentication
+bcrypt>=4.0.0
+
+# Build tool (CI only — remove for runtime)
+# pyinstaller>=6.0.0
