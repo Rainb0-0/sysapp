@@ -173,6 +173,12 @@ function setupScene() {
             }
             // Rubber-band selection in progress — no panning
             if (isSelecting) return false;
+            // Never start pan on right-click (button 2) — it interferes with
+            // context menu events on Windows (QWebEngine) where D3 zoom would
+            // otherwise swallow subsequent clicks on the custom context menu.
+            if (event.type === 'mousedown' && event.button === 2) {
+                return false;
+            }
             // Don't start pan on elements that have their own drag behavior
             var target = event.target;
             if (target) {
@@ -1436,14 +1442,23 @@ function showContextMenu(event, items) {
 
     document.body.appendChild(menu);
 
-    // Dismiss on any click outside
-    setTimeout(function () {
+    // Dismiss on click outside. Use queueMicrotask instead of
+    // setTimeout(0) to avoid Windows timer resolution issues (~15ms).
+    // queueMicrotask fires at the end of the current microtask queue,
+    // after any synchronous stray click events from the right-click
+    // sequence have already fired, but before any user follow-up clicks.
+    // Right-clicks (button !== 0) are ignored since some Windows
+    // configurations generate stray click events after a right-click.
+    // Menu items call stopPropagation() so their clicks never reach
+    // this dismiss handler — only outside-clicks dismiss the menu.
+    queueMicrotask(function () {
         document.addEventListener('click', function dismiss(e) {
+            if (e.button !== 0) return;
             if (!document.getElementById('schematic-context-menu')) return;
             removeContextMenu();
             document.removeEventListener('click', dismiss);
         }, { once: true });
-    }, 0);
+    });
 }
 
 function removeContextMenu() {
