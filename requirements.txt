@@ -1,5 +1,14 @@
 # System Architecture - Python Dependencies
 # ===========================================
+# Installed by GitHub Actions CI/CD (build.yml) before the PyInstaller build.
+# Keep this list in sync with every third-party import in the codebase:
+#   PyQt5 / PyQtWebEngine  -> GUI + WebEngine tabs
+#   psycopg2-binary        -> PostgreSQL connectivity
+#   bcrypt                 -> password hashing (auth)
+#   Pillow                 -> Component Tree image handling
+#   openpyxl               -> Architecture tab Excel export
+#   matplotlib             -> standalone Component_Tree_tab/node.py script
+
 # Core GUI framework
 PyQt5>=5.15.0
 PyQtWebEngine>=5.15.0
@@ -10,6 +19,16 @@ psycopg2-binary>=2.9.0
 
 # Authentication
 bcrypt>=4.0.0
+
+# Component Tree tab: image thumbnails / icons (PIL.Image, PIL.ImageQt)
+Pillow>=9.0.0
+
+# Architecture tab: Excel export (openpyxl.Workbook)
+openpyxl>=3.0.0
+
+# Component_Tree_tab/node.py (standalone tree-layout script; not imported
+# by the app itself — excluded from the packaged build in build_app.py)
+matplotlib>=3.5.0
 
 # Build tool (CI only — remove for runtime)
 # pyinstaller>=6.0.0
