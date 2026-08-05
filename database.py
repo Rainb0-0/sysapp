@@ -113,7 +113,9 @@ def test_connection():
     except Exception as e:
         if _is_missing_database_error(e):
             # Fresh server — create the database, then retry once.
-            ok, create_err = _create_database(DB_CONFIG['database'])
+            ok, create_err = _create_database(
+                DB_CONFIG.get('database', 'systemarchitecture')
+            )
             if ok:
                 try:
                     with get_connection() as conn:
@@ -229,7 +231,9 @@ def ensure_database_initialized():
             cur.execute("SELECT 1")
     except Exception as e:
         if _is_missing_database_error(e):
-            ok, create_err = _create_database(DB_CONFIG['database'])
+            ok, create_err = _create_database(
+                DB_CONFIG.get('database', 'systemarchitecture')
+            )
             if not ok:
                 return False, f"Could not create database: {create_err}"
         else:
