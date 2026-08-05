@@ -54,88 +54,7 @@ from styles.theme_manager import theme_manager
 from Schematic_View_tab.schematic_bridge import SchematicBridge
 from Schematic_View_tab.schematic_tree_selector import SchematicTreeSelector
 from Schematic_View_tab.mode.mode_web_panel import ModeWebPanel
-from access_control import guard_write, guard_export
-
-# ---------------------------------------------------------------------------
-# Grid layout constants for auto-positioning new modules (mirrors
-# schematic_scene_model.py to avoid circular imports).
-# ---------------------------------------------------------------------------
-_GRID_MARGIN = 40.0
-_GRID_CELL_W = 380.0
-_GRID_CELL_H = 280.0
-_GRID_COLUMNS = 4
-_DEFAULT_MODULE_W = 160.0
-_DEFAULT_MODULE_H = 100.0
-
-
-def _place_module_without_overlap(module_id: int, module_name: str):
-    """
-    Find a grid-aligned position that does NOT overlap any existing module
-    in the current project, then update the module's pos_x/pos_y in the DB.
-    Uses the same grid layout as _grid_fallback_position() in
-    schematic_scene_model.py.
-    """
-    from database import get_connection, get_current_project_id
-
-    project_id = get_current_project_id()
-    if project_id is None:
-        return
-
-    # Load bounding boxes of all existing modules
-    existing = []  # list of (x, y, w, h)
-    try:
-        with get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT pos_x, pos_y, width, height FROM modules "
-                "WHERE project_id = %s AND id != %s AND pos_x IS NOT NULL",
-                (project_id, module_id),
-            )
-            for row in cur.fetchall():
-                rx, ry, rw, rh = row
-                if rx is not None and ry is not None:
-                    existing.append((float(rx), float(ry), float(rw or _DEFAULT_MODULE_W), float(rh or _DEFAULT_MODULE_H)))
-    except Exception:
-        existing = []
-
-    def _rects_overlap(ax, ay, aw, ah, bx, by, bw, bh):
-        """Return True if two axis-aligned rectangles overlap (with 10px margin)."""
-        M = 10
-        return not (ax + aw + M <= bx or bx + bw + M <= ax or ay + ah + M <= by or by + bh + M <= ay)
-
-    # Try grid positions in order
-    best_x, best_y = _GRID_MARGIN, _GRID_MARGIN
-    found = False
-    for row in range(50):  # limit to 50 rows
-        for col in range(_GRID_COLUMNS):
-            cx = _GRID_MARGIN + col * _GRID_CELL_W
-            cy = _GRID_MARGIN + row * _GRID_CELL_H
-
-            # Check against all existing modules
-            overlap = False
-            for ex, ey, ew, eh in existing:
-                if _rects_overlap(cx, cy, _DEFAULT_MODULE_W, _DEFAULT_MODULE_H, ex, ey, ew, eh):
-                    overlap = True
-                    break
-
-            if not overlap:
-                best_x, best_y = cx, cy
-                found = True
-                break
-        if found:
-            break
-
-    try:
-        with get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "UPDATE modules SET pos_x = %s, pos_y = %s WHERE id = %s AND project_id = %s",
-                (best_x, best_y, module_id, project_id),
-            )
-            conn.commit()
-    except Exception:
-        pass
-
+from access_control import guard_export
 
 class SchematicViewTab(QWidget):
     """New web-based schematic view tab (Python data + JS/SVG rendering)."""
@@ -261,12 +180,6 @@ class SchematicViewTab(QWidget):
         layout.addWidget(title)
         layout.addSpacing(30)
 
-        self.add_module_btn = create_styled_button("+ Module", "normal")
-        self.add_module_btn.setToolTip("Create a new module")
-        self.add_module_btn.clicked.connect(self.add_module)
-        layout.addWidget(self.add_module_btn)
-        layout.addSpacing(30)
-
         self.fit_view_btn = create_styled_button("Fit View", "normal")
         self.fit_view_btn.setToolTip("Fit the schematic view to show all content")
         self.fit_view_btn.clicked.connect(self.fit_view)
@@ -305,7 +218,6 @@ class SchematicViewTab(QWidget):
 
         # Disabled until the page finishes loading
         for btn in (
-            self.add_module_btn,
             self.fit_view_btn,
             self.refresh_btn,
             self.save_layout_btn,
@@ -381,7 +293,6 @@ class SchematicViewTab(QWidget):
     def _on_page_loaded(self, ok: bool):
         self.page_ready = bool(ok)
         for btn in (
-            self.add_module_btn,
             self.fit_view_btn,
             self.refresh_btn,
             self.save_layout_btn,
@@ -457,173 +368,6 @@ class SchematicViewTab(QWidget):
         # selection and then apply_selection() emitting a second time.
         if hasattr(self, "tree_selector") and hasattr(self.tree_selector, "refresh_tree"):
             saved_selection = self.tree_selector.get_checked_ids()
-            self.tree_selector.refresh_tree(emit_selection=False)
-            self.tree_selector.apply_selection(saved_selection)
-
-    def add_module(self):
-        from PyQt5.QtWidgets import (
-            QComboBox, QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-            QDialogButtonBox, QLineEdit, QDoubleSpinBox,
-        )
-        from PyQt5.QtGui import QColor, QPixmap, QPainter
-        from database import get_connection, get_current_project_id
-        from auth_manager import auth
-
-        # Color palette matching the Architecture View tab
-        COLOR_MAP = {
-            "Default": "#33A444",
-            "Red": "#FF0000",
-            "Blue": "#0000FF",
-            "Yellow": "#FFFF00",
-            "Purple": "#800080",
-            "Orange": "#FFA500",
-            "Gray": "#5D5A5A",
-        }
-
-        project_id = get_current_project_id()
-        if project_id is None:
-            return
-
-        # Load subsystems, filtered by user access
-        subsystems = []
-        try:
-            with get_connection() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT id, name FROM subsystems WHERE project_id = %s ORDER BY name",
-                    (project_id,),
-                )
-                all_ss = cur.fetchall()
-
-            if auth.is_system() or not auth.is_logged_in():
-                subsystems = all_ss
-            else:
-                allowed = auth.allowed_subsystems_current or auth.allowed_subsystems
-                if not allowed:
-                    subsystems = all_ss
-                else:
-                    subsystems = [(sid, name) for sid, name in all_ss if sid in allowed]
-        except Exception:
-            pass
-
-        # ---- Single dialog for name, mass, power, subsystem, colour ----
-        dialog = QDialog(self)
-        dialog.setWindowTitle("New Module")
-        layout = QVBoxLayout(dialog)
-
-        # Module name
-        name_edit = QLineEdit()
-        name_edit.setPlaceholderText("Enter module name…")
-        layout.addWidget(QLabel("Module Name:"))
-        layout.addWidget(name_edit)
-
-        # Mass (kg)
-        mass_spin = QDoubleSpinBox()
-        mass_spin.setRange(0.0, 1e9)
-        mass_spin.setDecimals(3)
-        mass_spin.setValue(0.0)
-        mass_spin.setSingleStep(0.1)
-        mass_row = QHBoxLayout()
-        mass_row.addWidget(QLabel("Mass (kg):"))
-        mass_row.addWidget(mass_spin)
-        mass_row.addStretch()
-        layout.addLayout(mass_row)
-
-        # Power (mW)
-        power_spin = QDoubleSpinBox()
-        power_spin.setRange(0.0, 1e9)
-        power_spin.setDecimals(2)
-        power_spin.setValue(0.0)
-        power_spin.setSingleStep(1.0)
-        power_row = QHBoxLayout()
-        power_row.addWidget(QLabel("Power (mW):"))
-        power_row.addWidget(power_spin)
-        power_row.addStretch()
-        layout.addLayout(power_row)
-
-        # Subsystem dropdown (only if subsystems exist)
-        sub_combo = None
-        if subsystems:
-            sub_row = QHBoxLayout()
-            sub_row.addWidget(QLabel("Subsystem:"))
-            sub_combo = QComboBox()
-            sub_combo.addItem("(None)", None)
-            for ss_id, ss_name in subsystems:
-                sub_combo.addItem(ss_name, ss_id)
-            sub_row.addWidget(sub_combo)
-            sub_row.addStretch()
-            layout.addLayout(sub_row)
-
-        # Color row
-        color_row = QHBoxLayout()
-        color_row.addWidget(QLabel("Color:"))
-        color_combo = QComboBox()
-        color_swatch = QLabel()
-        color_swatch.setFixedSize(20, 20)
-
-        for color_name, color_hex in COLOR_MAP.items():
-            color_combo.addItem(color_name, color_hex)
-
-        def _update_swatch():
-            c = QColor(color_combo.currentData())
-            pm = QPixmap(20, 20)
-            pm.fill(Qt.transparent)
-            p = QPainter(pm)
-            p.setBrush(c)
-            p.drawRoundedRect(0, 0, 19, 19, 4, 4)
-            p.end()
-            color_swatch.setPixmap(pm)
-
-        color_combo.currentIndexChanged.connect(_update_swatch)
-        _update_swatch()
-
-        color_row.addWidget(color_combo)
-        color_row.addWidget(color_swatch)
-        color_row.addStretch()
-        layout.addLayout(color_row)
-
-        # Buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        if dialog.exec_() != QDialog.Accepted:
-            return
-
-        name = name_edit.text().strip()
-        if not name:
-            return
-
-        mass = mass_spin.value()
-        power = power_spin.value()
-        selected_subsystem_id = sub_combo.currentData() if sub_combo else None
-        selected_color = color_combo.currentData()
-
-        # Permission check before creating the module
-        if not guard_write("module.create", selected_subsystem_id, parent=self):
-            return
-
-        # Create module via bridge with all parameters
-        new_id = self.bridge.create_module(
-            name,
-            subsystem_id=selected_subsystem_id if selected_subsystem_id is not None else -1,
-            mass=mass,
-            power=power,
-            color=selected_color,
-        )
-
-        # Position the new module to avoid overlapping existing modules
-        if new_id and new_id > 0:
-            _place_module_without_overlap(new_id, name)
-
-        # Force refresh the scene and the tree selector immediately.
-        self.bridge.get_scene_data()
-
-        if hasattr(self, "tree_selector") and hasattr(self.tree_selector, "refresh_tree"):
-            saved_selection = self.tree_selector.get_checked_ids()
-            if new_id and new_id > 0 and new_id not in saved_selection["modules"]:
-                saved_selection["modules"].append(new_id)
             self.tree_selector.refresh_tree(emit_selection=False)
             self.tree_selector.apply_selection(saved_selection)
 
