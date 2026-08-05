@@ -2,6 +2,7 @@ import psycopg2
 from psycopg2 import pool
 import json
 import os
+import re
 import sys
 import threading
 from contextlib import contextmanager
@@ -86,15 +87,158 @@ def set_db_config(host, database, user, password, port=5432):
             connection_pool = None
 
 
+def _is_missing_database_error(e):
+    """Return True if the exception indicates the target database does not exist.
+
+    Uses the SQLSTATE code when available (psycopg2: '3D000' =
+    invalid_catalog_name), falling back to the message text.
+    """
+    if getattr(e, 'pgcode', None) == '3D000':
+        return True
+    msg = str(e).lower()
+    return 'database' in msg and 'does not exist' in msg
+
+
 def test_connection():
-    """Return (ok:boolean, message:str) for a simple connectivity test."""
+    """Return (ok:boolean, message:str) for a simple connectivity test.
+
+    On the very first launch the target database may not exist yet on the
+    PostgreSQL server; in that case it is created automatically first.
+    """
     try:
         with get_connection() as conn:
             cur = conn.cursor()
             cur.execute("SELECT 1")
-            return True, "Connection successful"
+        return True, "Connection successful"
     except Exception as e:
+        if _is_missing_database_error(e):
+            # Fresh server — create the database, then retry once.
+            ok, create_err = _create_database(DB_CONFIG['database'])
+            if ok:
+                try:
+                    with get_connection() as conn:
+                        cur = conn.cursor()
+                        cur.execute("SELECT 1")
+                    return True, "Connection successful (database was created)"
+                except Exception as e2:
+                    return False, f"Connection failed: {str(e2)}"
+            return False, (
+                "Connection failed: the database does not exist and could not "
+                f"be created automatically. Reason: {create_err}"
+            )
         return False, f"Connection failed: {str(e)}"
+
+
+def server_database_exists(db_name=None):
+    """
+    Check whether the target database exists on the PostgreSQL server.
+    Uses the maintenance 'postgres' database to inspect.
+    """
+    db_name = db_name or DB_CONFIG.get('database', 'systemarchitecture')
+    try:
+        conn = psycopg2.connect(
+            host=DB_CONFIG['host'],
+            port=DB_CONFIG['port'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'],
+            database='postgres',
+            connect_timeout=5,
+        )
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db_name,))
+            return cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Error checking database existence: {e}")
+        return False
+
+
+def _create_database(db_name):
+    """Create the database, returning (ok:bool, error_msg:str).
+
+    Tries the server default template first, then falls back to
+    ``TEMPLATE template0``. On PostgreSQL >= 16 the default template
+    (template1) can fail with a 'collation version mismatch' when the
+    operating system's libc collation was upgraded after the cluster was
+    initialized; template0 carries no collation version, so it is exempt
+    from that check and always works.
+    """
+    # Guard against SQL injection / malformed identifiers.
+    if not re.match(r'^[A-Za-z0-9_]+$', db_name):
+        return False, f"invalid database name: {db_name!r}"
+    try:
+        conn = psycopg2.connect(
+            host=DB_CONFIG['host'],
+            port=DB_CONFIG['port'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'],
+            database='postgres',
+            connect_timeout=5,
+        )
+        conn.autocommit = True
+        try:
+            cur = conn.cursor()
+            last_error = None
+            for statement in (
+                f'CREATE DATABASE "{db_name}"',
+                f'CREATE DATABASE "{db_name}" TEMPLATE template0',
+            ):
+                try:
+                    cur.execute(statement)
+                    print(f"Database '{db_name}' created successfully")
+                    return True, ""
+                except Exception as e:
+                    last_error = str(e)
+                    # A connection drop after a successful CREATE would
+                    # surface as an error too — re-check before giving up.
+                    if server_database_exists(db_name):
+                        return True, ""
+            print(f"Error creating database: {last_error}")
+            return False, last_error
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Error creating database: {e}")
+        return False, str(e)
+
+
+def create_server_database(db_name=None):
+    """
+    Create the target database if it does not exist yet.
+    Returns True if the database exists (or was created), False on failure.
+    """
+    db_name = db_name or DB_CONFIG.get('database', 'systemarchitecture')
+    if server_database_exists(db_name):
+        return True
+    ok, _ = _create_database(db_name)
+    return ok
+
+
+def ensure_database_initialized():
+    """
+    Make sure the app database exists and the schema is fully initialized.
+    Creates the database if missing (first launch), then runs init_db() to
+    create/upgrade all tables. Safe to call on every launch.
+    Returns (ok:bool, message:str).
+    """
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+    except Exception as e:
+        if _is_missing_database_error(e):
+            ok, create_err = _create_database(DB_CONFIG['database'])
+            if not ok:
+                return False, f"Could not create database: {create_err}"
+        else:
+            return False, f"Connection failed: {str(e)}"
+    try:
+        init_db()
+        return True, "Database initialized"
+    except Exception as e:
+        return False, f"Error initializing schema: {str(e)}"
 
 
 def get_app_data_dir():

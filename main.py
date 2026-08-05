@@ -38,6 +38,7 @@ from database import (
     export_project_data,
     import_project_data,
     get_current_project_id,
+    ensure_database_initialized,
 )
 
 from project_dialogs import ProjectSelectionDialog, LoginDialog
@@ -300,9 +301,9 @@ class ModuleWiringApp(QMainWindow):
         """Initialize database connection — try saved config first, else show dialog.
 
         Flow:
-          1. Try saved connection from app_config.json → seed + login + project selection
+          1. Try saved connection from app_config.json → ensure schema → seed + login + project selection
           2. If no saved config or connection fails → show DB config dialog
-          3. On dialog accept → seed auth → login → project selection
+          3. On dialog accept → run DB init (creates DB/schema if missing) → seed auth → login → project selection
           4. On dialog cancel → stay on welcome screen (user can configure later via menu)
         """
         # 1. Try saved connection from app_config.json
@@ -316,7 +317,7 @@ class ModuleWiringApp(QMainWindow):
                     password=db_conn.get("password", ""),
                     port=db_conn.get("port", 5432),
                 )
-                success, message = database.test_connection()
+                success, message = ensure_database_initialized()
                 if success:
                     self.db_configured = True
                     self.statusBar().showMessage(
@@ -331,13 +332,17 @@ class ModuleWiringApp(QMainWindow):
                             5000,
                         )
                     return
+                self.statusBar().showMessage(
+                    f"⚠️ DB init failed: {message}", 5000
+                )
             except Exception:
                 pass  # Saved config failed, fall through to dialog
 
         # 2. No saved working config — show DB configuration dialog
         self._show_database_config()
 
-        # 3. If user configured successfully via dialog, seed auth and proceed
+        # 3. If user configured successfully via dialog, seed auth and proceed.
+        #    (DB creation + schema init already ran inside _show_database_config.)
         if self.db_configured:
             self._seed_auth()
             if self._show_login_dialog():
@@ -357,9 +362,16 @@ class ModuleWiringApp(QMainWindow):
         config_dialog = DatabaseConfigDialog(self)
         if config_dialog.exec_() == QDialog.Accepted:
             self.db_configured = True
-            self.statusBar().showMessage(
-                "✅ Database configured successfully", 3000
-            )
+            # First launch: the DB may not exist yet — create DB + schema now.
+            success, message = ensure_database_initialized()
+            if success:
+                self.statusBar().showMessage(
+                    "✅ Database configured successfully", 3000
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"⚠️ DB init failed: {message}", 5000
+                )
         else:
             # User cancelled — don't close the app
             if not self.db_configured:
