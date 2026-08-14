@@ -8,8 +8,11 @@ from PyQt5.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     QVariant,
+    QEvent,
+    QRect,
 )
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QDialog,
     QVBoxLayout,
     QHBoxLayout,
@@ -19,7 +22,6 @@ from PyQt5.QtWidgets import (
     QApplication,
     QSpinBox,
     QDoubleSpinBox,
-    QPushButton,
     QWidget,
     QMessageBox,
     QHeaderView,
@@ -185,9 +187,11 @@ class ModuleTableModel(QAbstractTableModel):
             self.COL_POWER,
             self.COL_NUM_CONN,
             self.COL_COLOR,
-            self.COL_IMAGE,
         ):
             return Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
+        # COL_IMAGE is handled by the painting delegate (click to browse),
+        # so it must NOT be editable — a transient editor is what used to
+        # crash when its child QFileDialog stole focus.
         return Qt.ItemIsSelectable | Qt.ItemIsEnabled
 
     def setData(self, index, value, role=Qt.EditRole):
@@ -269,6 +273,18 @@ class ColorDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         cur = index.model().data(index, Qt.EditRole)
         editor = ColorComboBox(cur if cur else "Default", parent)
+        # Commit the picked color to the model immediately (when the user
+        # selects from the drop-down) instead of relying on the view's
+        # focus-out commit. A click on a button outside the table does not
+        # move focus away from the editor, so the old color used to linger
+        # in the model and the global Save/OK button saved the stale value.
+        # The editor is deliberately left open after a pick so the user can
+        # pick again without re-entering edit mode (which used to require
+        # clicking the cell several times to reach the drop-down).
+        editor.combo.activated.connect(lambda *_: self.commitData.emit(editor))
+        # Open the drop-down as soon as the editor appears, so one click on
+        # the cell is enough to reach the color list.
+        QTimer.singleShot(0, editor.combo.showPopup)
         return editor
 
     def setEditorData(self, editor, index):
@@ -285,26 +301,136 @@ class ColorDelegate(QStyledItemDelegate):
             model.setData(index, editor.current_color(), Qt.EditRole)
 
 
-class ImageBrowseDelegate(QStyledItemDelegate):
-    def createEditor(self, parent, option, index):
-        btn = QPushButton("Browse...", parent)
-        btn.clicked.connect(lambda: self._open_dialog(btn, index))
-        return btn
+class ImagePreviewDelegate(QStyledItemDelegate):
+    """
+    Image column delegate: paints a thumbnail preview + filename and lets the
+    user pick an image by clicking the cell (or clear it via the ✕ badge).
 
-    def setEditorData(self, editor, index):
-        pass
+    The file dialog is parented to the *view* rather than to a transient
+    delegate editor, so it can never be destroyed while it is open — this
+    also fixes the previous crash where the editor (and the dialog as its
+    child) was destroyed mid-`exec_()` as soon as the dialog stole focus.
+    """
 
-    def setModelData(self, editor, model, index):
-        pass
+    _THUMB_W = 64
+    _THUMB_H = 44
 
-    def _open_dialog(self, btn, index):
-        dlg = QFileDialog(btn)
-        dlg.setFileMode(QFileDialog.ExistingFile)
-        dlg.setNameFilter("Images (*.png *.jpg *.jpeg *.bmp *.gif)")
-        if dlg.exec_():
-            path = dlg.selectedFiles()[0]
-            model = index.model()
-            model.setData(index, path, Qt.EditRole)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thumb_cache = {}
+
+    @staticmethod
+    def _clear_rect_for(rect):
+        return QRect(rect.right() - 18, rect.top() + (rect.height() - 16) // 2, 16, 16)
+
+    def _thumb(self, path):
+        """Return a scaled thumbnail for the given path (cached)."""
+        pix = self._thumb_cache.get(path)
+        if pix is None:
+            raw = QPixmap(path)
+            if raw.isNull():
+                pix = QPixmap()  # invalid marker: file missing / not an image
+            else:
+                pix = raw.scaled(
+                    self._THUMB_W,
+                    self._THUMB_H,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            if len(self._thumb_cache) >= 200:  # keep the cache bounded (evict oldest)
+                self._thumb_cache.pop(next(iter(self._thumb_cache)))
+            self._thumb_cache[path] = pix
+        return pix
+
+    def _text_color(self, option):
+        """Palette text colour that stays readable on the selected state."""
+        if option.state & QStyle.State_Selected:
+            return option.palette.highlightedText().color()
+        return option.palette.text().color()
+
+    def paint(self, painter, option, index):
+        painter.save()
+        rect = option.rect
+
+        # NOTE: no explicit background fill — the view's stylesheet already
+        # renders selection / hover / alternating row colours; painting over
+        # them with palette brushes would break the theme.
+
+        photo = (index.model().data(index, Qt.EditRole) or "").strip()
+
+        if not photo:
+            painter.setPen(option.palette.mid().color())
+            painter.drawText(
+                rect.adjusted(8, 0, -8, 0),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                "No image — click to browse",
+            )
+            painter.restore()
+            return
+
+        pix = self._thumb(photo)
+        if pix.isNull():
+            painter.setPen(option.palette.mid().color())
+            painter.drawText(
+                rect.adjusted(8, 0, -8, 0),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                "⚠️ image unavailable",
+            )
+            painter.restore()
+            return
+
+        # thumbnail, vertically centred
+        th_rect = QRect(
+            rect.left() + 6,
+            rect.top() + max(0, (rect.height() - pix.height()) // 2),
+            pix.width(),
+            pix.height(),
+        )
+        painter.drawPixmap(th_rect, pix)
+
+        # elided filename next to the thumbnail
+        font = painter.font()
+        font.setPointSize(max(8, font.pointSize() - 1))
+        painter.setFont(font)
+        text_rect = rect.adjusted(th_rect.width() + 16, 0, -24, 0)
+        elided = painter.fontMetrics().elidedText(
+            os.path.basename(photo), Qt.ElideMiddle, max(24, text_rect.width())
+        )
+        painter.setPen(self._text_color(option))
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, elided)
+
+        # clear (✕) badge
+        clear_rect = self._clear_rect_for(rect)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(200, 60, 60, 210))
+        painter.drawRoundedRect(clear_rect, 3, 3)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(clear_rect, Qt.AlignCenter, "✕")
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):
+        if (
+            event.type() == QEvent.MouseButtonRelease
+            and event.button() == Qt.LeftButton
+            and index.column() == ModuleTableModel.COL_IMAGE
+        ):
+            # clicking the ✕ badge clears the image
+            if self._clear_rect_for(option.rect).contains(event.pos()):
+                model.setData(index, "", Qt.EditRole)
+                return True
+            # otherwise open the file picker, parented to the view so it
+            # outlives any editor / focus changes while the dialog is open
+            parent = option.widget
+            path, _ = QFileDialog.getOpenFileName(
+                parent,
+                "Choose Module Image",
+                "",
+                "Images (*.png *.jpg *.jpeg *.bmp *.gif)",
+            )
+            if path:
+                model.setData(index, path, Qt.EditRole)
+            return True
+        return super().editorEvent(event, model, option, index)
 
 
 # numeric input delegates
@@ -370,7 +496,6 @@ class ModuleDialog(QDialog):
         self._target_table_name = "modules"
         self._focus_filter = FocusEventFilter(self)
         self._changed_rows = set()
-        self._image_paths = {}  # Store image paths per row index
 
         # Received from ArchitectureViewTab
         self._initial_subsystem_id = subsystem_id
@@ -648,7 +773,7 @@ class ModuleDialog(QDialog):
             ModuleTableModel.COL_COLOR, ColorDelegate(self)
         )
         self.table.setItemDelegateForColumn(
-            ModuleTableModel.COL_IMAGE, ImageBrowseDelegate(self)
+            ModuleTableModel.COL_IMAGE, ImagePreviewDelegate(self)
         )
         # numeric validators
         self.table.setItemDelegateForColumn(
@@ -865,34 +990,6 @@ class ModuleDialog(QDialog):
         r = self.model.rowCount() - 1
         self.table.setRowHeight(r, 60)
 
-    def create_image_widget(self, row, photo):
-        """ایجاد ویجت انتخاب تصویر"""
-        image_widget = QWidget()
-        image_layout = QHBoxLayout(image_widget)
-        image_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Browse button with new styling
-        image_btn = create_styled_button("📁 Browse...", "small")
-        image_label = QLabel(os.path.basename(photo) if photo else "No image selected")
-
-        # Style label
-        label_style = f"""
-            QLabel {{
-                font-size: {Typography.SIZE_SMALL}; 
-                color: {theme_manager.get_color('text_secondary')};
-                background: transparent;
-            }}
-        """
-        image_label.setStyleSheet(label_style)
-
-        image_layout.addWidget(image_btn)
-        image_layout.addWidget(image_label)
-
-        # Connect signal
-        image_btn.clicked.connect(lambda _, row=row: self._browse_image(row))
-
-        return image_widget
-
     def _mark_row_changed(self, row):
         """Mark row as changed and enable its Save button."""
         if row in self._changed_rows:
@@ -902,19 +999,6 @@ class ModuleDialog(QDialog):
         # request repaint so delegates can reflect changed state if needed
         if hasattr(self, "table"):
             self.table.viewport().update()
-
-    def _browse_image(self, row):
-        """Browse for image file"""
-        file_dialog = QFileDialog(self)
-        file_dialog.setFileMode(QFileDialog.ExistingFile)
-        file_dialog.setNameFilter("Images (*.png *.jpg *.jpeg *.bmp *.gif)")
-
-        if file_dialog.exec_():
-            file_path = file_dialog.selectedFiles()[0]
-            # store into model
-            idx = self.model.index(row, ModuleTableModel.COL_IMAGE)
-            self.model.setData(idx, file_path, Qt.EditRole)
-            self._mark_row_changed(row)
 
     # ------------------------------------------------------------------
     #   Initial Row Highlight
@@ -1215,6 +1299,14 @@ class ModuleDialog(QDialog):
         """Attempt to save all changes and exit"""
         if not self._ensure_project_selected():
             return False
+
+        # If a cell editor is still open, force the view to commit it into
+        # the model before we snapshot rows. Clicking a button outside the
+        # table does not reliably move focus away from the editor, so the
+        # last edit (color, name, mass, …) would otherwise be silently lost.
+        if self.table.state() == QAbstractItemView.EditingState:
+            self.table.setFocus()
+            QApplication.processEvents()
 
         project_id = get_current_project_id()
         rows_to_save = []
