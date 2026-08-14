@@ -5,17 +5,22 @@ import sys
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
     QDialog, QComboBox, QPushButton, QMessageBox, QGroupBox, 
-    QFormLayout, QDialogButtonBox,QHeaderView, QHBoxLayout, QWidget as QW
+    QFormLayout, QDialogButtonBox,QHeaderView, QHBoxLayout, QWidget as QW,
+    QDoubleSpinBox,
 )
 from PyQt5.QtGui import QColor, QPixmap, QIcon, QFont
 from PyQt5.QtCore import Qt, pyqtSignal
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from database import get_connection, get_current_project_id, add_interface_guarded
+from database import (
+    get_connection, get_current_project_id, pins_connectable_from_data,
+)
 from auth_manager import auth
+from suggestions import propose_interface_change
 
 from Interface_Connectivity_tab.wiring_utils import (
-    get_all_pins_with_full_numbered_name, PREDEFINED_COLORS, AddInterfaceDialog
+    get_all_pins_with_full_numbered_name, PREDEFINED_COLORS, AddInterfaceDialog,
+    _pin_label,
 )
 
 # Import new style system
@@ -736,7 +741,7 @@ class MatrixPanel(QWidget):
                     SELECT pin1_id, pin2_id, i.id,
                         (SELECT connector_id FROM pins WHERE id=pin1_id AND project_id=%s),
                         (SELECT connector_id FROM pins WHERE id=pin2_id AND project_id=%s),
-                        i.color
+                        i.color, i.current
                     FROM interfaces i
                     WHERE i.project_id = %s
                 """, (project_id, project_id, project_id))
@@ -768,7 +773,7 @@ class MatrixPanel(QWidget):
         # endpoints appear in both scopes (identical scopes keep the classic
         # symmetric view). Interfaces inside a single connector (c1 == c2)
         # are never shown.
-        for p1_id, p2_id, iface_id, c1_id, c2_id, color in all_ifaces:
+        for p1_id, p2_id, iface_id, c1_id, c2_id, color, iface_cur in all_ifaces:
             if c1_id is None or c2_id is None or c1_id == c2_id:
                 continue  # skip missing lookups and intra-connector relations
 
@@ -776,7 +781,7 @@ class MatrixPanel(QWidget):
             p2_full_name = all_pins_map.get(p2_id, "N/A")
             p1_name = p1_full_name.split(': ')[-1]
             p2_name = p2_full_name.split(': ')[-1]
-            entry = (p1_id, p1_name, p2_id, p2_name, iface_id, color or '#0000FF')
+            entry = (p1_id, p1_name, p2_id, p2_name, iface_id, color or '#0000FF', float(iface_cur or 0.0))
 
             r1 = row_index.get(c1_id)
             c1c = col_index.get(c1_id)
@@ -803,11 +808,9 @@ class MatrixPanel(QWidget):
     def edit_matrix_cell(self, row, column):
         """
         Show dialog for editing interfaces between two connectors.
+        System admins edit the DB directly; other users' changes are
+        recorded as suggestions for approval.
         """
-        if not auth.is_system():
-            QMessageBox.warning(self, "Access denied", "Only 'system' can edit the wiring matrix.")
-            return
-
         connector1_id = self.matrix_row_connector_ids[row]
         connector2_id = self.matrix_col_connector_ids[column]
 
@@ -899,8 +902,8 @@ class MatrixPanel(QWidget):
 
         # Table for existing interfaces
         iface_table = QTableWidget()
-        iface_table.setColumnCount(5)
-        iface_table.setHorizontalHeaderLabels(["Pin from Conn1", "Pin from Conn2", "Color", "Edit", "Delete"])
+        iface_table.setColumnCount(6)
+        iface_table.setHorizontalHeaderLabels(["Pin from Conn1", "Pin from Conn2", "Color", "Current (mA)", "Edit", "Delete"])
         
         # اعمال استایل جدول
         self.apply_interface_table_style(iface_table)
@@ -908,13 +911,12 @@ class MatrixPanel(QWidget):
         iface_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         existing_layout.addWidget(iface_table)
         layout.addWidget(existing_group)
-        is_sys = auth.is_system()
 
         # --- Refresh function for existing interfaces ---
 
         def refresh_cell_list():
             iface_table.setRowCount(len(existing_ifaces))
-            for idx, (p1_id, p1_name, p2_id, p2_name, iface_id, color) in enumerate(existing_ifaces):
+            for idx, (p1_id, p1_name, p2_id, p2_name, iface_id, color, cur_mA) in enumerate(existing_ifaces):
                 iface_table.setRowHeight(idx, 60)
                 iface_table.setItem(idx, 0, QTableWidgetItem(p1_name))
                 iface_table.setItem(idx, 1, QTableWidgetItem(p2_name))
@@ -940,16 +942,20 @@ class MatrixPanel(QWidget):
                 
                 iface_table.setItem(idx, 2, color_item)
 
+                # Connection current
+                cur_item = QTableWidgetItem(f"{cur_mA or 0:g}")
+                cur_item.setTextAlignment(Qt.AlignCenter)
+                cur_item.setFont(QFont("Roboto Mono", 11))
+                iface_table.setItem(idx, 3, cur_item)
+
                 # ادامه کد برای دکمه‌های Edit و Delete
                 edit_btn = create_styled_button("✏️ Edit", "small")
-                edit_btn.setEnabled(is_sys)
                 edit_btn.clicked.connect(lambda _, iid=iface_id: on_edit(iid))
-                iface_table.setCellWidget(idx, 3, edit_btn)
+                iface_table.setCellWidget(idx, 4, edit_btn)
 
                 delete_btn = create_styled_button("🗑️ Delete", "small")
-                delete_btn.setEnabled(is_sys)
                 delete_btn.clicked.connect(lambda _, iid=iface_id: on_delete(iid))
-                iface_table.setCellWidget(idx, 4, delete_btn)
+                iface_table.setCellWidget(idx, 5, delete_btn)
 
             
             for col in range(iface_table.columnCount()):
@@ -963,18 +969,16 @@ class MatrixPanel(QWidget):
             if confirm == QMessageBox.Yes:
                 if not self._ensure_project_selected():
                     return
-                project_id = get_current_project_id()
-                try:
-                    with get_connection() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute("DELETE FROM interfaces WHERE id = %s AND project_id = %s", (iid, project_id))
-                        conn.commit()
-                        existing_ifaces[:] = [e for e in existing_ifaces if e[4] != iid]
-                        self.load_matrix_data()
-                        self.interface_changed.emit()
-                        refresh_cell_list()
-                except Exception as e:
-                    QMessageBox.critical(dialog, "DB Error", f"Failed to delete: {e}")
+                # System admins delete directly; others submit a suggestion.
+                ok, msg = propose_interface_change("delete", None, None, iface_id=iid)
+                if not ok:
+                    QMessageBox.warning(dialog, "Cannot Delete", msg)
+                    return
+                QMessageBox.information(dialog, "Success", msg)
+                existing_ifaces[:] = [e for e in existing_ifaces if e[4] != iid]
+                self.load_matrix_data()
+                self.interface_changed.emit()
+                refresh_cell_list()
 
         # --- Edit handler ---
         def on_edit(iid):
@@ -986,17 +990,49 @@ class MatrixPanel(QWidget):
         add_new_layout = QFormLayout(add_new_group)
         add_new_layout.setLabelAlignment(Qt.AlignLeft)
         
+        # Pins now carry their electrical info: (pin_id, label, info_dict)
         pin1_combo = QComboBox()
         pin1_combo.setFont(QFont("Roboto Mono", 11))
-        for p_id, p_name_numbered in pins1:
+        for p_id, p_name_numbered, _info in pins1:
             pin1_combo.addItem(p_name_numbered, p_id)
         add_new_layout.addRow(f"Pin from {connector1_name}:", pin1_combo)
-        
+
         pin2_combo = QComboBox()
         pin2_combo.setFont(QFont("Roboto Mono", 11))
-        for p_id, p_name_numbered in pins2:
+        for p_id, p_name_numbered, _info in pins2:
             pin2_combo.addItem(p_name_numbered, p_id)
         add_new_layout.addRow(f"Pin from {connector2_name}:", pin2_combo)
+
+        # Same-type wiring rule: picking a pin on one side only lists
+        # compatible pins on the other side.
+        def _pin_info(pin_list, pin_id):
+            for _pid, _pname, info in pin_list:
+                if _pid == pin_id:
+                    return info
+            return None
+
+        def _refill_pin_combo(combo, pin_list, reference):
+            combo.blockSignals(True)
+            try:
+                combo.clear()
+                for p_id, p_name_numbered, info in pin_list:
+                    if reference is not None:
+                        ok, _ = pins_connectable_from_data(reference, info)
+                        if not ok:
+                            continue
+                    combo.addItem(p_name_numbered, p_id)
+            finally:
+                combo.blockSignals(False)
+
+        def _on_pin1_changed(_idx):
+            _refill_pin_combo(pin2_combo, pins2, _pin_info(pins1, pin1_combo.currentData()))
+
+        def _on_pin2_changed(_idx):
+            _refill_pin_combo(pin1_combo, pins1, _pin_info(pins2, pin2_combo.currentData()))
+
+        pin1_combo.currentIndexChanged.connect(_on_pin1_changed)
+        pin2_combo.currentIndexChanged.connect(_on_pin2_changed)
+        _on_pin1_changed(0)  # initial state: filter pin2 by the first pin
         
         color_combo = QComboBox()
         color_combo.setFont(QFont("Roboto Mono", 11))
@@ -1008,15 +1044,18 @@ class MatrixPanel(QWidget):
         color_combo.setCurrentText("Blue")
         add_new_layout.addRow("Interface Color:", color_combo)
 
+        # Connection current — decided on the connection itself, not the pin
+        cur_spin = QDoubleSpinBox()
+        cur_spin.setRange(0.0, 1000000.0)
+        cur_spin.setDecimals(1)
+        cur_spin.setValue(0.0)
+        cur_spin.setSuffix(" mA")
+        add_new_layout.addRow("Current (mA):", cur_spin)
+
         # define handler BEFORE connecting
         def on_add():
             if not self._ensure_project_selected():
                 return
-            if not auth.is_system():
-                QMessageBox.warning(dialog, "Access denied", "Only 'system' can add interfaces.")
-                return
-
-            project_id = get_current_project_id()
 
             p1_id = pin1_combo.currentData()
             p2_id = pin2_combo.currentData()
@@ -1028,12 +1067,19 @@ class MatrixPanel(QWidget):
 
             color_hex = PREDEFINED_COLORS[color_index][1]
 
-            # use DB-guarded helper (prevents duplicates both directions)
-            ok, msg = add_interface_guarded(auth.user_id, p1_id, p2_id, color_hex, project_id)
+            # System admins write straight to the DB; everyone else's change
+            # is recorded as a suggestion for the admin to approve.
+            ok, msg = propose_interface_change(
+                "create", p1_id, p2_id, color_hex, cur_spin.value()
+            )
             if not ok:
                 # e.g., "Interface already exists."
                 QMessageBox.information(dialog, "Info", msg)
                 return
+
+            # Non-admins must know their change is only pending approval.
+            if not auth.is_system():
+                QMessageBox.information(dialog, "Submitted", msg)
 
             # refresh UI once
             self.load_matrix_data()
@@ -1042,22 +1088,15 @@ class MatrixPanel(QWidget):
 
 
         add_btn = create_styled_button("➕ Add This Pin Interface", "normal")
-        add_btn.setEnabled(is_sys)
         add_btn.setFont(QFont("Roboto Mono", 11, QFont.Bold))
         add_new_layout.addRow(add_btn)
-
-        if is_sys:
-            add_btn.clicked.connect(on_add)
-        else:
-            add_btn.clicked.connect(lambda: QMessageBox.warning(dialog, "Access denied", "Only 'system' can add interfaces."))
+        add_btn.clicked.connect(on_add)
 
         layout.addWidget(add_new_group)
 
         # --- Close Button ---
         close_btn = create_styled_button("❌ Close", "large")
         close_btn.clicked.connect(dialog.reject)
-
-        add_btn.clicked.connect(on_add)
         return dialog
 
     def apply_interface_table_style(self, table):
@@ -1107,7 +1146,7 @@ class MatrixPanel(QWidget):
         try:
             with get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT pin1_id, pin2_id, color FROM interfaces WHERE id = %s AND project_id = %s", 
+                cursor.execute("SELECT pin1_id, pin2_id, color, current FROM interfaces WHERE id = %s AND project_id = %s", 
                             (iface_id, project_id))
                 data = cursor.fetchone()
         except Exception as e:
@@ -1117,10 +1156,11 @@ class MatrixPanel(QWidget):
         if not data:
             QMessageBox.critical(self, "Error", "Interface not found.")
             return
-        pin1_id, pin2_id, color = data
+        pin1_id, pin2_id, color, cur_mA = data
 
         dialog = AddInterfaceDialog(self)
         auto_style_widget(dialog)  # اعمال استایل خودکار
+        dialog.current_spin.setValue(float(cur_mA or 0.0))
 
         # Load pin details for Side 1 (pin1_id)
         try:
@@ -1203,20 +1243,19 @@ class MatrixPanel(QWidget):
         if dialog.exec_() == QDialog.Accepted:
             new_data = dialog.get_data()
             if new_data:
-                new_p1, new_p2, new_color = new_data
+                new_p1, new_p2, new_color, new_current = new_data
                 try:
-                    with get_connection() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "UPDATE interfaces SET pin1_id=%s, pin2_id=%s, color=%s WHERE id=%s AND project_id=%s",
-                            (new_p1, new_p2, new_color, iface_id, project_id)
-                        )
-                        conn.commit()
-                        QMessageBox.information(self, "Success", "Interface updated.")
-                        self.load_matrix_data()
-                        self.interface_changed.emit()
-                        if refresh_callback:
-                            refresh_callback()
+                    ok, msg = propose_interface_change(
+                        "update", new_p1, new_p2, new_color, new_current, iface_id=iface_id
+                    )
+                    if not ok:
+                        QMessageBox.warning(self, "Cannot Update", msg)
+                        return
+                    QMessageBox.information(self, "Success", msg)
+                    self.load_matrix_data()
+                    self.interface_changed.emit()
+                    if refresh_callback:
+                        refresh_callback()
                 except Exception as e:
                     QMessageBox.critical(self, "DB Error", f"Failed to update: {e}")
 
@@ -1237,10 +1276,21 @@ class MatrixPanel(QWidget):
             with get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT id, name, pin_number FROM pins WHERE connector_id = %s AND project_id = %s ORDER BY pin_number",
+                    "SELECT id, name, pin_number, pin_type, is_ground, value "
+                    "FROM pins WHERE connector_id = %s AND project_id = %s ORDER BY pin_number",
                     (connector_id, project_id)
                 )
-                pins = [(pin_id, f"Pin {pin_num or 'N/A'}: {pin_name}") for pin_id, pin_name, pin_num in cursor.fetchall()]
+                pins = []
+                for pin_id, pin_name, pin_num, ptype, isg, val in cursor.fetchall():
+                    info = {
+                        "id": pin_id,
+                        "name": pin_name,
+                        "pin_number": pin_num,
+                        "pin_type": ptype,
+                        "is_ground": bool(isg) if isg is not None else False,
+                        "value": val,
+                    }
+                    pins.append((pin_id, _pin_label(info), info))
             self.connector_data_cache[connector_id] = pins
             return pins
         except Exception as e:

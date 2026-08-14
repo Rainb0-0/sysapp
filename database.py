@@ -33,6 +33,18 @@ current_project_name = None
 connection_pool = None
 pool_lock = threading.Lock()
 
+# -----------------------------------------------------------------------------
+# Pin types & same-type wiring rules
+# -----------------------------------------------------------------------------
+# Fixed electrical classes recognised everywhere (ground / power) plus the
+# default data pin types seeded for the admin-managed list.
+GROUND_PIN_ALIASES = {"GND", "GROUND", "VSS", "AGND", "DGND"}
+POWER_PIN_ALIASES = {"VCC", "VDD", "POWER", "PWR", "VOLTAGE"}
+DEFAULT_PIN_TYPES = [
+    "UART", "RS422", "RS485", "RS232", "TTL", "CAN", "I2C", "SPI",
+    "QSPI", "LVDS", "SpaceWire", "SpaceFibre",
+]
+
 
 def init_connection_pool(min_conn=2, max_conn=20):
     """Initialize the global connection pool if not already initialized."""
@@ -518,6 +530,7 @@ def init_db():
                         project_id INTEGER NOT NULL,
                         interface_type VARCHAR(100),
                         color VARCHAR(7) DEFAULT '#C8C8FF',
+                        current REAL DEFAULT 0,
                         pos_x REAL DEFAULT 0,
                         pos_y REAL DEFAULT 0,
                         rotation REAL DEFAULT 0,
@@ -539,6 +552,16 @@ def init_db():
                         y REAL NOT NULL,
                         FOREIGN KEY(interface_id) REFERENCES interfaces(id) ON DELETE CASCADE,
                         FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+                    )
+                """)
+
+            # --- pin_types (admin-managed data pin types) ---
+            if not _table_exists(cur, 'pin_types'):
+                cur.execute("""
+                    CREATE TABLE pin_types (
+                        id SERIAL PRIMARY KEY,
+                        name VARCHAR(50) NOT NULL UNIQUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
 
@@ -617,6 +640,7 @@ def init_db():
             _add_column_if_not_exists(cur, 'interfaces', 'pos_x', 'REAL DEFAULT 0')
             _add_column_if_not_exists(cur, 'interfaces', 'pos_y', 'REAL DEFAULT 0')
             _add_column_if_not_exists(cur, 'interfaces', 'rotation', 'REAL DEFAULT 0')
+            _add_column_if_not_exists(cur, 'interfaces', 'current', 'REAL DEFAULT 0')
 
             _add_column_if_not_exists(cur, 'interface_points', 'project_id', 'INTEGER')
             _add_column_if_not_exists(cur, 'interface_points', 'description', 'TEXT')  # for routing metadata
@@ -624,6 +648,13 @@ def init_db():
             _add_column_if_not_exists(cur, 'modes', 'project_id', 'INTEGER')
             _add_column_if_not_exists(cur, 'mode_modules', 'project_id', 'INTEGER')
             _add_column_if_not_exists(cur, 'mode_positions', 'project_id', 'INTEGER')
+
+            # seed default data pin types (idempotent)
+            for _pt in DEFAULT_PIN_TYPES:
+                cur.execute(
+                    "INSERT INTO pin_types (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+                    (_pt,),
+                )
 
             # --- indexes (idempotent) ---
             # project scoping
@@ -1230,6 +1261,33 @@ def apply_auth_migration():
         );
         """)
 
+        # --- pending_changes (change suggestions awaiting system-admin review) ---
+        # Non-system-admin edits are recorded here instead of being applied
+        # directly; the system admin approves/rejects them from the Reviews
+        # tab. `temp_id` is a deterministic negative id (see suggestions.py)
+        # used so pending-created items can be referenced by other pending
+        # suggestions and by the optimistic previews in the UI.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_changes (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            action VARCHAR(16) NOT NULL,          -- create | update | delete
+            entity_type VARCHAR(24) NOT NULL,     -- module | connector | pin | interface | mode
+            entity_id INTEGER,                    -- real id when the target exists (NULL for creates)
+            subsystem_id INTEGER,                 -- scope for display / permission checks
+            temp_id INTEGER UNIQUE,               -- deterministic negative id for creates
+            payload JSONB NOT NULL,               -- canonical change payload (see suggestions.py)
+            summary TEXT NOT NULL,                -- human-readable one-liner
+            status VARCHAR(16) NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | stale
+            review_note TEXT,
+            resolved_id INTEGER,                  -- real id after a create is approved
+            created_at TIMESTAMP DEFAULT NOW(),
+            resolved_at TIMESTAMP,
+            resolved_by INTEGER
+        );
+        """)
+
 
         # indexes for faster auth lookups
 
@@ -1238,6 +1296,9 @@ def apply_auth_migration():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_role_perms_role ON role_permissions(role_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_subsystems_user ON user_subsystems(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_active ON user_sessions(user_id, is_active)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_project_status ON pending_changes(project_id, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_user ON pending_changes(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_temp ON pending_changes(temp_id)")
         conn.commit()
 
 def _hash_password(plain: str) -> str:
@@ -1431,6 +1492,7 @@ def seed_auth_basics():
             "interface.create", "interface.edit", "interface.delete",
             "project.delete",
             "subsystem.create", "subsystem.delete",
+            "pin_type.create", "pin_type.delete",
         ]
         for code in perms:
             add_permission(code, code.replace(".", " "))
@@ -1569,6 +1631,248 @@ def get_interface_pins(interface_id: int) -> tuple[int | None, int | None]:
         )
         r = cur.fetchone()
         return (r[0], r[1]) if r else (None, None)
+
+
+# =============================================================================
+# Same-type wiring rules (pins may only connect to pins of the same class)
+# =============================================================================
+def _normalize_pin_type(pin_type) -> str:
+    return (pin_type or "").strip().upper()
+
+
+def classify_pin(pin_type, is_ground=False, value=None) -> dict:
+    """
+    Classify a pin for the same-type wiring rules.
+
+    Returns {"class": "ground"|"power"|"data"|"untyped", "type": str,
+             "voltage": float}.
+    """
+    t = _normalize_pin_type(pin_type)
+    if is_ground or t in GROUND_PIN_ALIASES:
+        return {"class": "ground", "type": t or "GND", "voltage": 0.0}
+    if t in POWER_PIN_ALIASES:
+        return {"class": "power", "type": t, "voltage": float(value) if value else 0.0}
+    if not t:
+        return {"class": "untyped", "type": "", "voltage": 0.0}
+    return {"class": "data", "type": t, "voltage": 0.0}
+
+
+def pins_connectable_from_data(pin_a: dict, pin_b: dict):
+    """
+    Pure compatibility check for two pin dicts (each with "pin_type",
+    "is_ground", "value" and optionally "name"/"id"). Returns (ok, reason).
+
+    Rules:
+      * ground  ↔ ground
+      * power   ↔ power with matching voltage (an unknown voltage never
+                 blocks — only two known, different voltages are rejected)
+      * data    ↔ data of the exact same type (UART↔UART, I2C↔I2C, …)
+      * untyped pins block the connection until a type is set
+    """
+    def _label(d):
+        return d.get("name") or f"Pin {d.get('id', '?')}"
+
+    a_name, b_name = _label(pin_a), _label(pin_b)
+    ca = classify_pin(pin_a.get("pin_type"), bool(pin_a.get("is_ground")), pin_a.get("value"))
+    cb = classify_pin(pin_b.get("pin_type"), bool(pin_b.get("is_ground")), pin_b.get("value"))
+
+    if ca["class"] == "untyped" or cb["class"] == "untyped":
+        which = a_name if ca["class"] == "untyped" else b_name
+        return False, (
+            f"Pin '{which}' has no type set. Set a pin type "
+            "(GND, VCC/voltage or a data type) before connecting."
+        )
+
+    if ca["class"] == "ground" or cb["class"] == "ground":
+        if ca["class"] == "ground" and cb["class"] == "ground":
+            return True, ""
+        return False, "Ground pins can only connect to other ground pins."
+
+    if ca["class"] == "power" or cb["class"] == "power":
+        if ca["class"] != "power" or cb["class"] != "power":
+            return False, "Voltage (VCC) pins can only connect to other voltage pins."
+        va, vb = ca["voltage"], cb["voltage"]
+        if va and vb and abs(va - vb) > 1e-6:
+            return False, f"Voltage pins must have the same voltage ({va:g}V ≠ {vb:g}V)."
+        return True, ""
+
+    # Both data pins — exact same type required
+    if ca["type"] != cb["type"]:
+        return False, (
+            f"'{ca['type']}' pins can only connect to other '{ca['type']}' pins "
+            f"(cannot connect '{ca['type']}' to '{cb['type']}')."
+        )
+    return True, ""
+
+
+def check_pin_change_interfaces(pin_id: int, pin_type: str, is_ground: bool = False, value: float | None = None):
+    """
+    Before changing a pin's electrical type, verify it does not break any
+    existing connection. Returns (ok, reason); reason names the first
+    connected pin the new type is incompatible with (empty when ok).
+
+    E.g. a GND↔GND connection becomes illegal the moment one side is
+    retyped to VCC or a data type, so the change is rejected.
+    """
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            project_id = get_current_project_id()
+            if project_id is None:
+                return True, ""
+
+            # No electrical change (e.g. a rename-only edit) → existing
+            # connections are untouched, so there is nothing to validate.
+            cur.execute(
+                "SELECT pin_type, is_ground, value FROM pins WHERE id=%s AND project_id=%s",
+                (pin_id, project_id),
+            )
+            own = cur.fetchone()
+            if own is None:
+                return True, ""
+            old_type_norm = (own[0] or "").strip().upper() or None
+            old_ground = bool(own[1]) if own[1] is not None else False
+            old_value = None if own[2] is None else float(own[2] or 0.0)
+            new_type_norm = (pin_type or "").strip().upper() or None
+            new_value = None if value is None else float(value or 0.0)
+            if (
+                new_type_norm == old_type_norm
+                and bool(is_ground) == old_ground
+                and new_value == old_value
+            ):
+                return True, ""
+
+            cur.execute(
+                "SELECT pin1_id, pin2_id FROM interfaces "
+                "WHERE project_id=%s AND (pin1_id=%s OR pin2_id=%s)",
+                (project_id, pin_id, pin_id),
+            )
+            other_ids = []
+            for p1, p2 in cur.fetchall():
+                other_ids.append(p2 if p1 == pin_id else p1)
+            if not other_ids:
+                return True, ""
+            cur.execute(
+                "SELECT id, name, pin_type, is_ground, value FROM pins WHERE id = ANY(%s)",
+                (other_ids,),
+            )
+            connected = cur.fetchall()
+    except Exception as e:
+        return False, f"Error checking existing connections: {e}"
+
+    new_cfg = {
+        "id": pin_id,
+        "pin_type": pin_type,
+        "is_ground": bool(is_ground),
+        "value": value,
+    }
+    for cid, cname, ctype, cgnd, cval in connected:
+        other = {
+            "id": cid,
+            "name": cname,
+            "pin_type": ctype,
+            "is_ground": bool(cgnd) if cgnd is not None else False,
+            "value": cval,
+        }
+        ok, reason = pins_connectable_from_data(new_cfg, other)
+        if not ok:
+            other_label = other.get("name") or f"Pin {other.get('id', '?')}"
+            return False, f"'{other_label}' would become incompatible ({reason})"
+    return True, ""
+
+
+def pins_connectable(pin1_id: int, pin2_id: int):
+    """Check whether two pins may be wired together. Returns (ok, reason)."""
+    if pin1_id == pin2_id:
+        return False, "Cannot connect a pin to itself."
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, name, pin_type, is_ground, value FROM pins WHERE id = ANY(%s)",
+                ([pin1_id, pin2_id],),
+            )
+            rows = {r[0]: r for r in cur.fetchall()}
+    except Exception as e:
+        return False, f"Error checking pin types: {e}"
+    if pin1_id not in rows or pin2_id not in rows:
+        return False, "One of the pins no longer exists."
+    r1, r2 = rows[pin1_id], rows[pin2_id]
+    return pins_connectable_from_data(
+        {"id": r1[0], "name": r1[1], "pin_type": r1[2], "is_ground": r1[3], "value": r1[4]},
+        {"id": r2[0], "name": r2[1], "pin_type": r2[2], "is_ground": r2[3], "value": r2[4]},
+    )
+
+
+# =============================================================================
+# Managed data pin types (system admin)
+# =============================================================================
+def list_pin_types() -> list:
+    """Return the managed data pin type names (sorted)."""
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM pin_types ORDER BY name")
+            return [r[0] for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def count_pins_by_type(name: str) -> int:
+    """How many pins currently use the given type (for the management dialog)."""
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM pins WHERE LOWER(TRIM(COALESCE(pin_type,''))) = LOWER(%s)",
+                (name,),
+            )
+            return cur.fetchone()[0]
+    except Exception:
+        return 0
+
+
+def add_pin_type_guarded(user_id: int, name: str):
+    """System-admin guarded: add a new data pin type. Returns (ok, msg)."""
+    name = (name or "").strip()
+    if not name:
+        return False, "Pin type name cannot be empty."
+    guard_or_raise(user_id, "pin_type.create", None, "pin_type.create", details={"name": name})
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pin_types WHERE LOWER(name) = LOWER(%s)", (name,))
+            if cur.fetchone():
+                return False, f"Pin type '{name}' already exists."
+            cur.execute("INSERT INTO pin_types (name) VALUES (%s)", (name,))
+            conn.commit()
+    except Exception as e:
+        return False, f"Failed to add pin type: {e}"
+    return True, f"Pin type '{name}' added."
+
+
+def delete_pin_type_guarded(user_id: int, name: str):
+    """System-admin guarded: remove a data pin type. Returns (ok, msg)."""
+    name = (name or "").strip()
+    guard_or_raise(user_id, "pin_type.delete", None, "pin_type.delete", details={"name": name})
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pin_types WHERE LOWER(name) = LOWER(%s)", (name,))
+            if not cur.fetchone():
+                return False, f"Pin type '{name}' not found."
+            cur.execute(
+                "SELECT COUNT(*) FROM pins WHERE LOWER(TRIM(COALESCE(pin_type,''))) = LOWER(%s)",
+                (name,),
+            )
+            count = cur.fetchone()[0]
+            if count:
+                return False, f"Cannot delete '{name}': {count} pin(s) still use this type."
+            cur.execute("DELETE FROM pin_types WHERE LOWER(name) = LOWER(%s)", (name,))
+            conn.commit()
+    except Exception as e:
+        return False, f"Failed to delete pin type: {e}"
+    return True, f"Pin type '{name}' deleted."
 
 
 def get_interface_subsystem_ids(interface_id: int) -> set[int]:
@@ -1768,9 +2072,13 @@ def get_user_subsystem_names(user_id: int) -> set[str]:
         """, (user_id,))
         return {row[0] for row in cur.fetchall()}
 
-def add_interface_guarded(user_id: int, pin1_id: int, pin2_id: int, color: str, project_id: int):
+def add_interface_guarded(user_id: int, pin1_id: int, pin2_id: int, color: str, project_id: int, current: float = 0.0):
     guard_or_raise(user_id, "interface.create", None, "interface.create",
                    details={"pin1_id": pin1_id, "pin2_id": pin2_id})
+    # Same-type wiring rule (ground↔ground, matching VCC, same data type)
+    ok, reason = pins_connectable(pin1_id, pin2_id)
+    if not ok:
+        return (False, reason)
     with get_connection() as conn:
         cur = conn.cursor()
         # avoid duplicates (both orders)
@@ -1782,22 +2090,41 @@ def add_interface_guarded(user_id: int, pin1_id: int, pin2_id: int, color: str, 
         if cur.fetchone():
             return (False, "Interface already exists.")
         cur.execute("""
-            INSERT INTO interfaces (pin1_id, pin2_id, color, project_id)
-            VALUES (%s, %s, %s, %s)
-        """, (pin1_id, pin2_id, color, project_id))
+            INSERT INTO interfaces (pin1_id, pin2_id, color, current, project_id)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (pin1_id, pin2_id, color, current, project_id))
         conn.commit()
         return (True, "Interface added.")
 
-def update_interface_guarded(user_id: int, iface_id: int, pin1_id: int, pin2_id: int, color: str, project_id: int):
+def update_interface_guarded(user_id: int, iface_id: int, pin1_id: int, pin2_id: int, color: str, project_id: int, current: float = 0.0):
     guard_or_raise(user_id, "interface.edit", None, "interface.edit",
                    details={"iface_id": iface_id})
+    # Same-type wiring rule — but only when the pin pair actually changes.
+    # Legacy interfaces created before this rule may already pair mismatched
+    # pins; re-validating an unchanged pair would block harmless colour-only
+    # edits and prevent the user from fixing old data.
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT pin1_id, pin2_id FROM interfaces WHERE id=%s AND project_id=%s",
+            (iface_id, project_id),
+        )
+        row = cur.fetchone()
+        pair_changed = row is None or not (
+            (row[0] == pin1_id and row[1] == pin2_id)
+            or (row[0] == pin2_id and row[1] == pin1_id)
+        )
+    if pair_changed:
+        ok, reason = pins_connectable(pin1_id, pin2_id)
+        if not ok:
+            return (False, reason)
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
             UPDATE interfaces
-            SET pin1_id=%s, pin2_id=%s, color=%s
+            SET pin1_id=%s, pin2_id=%s, color=%s, current=%s
             WHERE id=%s AND project_id=%s
-        """, (pin1_id, pin2_id, color, iface_id, project_id))
+        """, (pin1_id, pin2_id, color, current, iface_id, project_id))
         conn.commit()
         return (True, "Interface updated.")
 

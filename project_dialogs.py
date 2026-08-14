@@ -17,7 +17,9 @@ from database import (get_all_projects, create_new_project_guarded,
                      get_project_id_by_name, delete_project_guarded,  # added
                      get_current_project_id, get_current_project_name,
                      list_subsystems_for_project, count_subsystem_data,
-                     add_subsystem_guarded, delete_subsystem_guarded)
+                     add_subsystem_guarded, delete_subsystem_guarded,
+                     list_pin_types, count_pins_by_type,
+                     add_pin_type_guarded, delete_pin_type_guarded)
 
 from project_config import project_config
 from auth_manager import auth
@@ -759,3 +761,196 @@ class SubsystemManagementDialog(QDialog):
 
         QMessageBox.information(self, "Deleted", msg)
         self._load_subsystems()
+
+
+class DataPinTypesDialog(QDialog):
+    """
+    System-admin only: manage the global list of data pin types.
+
+    Only pins that share the exact same type may be connected together
+    (e.g. UART ↔ UART). Power/ground pins are handled by voltage matching
+    and are not listed here.
+
+    A type that is still in use by at least one pin cannot be removed.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Data Pin Types")
+        self.setModal(True)
+        self.setMinimumSize(520, 460)
+
+        self._build_ui()
+        self._load_types()
+
+        auth.auth_changed.connect(self.apply_access_policy)
+        self.apply_access_policy()
+
+    # ---------------------------
+    # UI
+    # ---------------------------
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Header
+        header = QLabel("🔌 Manage Data Pin Types")
+        hf = QFont(); hf.setPointSize(14); hf.setBold(True)
+        header.setFont(hf)
+        header.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header)
+
+        sub = QLabel(
+            "Pins may only connect to pins of the same type\n"
+            "(UART ↔ UART, CAN ↔ CAN, SPI ↔ SPI, …)"
+        )
+        sub.setAlignment(Qt.AlignCenter)
+        sub.setStyleSheet("color:#666;")
+        layout.addWidget(sub)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(sep)
+
+        # Type list
+        list_group = QGroupBox("Available data pin types")
+        list_layout = QVBoxLayout()
+        self.type_list = QListWidget()
+        self.type_list.setMinimumHeight(220)
+        self.type_list.itemSelectionChanged.connect(self.apply_access_policy)
+        list_layout.addWidget(self.type_list)
+        list_group.setLayout(list_layout)
+        layout.addWidget(list_group)
+
+        # Add row
+        add_row = QHBoxLayout()
+        self.new_type_edit = QLineEdit()
+        self.new_type_edit.setPlaceholderText("New pin type (e.g. Ethernet, USB, MIL-STD-1553)…")
+        self.new_type_edit.returnPressed.connect(self._add_type)
+        self.btn_add = QPushButton("➕ Add Type")
+        add_row.addWidget(self.new_type_edit, 1)
+        add_row.addWidget(self.btn_add)
+        layout.addLayout(add_row)
+
+        # Buttons row
+        btn_row = QHBoxLayout()
+        self.btn_remove = QPushButton("🗑️ Remove Selected")
+        self.btn_close = QPushButton("Close")
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_remove)
+        btn_row.addWidget(self.btn_close)
+        layout.addLayout(btn_row)
+
+        self.lbl_hint = QLabel(
+            "Only the system admin can add or remove data pin types. A type that "
+            "is still used by a pin cannot be removed until no pin uses it."
+        )
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setStyleSheet("color:#888; font-size:11px;")
+        layout.addWidget(self.lbl_hint)
+
+        # Connections
+        self.btn_add.clicked.connect(self._add_type)
+        self.btn_remove.clicked.connect(self._remove_selected)
+        self.btn_close.clicked.connect(self.accept)
+
+    # ---------------------------
+    # Access policy
+    # ---------------------------
+    def apply_access_policy(self):
+        can_manage = auth.is_system()
+        if hasattr(self, "btn_add"):
+            self.btn_add.setEnabled(can_manage)
+        if hasattr(self, "new_type_edit"):
+            self.new_type_edit.setEnabled(can_manage)
+        if hasattr(self, "btn_remove"):
+            self.btn_remove.setEnabled(
+                can_manage and self.type_list.currentItem() is not None
+            )
+        if not can_manage:
+            self.lbl_hint.setText(
+                "Only the system admin can add or remove data pin types. "
+                "You have read-only access here."
+            )
+
+    # ---------------------------
+    # Data loading
+    # ---------------------------
+    def _load_types(self):
+        self.type_list.clear()
+        try:
+            for name in list_pin_types() or []:
+                used = count_pins_by_type(name)
+                suffix = "" if used else "   (unused)"
+                item = QListWidgetItem(f"📡 {name}{suffix}")
+                item.setData(Qt.UserRole, name)
+                self.type_list.addItem(item)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load pin types:\n{e}")
+        self.apply_access_policy()
+
+    def _selected_type_name(self):
+        item = self.type_list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    # ---------------------------
+    # Actions
+    # ---------------------------
+    def _add_type(self):
+        if not auth.is_system():
+            QMessageBox.warning(
+                self, "Access denied", "Only the system admin can add pin types."
+            )
+            return
+
+        name = self.new_type_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Invalid name", "Please enter a pin type name.")
+            return
+
+        ok, msg = add_pin_type_guarded(auth.user_id, name)
+        if not ok:
+            QMessageBox.critical(self, "Create failed", msg)
+            return
+
+        QMessageBox.information(self, "Created", msg)
+        self.new_type_edit.clear()
+        self._load_types()
+
+    def _remove_selected(self):
+        if not auth.is_system():
+            QMessageBox.warning(
+                self, "Access denied", "Only the system admin can remove pin types."
+            )
+            return
+
+        name = self._selected_type_name()
+        if name is None:
+            QMessageBox.information(self, "Remove Type", "Select a pin type first.")
+            return
+
+        used = count_pins_by_type(name)
+        if used:
+            QMessageBox.warning(
+                self,
+                "Cannot Remove",
+                f"Cannot remove pin type '{name}':\n{used} pin(s) still use this type.\n\n"
+                "Retype or delete those pins first, then try again.",
+            )
+            return
+
+        r = QMessageBox.question(
+            self,
+            "Confirm remove",
+            f"Remove pin type '{name}'?\n\n"
+            "No pin currently uses this type, so removing it is safe.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if r != QMessageBox.Yes:
+            return
+
+        ok, msg = delete_pin_type_guarded(auth.user_id, name)
+        if not ok:
+            QMessageBox.critical(self, "Delete failed", msg)
+            return
+
+        QMessageBox.information(self, "Removed", msg)
+        self._load_types()

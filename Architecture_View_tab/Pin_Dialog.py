@@ -30,9 +30,22 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QFont, QDoubleValidator
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from database import get_connection, get_current_project_id, get_pin_subsystem_id
+from database import (
+    get_connection,
+    get_current_project_id,
+    get_pin_subsystem_id,
+    list_pin_types,
+    classify_pin,
+    check_pin_change_interfaces,
+)
 from access_control import guard_write, can_edit_subsystem
 from auth_manager import auth
+from suggestions import suggest_change
+
+SUBMITTED_MSG = (
+    "Change submitted for approval — it will apply once the system admin "
+    "approves it."
+)
 
 from Architecture_View_tab.table_navigation import (
     NavigableLineEdit,
@@ -57,20 +70,50 @@ from styles.theme_manager import theme_manager
 class FormatTypeWidget(QWidget):
     formatChanged = pyqtSignal()
     powerTypeChanged = pyqtSignal()
+    dataTypeChanged = pyqtSignal()
 
-    def __init__(self, initial_fmt="Data", initial_power="VCC", parent=None):
+    def __init__(
+        self,
+        initial_fmt="Data",
+        initial_power="VCC",
+        initial_data="Data",
+        parent=None,
+    ):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setAlignment(Qt.AlignCenter)
 
+        # Legacy rows stored the data type directly in the format field
+        # (e.g. "UART"); fold that into the data-type combo instead — it
+        # must win over any default "Data" so the type is never dropped.
+        if initial_fmt not in ("Data", "Power"):
+            initial_data = initial_fmt
+            initial_fmt = "Data"
+
+        # Format category: Data / Power. The concrete choice lives in the
+        # secondary combo next to it — exactly like Power → VCC/GND.
         self.cb_fmt = QComboBox()
         self.cb_fmt.addItems(["Data", "Power"])
         self.cb_fmt.setCurrentText(initial_fmt)
         self.cb_fmt.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.cb_fmt)
 
+        # Data type combo (visible when "Data" is selected): generic "Data"
+        # plus every admin-managed type (UART, RS422, CAN, I2C, SPI, …).
+        data_items = ["Data"] + list(list_pin_types() or [])
+        # Keep an existing pin editable even if its type was later removed
+        # from the managed list.
+        if initial_data and initial_data not in data_items:
+            data_items.append(initial_data)
+        self.cb_data = QComboBox()
+        self.cb_data.addItems(data_items)
+        self.cb_data.setCurrentText(initial_data if initial_data in data_items else "Data")
+        self.cb_data.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.cb_data)
+
+        # Power subtype combo (visible when "Power" is selected)
         self.cb_power = QComboBox()
         self.cb_power.addItems(["VCC", "GND"])
         self.cb_power.setCurrentText(initial_power)
@@ -80,6 +123,7 @@ class FormatTypeWidget(QWidget):
         self._update_visibility()
         self.cb_fmt.currentTextChanged.connect(self._on_fmt_changed)
         self.cb_power.currentTextChanged.connect(lambda _: self.powerTypeChanged.emit())
+        self.cb_data.currentTextChanged.connect(lambda _: self.dataTypeChanged.emit())
 
         # اتصال به تغییر تم
         style_manager.theme_changed.connect(self.apply_theme_style)
@@ -130,6 +174,7 @@ class FormatTypeWidget(QWidget):
             }}
         """
         self.cb_fmt.setStyleSheet(combo_style)
+        self.cb_data.setStyleSheet(combo_style)
         self.cb_power.setStyleSheet(combo_style)
 
     def _on_fmt_changed(self, txt):
@@ -138,13 +183,18 @@ class FormatTypeWidget(QWidget):
 
     def _update_visibility(self):
         is_power = self.cb_fmt.currentText() == "Power"
+        is_data = self.cb_fmt.currentText() == "Data"
         self.cb_power.setVisible(is_power)
+        self.cb_data.setVisible(is_data)
 
     def get_format(self):
         return self.cb_fmt.currentText()
 
     def get_power_type(self):
         return self.cb_power.currentText()
+
+    def get_data_type(self):
+        return self.cb_data.currentText()
 
 
 # --- Model & Delegates for performance ---------------------------------
@@ -155,10 +205,11 @@ class PinTableModel(QAbstractTableModel):
     COL_NAME = 1
     COL_FORMAT = 2
     COL_VOLTAGE = 3
-    COL_CURRENT = 4
-    COL_SAVE = 5
+    COL_SAVE = 4
 
-    headers = ["ID", "Pin Name", "Type", "Voltage (V)", "Current (mA)", "Save"]
+    # NOTE: the pin's current was removed — current now lives on the
+    # connection (interfaces.current) and is decided when wiring two pins.
+    headers = ["ID", "Pin Name", "Type", "Voltage (V)", "Save"]
 
     def __init__(self, data=None, parent=None):
         super().__init__(parent)
@@ -179,7 +230,7 @@ class PinTableModel(QAbstractTableModel):
         if not index.isValid():
             return Qt.ItemIsEnabled
         col = index.column()
-        if col in (self.COL_NAME, self.COL_FORMAT, self.COL_VOLTAGE, self.COL_CURRENT):
+        if col in (self.COL_NAME, self.COL_FORMAT, self.COL_VOLTAGE):
             return Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
         return Qt.ItemIsSelectable | Qt.ItemIsEnabled
 
@@ -196,12 +247,11 @@ class PinTableModel(QAbstractTableModel):
                 return item.get("name", "")
             if col == self.COL_FORMAT:
                 fmt = item.get("format", "Data")
-                power_type = item.get("power_type", "VCC")
-                return fmt if fmt == "Data" else f"Power/{power_type}"
+                if fmt == "Power":
+                    return f"Power/{item.get('power_type', 'VCC')}"
+                return item.get("data_type") or "Data"
             if col == self.COL_VOLTAGE:
                 return item.get("voltage", "")
-            if col == self.COL_CURRENT:
-                return item.get("current", "")
             if col == self.COL_SAVE:
                 return ""
         if role == Qt.EditRole:
@@ -210,11 +260,13 @@ class PinTableModel(QAbstractTableModel):
             if col == self.COL_NAME:
                 return item.get("name", "")
             if col == self.COL_FORMAT:
-                return (item.get("format", "Data"), item.get("power_type", "VCC"))
+                return (
+                    item.get("format", "Data"),
+                    item.get("power_type", "VCC"),
+                    item.get("data_type") or "Data",
+                )
             if col == self.COL_VOLTAGE:
                 return item.get("voltage", "")
-            if col == self.COL_CURRENT:
-                return item.get("current", "")
             if col == self.COL_SAVE:
                 return ""
         return QVariant()
@@ -228,14 +280,16 @@ class PinTableModel(QAbstractTableModel):
         if col == self.COL_NAME:
             item["name"] = str(value)
         elif col == self.COL_FORMAT:
-            if isinstance(value, (tuple, list)) and len(value) == 2:
-                item["format"], item["power_type"] = str(value[0]), str(value[1])
+            if isinstance(value, (tuple, list)) and len(value) >= 2:
+                item["format"] = str(value[0])
+                item["power_type"] = str(value[1])
+                item["data_type"] = (
+                    str(value[2]) if len(value) >= 3 else "Data"
+                )
             else:
                 return False
         elif col == self.COL_VOLTAGE:
             item["voltage"] = str(value).strip()
-        elif col == self.COL_CURRENT:
-            item["current"] = str(value).strip()
         else:
             return False
 
@@ -298,26 +352,40 @@ class ButtonDelegate(QStyledItemDelegate):
 class FormatTypeDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         data = index.model().data(index, Qt.EditRole)
-        initial_fmt, initial_power = (
-            data if isinstance(data, (tuple, list)) else ("Data", "VCC")
-        )
+        if isinstance(data, (tuple, list)) and len(data) >= 3:
+            initial_fmt, initial_power, initial_data = data[0], data[1], data[2]
+        elif isinstance(data, (tuple, list)) and len(data) == 2:
+            initial_fmt, initial_power, initial_data = data[0], data[1], "Data"
+        else:
+            initial_fmt, initial_power, initial_data = "Data", "VCC", "Data"
         return FormatTypeWidget(
-            initial_fmt=initial_fmt, initial_power=initial_power, parent=parent
+            initial_fmt=initial_fmt,
+            initial_power=initial_power,
+            initial_data=initial_data,
+            parent=parent,
         )
 
     def setEditorData(self, editor, index):
         if not isinstance(editor, FormatTypeWidget):
             return
         data = index.model().data(index, Qt.EditRole)
-        if isinstance(data, (tuple, list)) and len(data) == 2:
+        if isinstance(data, (tuple, list)) and len(data) >= 2:
             editor.cb_fmt.setCurrentText(data[0])
             editor.cb_power.setCurrentText(data[1])
+            if len(data) >= 3:
+                editor.cb_data.setCurrentText(data[2])
 
     def setModelData(self, editor, model, index):
         if not isinstance(editor, FormatTypeWidget):
             return
         model.setData(
-            index, (editor.get_format(), editor.get_power_type()), Qt.EditRole
+            index,
+            (
+                editor.get_format(),
+                editor.get_power_type(),
+                editor.get_data_type(),
+            ),
+            Qt.EditRole,
         )
 
 
@@ -342,25 +410,7 @@ class VoltageDelegate(QStyledItemDelegate):
         model.setData(index, editor.text().strip(), Qt.EditRole)
 
 
-class CurrentDelegate(QStyledItemDelegate):
-    def createEditor(self, parent, option, index):
-        editor = QLineEdit(parent)
-        validator = QDoubleValidator(parent)
-        validator.setNotation(QDoubleValidator.StandardNotation)
-        validator.setBottom(0.0)
-        editor.setValidator(validator)
-        return editor
 
-    def setEditorData(self, editor, index):
-        if not isinstance(editor, QLineEdit):
-            return
-        value = index.model().data(index, Qt.EditRole)
-        editor.setText(str(value) if value is not None else "")
-
-    def setModelData(self, editor, model, index):
-        if not isinstance(editor, QLineEdit):
-            return
-        model.setData(index, editor.text().strip(), Qt.EditRole)
 
 
 # -------------------------------------------------------------
@@ -604,9 +654,6 @@ class PinDialog(QDialog):
         self.table.setItemDelegateForColumn(
             PinTableModel.COL_VOLTAGE, VoltageDelegate(self)
         )
-        self.table.setItemDelegateForColumn(
-            PinTableModel.COL_CURRENT, CurrentDelegate(self)
-        )
         self._save_delegate = ButtonDelegate("✓", self._is_row_dirty, self.table)
         self._save_delegate.clicked.connect(self._save_row)
         self.table.setItemDelegateForColumn(PinTableModel.COL_SAVE, self._save_delegate)
@@ -721,6 +768,17 @@ class PinDialog(QDialog):
         project_id = get_current_project_id()
         item = self.model.item(row)
         if item and item.get("id"):
+            if not auth.is_system():
+                # Non-admin: propose the deletion instead of writing.
+                suggest_change("pin", "delete", item["id"],
+                               get_pin_subsystem_id(item["id"]),
+                               {"id": item["id"]},
+                               f"Delete pin '{item.get('name', '')}'")
+                QMessageBox.information(self, "Submitted", SUBMITTED_MSG)
+                self.model.removeRowItem(row)
+                self._shift_dirty_rows_after_removal(row)
+                self.pins_updated.emit()
+                return
             try:
                 with get_connection() as conn:
                     cur = conn.cursor()
@@ -878,20 +936,23 @@ class PinDialog(QDialog):
                 cap = result[0] if result else 0
 
                 cur.execute(
-                    "SELECT id,name,pin_type,is_ground,value,current FROM pins WHERE connector_id=%s AND project_id=%s ORDER BY pin_number",
+                    "SELECT id,name,pin_type,is_ground,value FROM pins WHERE connector_id=%s AND project_id=%s ORDER BY pin_number",
                     (conn_id, project_id),
                 )
-                for pid, name, ptype, is_gnd, val, curr in cur.fetchall():
-                    fmt = "Power" if ptype == "Voltage" else ptype
-                    power_t = "GND" if is_gnd else "VCC"
+                for pid, name, ptype, is_gnd, val in cur.fetchall():
+                    cls = classify_pin(ptype, bool(is_gnd), val)["class"]
+                    if cls in ("ground", "power"):
+                        fmt = "Power"
+                        power_t = "GND" if cls == "ground" else "VCC"
+                        data_type = ""
+                    else:
+                        fmt = "Data"
+                        power_t = "VCC"
+                        # untyped pins fall back to the generic "Data" type
+                        data_type = ptype or "Data"
                     volt_str = (
                         f"{val:.2f}"
                         if val is not None
-                        else ""
-                    )
-                    curr_str = (
-                        f"{curr:.2f}"
-                        if curr is not None
                         else ""
                     )
                     rows.append(
@@ -900,8 +961,8 @@ class PinDialog(QDialog):
                             "name": name or "",
                             "format": fmt,
                             "power_type": power_t,
+                            "data_type": data_type,
                             "voltage": volt_str,
-                            "current": curr_str,
                         }
                     )
         except Exception as e:
@@ -916,8 +977,8 @@ class PinDialog(QDialog):
                     "name": "",
                     "format": "Data",
                     "power_type": "VCC",
+                    "data_type": "Data",
                     "voltage": "",
-                    "current": "",
                 }
             )
 
@@ -926,21 +987,21 @@ class PinDialog(QDialog):
         self.model.blockSignals(False)
         self._changed_rows.clear()
 
-        for col in range(1, 5):
+        for col in range(1, PinTableModel.COL_SAVE):
             self.table.setColumnWidth(col, 150)
 
     # ------------------------------------------------------------------
     # Row creation & change-tracking
     # ------------------------------------------------------------------
-    def _append_row(self, pid, name, fmt, power_t, volt, curr):
+    def _append_row(self, pid, name, fmt, power_t, data_type, volt):
         self.model.insertRowItem(
             {
                 "id": pid,
                 "name": name,
                 "format": fmt,
                 "power_type": power_t,
+                "data_type": data_type,
                 "voltage": volt,
-                "current": curr,
             }
         )
 
@@ -965,7 +1026,6 @@ class PinDialog(QDialog):
                 PinTableModel.COL_NAME,
                 PinTableModel.COL_FORMAT,
                 PinTableModel.COL_VOLTAGE,
-                PinTableModel.COL_CURRENT,
             )
             for col in changed_columns
         ):
@@ -1004,8 +1064,8 @@ class PinDialog(QDialog):
 
         fmt = item.get("format", "Data")
         ptype = item.get("power_type", "VCC")
+        data_type = (item.get("data_type") or "Data").strip() or "Data"
         volt_str = str(item.get("voltage", "")).strip()
-        curr_str = str(item.get("current", "")).strip()
 
         try:
             voltage = float(volt_str) if volt_str else None
@@ -1013,21 +1073,60 @@ class PinDialog(QDialog):
             QMessageBox.warning(self, "Validation", "Voltage must be a number.")
             return
 
-        try:
-            numeric_current = float(curr_str) if curr_str else None
-        except ValueError:
-            QMessageBox.warning(self, "Validation", "Current must be a number.")
-            return
-
         conn_id = self.connector_combo.currentData()
         is_gnd = fmt == "Power" and ptype == "GND"
-        # If a voltage value is entered, set pin_type to "Voltage" so it
-        # displays correctly in the Schematic View edit dialog.
-        # If grounded, always mark as "Voltage"/GND regardless of entered voltage.
-        if is_gnd or (volt_str and voltage is not None and voltage > 0):
-            pin_type = "Voltage"
+        if fmt == "Power":
+            # If a voltage value is entered, set pin_type to "Voltage" so it
+            # displays correctly in the Schematic View edit dialog.
+            # If grounded, always mark as "Voltage"/GND regardless of entered voltage.
+            if is_gnd or (volt_str and voltage is not None and voltage > 0):
+                pin_type = "Voltage"
+            else:
+                pin_type = "Power"
         else:
-            pin_type = fmt
+            # Data pins store their concrete type (UART, CAN, …) so the
+            # same-type-only connection rule applies.
+            pin_type = data_type
+
+        # Re-validate existing connections against the NEW type before
+        # writing: e.g. a GND↔GND link must not silently become GND↔VCC.
+        # (Only runs when the electrical type actually changed.)
+        if item.get("id"):
+            ok_change, reason = check_pin_change_interfaces(
+                item["id"], pin_type, is_gnd, voltage
+            )
+            if not ok_change:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Type Change",
+                    f"Cannot change this pin's type:\n{reason}",
+                )
+                return
+
+        if not auth.is_system():
+            # Non-admin: record the change as a suggestion instead of writing.
+            pin_id = item.get("id")
+            if pin_id:
+                suggest_change("pin", "update", pin_id, subsystem_id,
+                               {"id": pin_id,
+                                "fields": {"name": name, "pin_type": pin_type,
+                                            "is_ground": is_gnd, "value": voltage}},
+                               f"Edit pin '{name}'")
+            else:
+                suggest_change("pin", "create", None, subsystem_id,
+                               {"connector_id": conn_id, "name": name,
+                                "pin_type": pin_type, "is_ground": is_gnd,
+                                "value": voltage},
+                               f"Add pin '{name}'")
+            if show_message:
+                QMessageBox.information(self, "Submitted", SUBMITTED_MSG)
+            self.pins_updated.emit()
+            self._changed_rows.discard(row)
+            self.model.dataChanged.emit(
+                self.model.index(row, PinTableModel.COL_SAVE),
+                self.model.index(row, PinTableModel.COL_SAVE),
+            )
+            return
 
         try:
             with get_connection() as conn:
@@ -1035,14 +1134,13 @@ class PinDialog(QDialog):
                 if item.get("id"):
                     cur.execute(
                         "UPDATE pins "
-                        "SET name=%s, pin_type=%s, is_ground=%s, value=%s, current=%s "
+                        "SET name=%s, pin_type=%s, is_ground=%s, value=%s "
                         "WHERE id=%s AND project_id=%s",
                         (
                             name,
                             pin_type,
                             is_gnd,
                             voltage,
-                            numeric_current,
                             item["id"],
                             project_id,
                         ),
@@ -1063,8 +1161,8 @@ class PinDialog(QDialog):
                     next_num = cur.fetchone()[0]
                     cur.execute(
                         "INSERT INTO pins "
-                        "(connector_id, project_id, name, pin_number, pin_type, is_ground, value, current) "
-                        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                        "(connector_id, project_id, name, pin_number, pin_type, is_ground, value) "
+                        "VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                         (
                             conn_id,
                             project_id,
@@ -1073,7 +1171,6 @@ class PinDialog(QDialog):
                             pin_type,
                             is_gnd,
                             voltage,
-                            numeric_current,
                         ),
                     )
                     item["id"] = cur.fetchone()[0]
@@ -1160,6 +1257,13 @@ class PinDialog(QDialog):
                 if reply == QMessageBox.Yes:
                     db_id = item.get("id")
                     if db_id:
+                        if not auth.is_system():
+                            suggest_change("pin", "delete", db_id,
+                                           get_pin_subsystem_id(db_id),
+                                           {"id": db_id},
+                                           f"Delete pin '{item.get('name', '')}'")
+                            empty_new_rows.append(row)
+                            continue
                         try:
                             with get_connection() as conn:
                                 cur = conn.cursor()

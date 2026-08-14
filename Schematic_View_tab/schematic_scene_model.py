@@ -35,6 +35,7 @@ from database import (
     get_connection,
     get_current_project_id,
     get_complete_layout,
+    pins_connectable,
 )
 from auth_manager import auth
 
@@ -130,6 +131,10 @@ def load_schematic_scene(
     with get_connection() as conn:
         cur = conn.cursor()
 
+        # ---------------- Managed data pin types ----------------
+        cur.execute("SELECT name FROM pin_types ORDER BY name")
+        scene["pin_types"] = [r[0] for r in cur.fetchall()]
+
         # ---------------- Subsystems ----------------
         cur.execute(
             "SELECT id, name FROM subsystems WHERE project_id = %s ORDER BY name",
@@ -187,18 +192,20 @@ def load_schematic_scene(
         if connector_id_list:
             conn_ph = ",".join(["%s"] * len(connector_id_list))
             cur.execute(
-                f"SELECT id, connector_id, name, value, current, pin_type, is_ground FROM pins "
+                f"SELECT id, connector_id, name, value, pin_type, is_ground FROM pins "
                 f"WHERE connector_id IN ({conn_ph}) AND project_id = %s ORDER BY pin_number",
                 (*connector_id_list, project_id),
             )
-            for pin_id, conn_id, pin_name, pin_value, pin_current, pin_type, is_ground in cur.fetchall():
+            for pin_id, conn_id, pin_name, pin_value, pin_type, is_ground in cur.fetchall():
                 all_pin_ids_set.add(pin_id)
                 pin_data_by_connector.setdefault(conn_id, []).append({
                     "id": pin_id,
                     "name": pin_name,
                     "voltage": pin_value,
-                    "current": pin_current,
-                    "pin_type": pin_type or "Data",
+                    # Raw pin_type (None when untyped) — the renderer applies
+                    # the "Data" default only for display, so the same-type
+                    # wiring rule sees the real stored value.
+                    "pin_type": pin_type,
                     "is_ground": bool(is_ground) if is_ground is not None else False,
                 })
 
@@ -215,7 +222,7 @@ def load_schematic_scene(
             mod_ph = ",".join(["%s"] * len(module_id_list))
             cur.execute(
                 f"""
-                SELECT DISTINCT i.id, i.pin1_id, i.pin2_id, i.color
+                SELECT DISTINCT i.id, i.pin1_id, i.pin2_id, i.color, i.current
                 FROM Interfaces i
                 JOIN pins p1 ON i.pin1_id = p1.id
                 JOIN pins p2 ON i.pin2_id = p2.id
@@ -274,11 +281,14 @@ def load_schematic_scene(
             else:
                 module_color = SUBSYSTEM_COLORS[idx % len(SUBSYSTEM_COLORS)]
 
-            # The schematic view is read-only for everyone except the system
-            # admin (subsystem admins included). `editable` drives every
+            # Any logged-in user may interact with the schematic: the system
+            # admin's edits hit the DB directly, everyone else's become
+            # pending suggestions (approved later). `editable` drives every
             # interaction guard on the JS side (context menus, drag, resize,
             # re-routing), and the bridge re-checks auth on each write.
-            can_edit = auth.is_logged_in() and auth.is_system()
+            # Pending-created entities are marked editable=False by the
+            # suggestions overlay so they can't be dragged before approval.
+            can_edit = auth.is_logged_in()
 
             scene["modules"].append({
                 "id": mod_id,
@@ -317,7 +327,7 @@ def load_schematic_scene(
             from Schematic_View_tab.routing_persistence import load_enhanced_interface_data
             routing_data = load_enhanced_interface_data(interface_id_list)
 
-            for iface_id, pin1_id, pin2_id, color in interface_rows:
+            for iface_id, pin1_id, pin2_id, color, iface_current in interface_rows:
                 payload = routing_data.get(iface_id)
                 if isinstance(payload, dict):
                     points = payload.get("points", [])
@@ -327,15 +337,16 @@ def load_schematic_scene(
                 else:
                     points, meta = [], {}
 
-                # Read-only for everyone except the system admin (see the
-                # module `editable` comment above).
-                iface_can_edit = auth.is_logged_in() and auth.is_system()
+                # See the module `editable` comment: any logged-in user may
+                # interact; non-admin changes become pending suggestions.
+                iface_can_edit = auth.is_logged_in()
 
                 scene["interfaces"].append({
                     "id": iface_id,
                     "from_pin": pin1_id,
                     "to_pin": pin2_id,
                     "color": color,
+                    "current": float(iface_current or 0.0),
                     "points": [[x, y] for x, y in points],
                     "editable": iface_can_edit,
                     **meta,
@@ -427,10 +438,16 @@ def save_connector_positions(positions: Dict[int, Dict[str, float]]) -> None:
         conn.commit()
 
 
-def create_interface(pin1_id: int, pin2_id: int, color: Optional[str] = None) -> Optional[int]:
+def create_interface(pin1_id: int, pin2_id: int, color: Optional[str] = None,
+                      current: Optional[float] = None) -> Optional[int]:
     """Create a new Interfaces row connecting two pins."""
     project_id = get_current_project_id()
     if project_id is None or pin1_id == pin2_id:
+        return None
+
+    # Same-type wiring rule — the bridge reports the reason to the user.
+    ok, _reason = pins_connectable(pin1_id, pin2_id)
+    if not ok:
         return None
 
     with get_connection() as conn:
@@ -445,9 +462,9 @@ def create_interface(pin1_id: int, pin2_id: int, color: Optional[str] = None) ->
             return existing[0]
 
         cur.execute(
-            "INSERT INTO Interfaces (project_id, pin1_id, pin2_id, color) "
-            "VALUES (%s, %s, %s, %s) RETURNING id",
-            (project_id, pin1_id, pin2_id, color),
+            "INSERT INTO Interfaces (project_id, pin1_id, pin2_id, color, current) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (project_id, pin1_id, pin2_id, color, current),
         )
         new_id = cur.fetchone()[0]
         conn.commit()

@@ -2,7 +2,7 @@
 
 from PyQt5.QtGui import QPixmap, QIcon, QColor, QFont
 from PyQt5.QtWidgets import (QStyledItemDelegate, QDialog, 
-                             QFormLayout, QComboBox, QDialogButtonBox,
+                             QFormLayout, QComboBox, QDoubleSpinBox,
                              QMessageBox, QGroupBox, QLabel, QHBoxLayout, QVBoxLayout)
 from PyQt5.QtCore import Qt
 
@@ -10,7 +10,12 @@ from PyQt5.QtCore import Qt
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from database import get_connection, get_current_project_id  # اضافه شده
+from database import (  # اضافه شده
+    get_connection,
+    get_current_project_id,
+    classify_pin,
+    pins_connectable_from_data,
+)
 
 # Import new style system
 from styles.style_manager import (style_manager, register_widget, 
@@ -41,6 +46,27 @@ def _ensure_project_selected():
     if project_id is None:
         return False
     return True
+
+def pin_type_label(pin_type, is_ground=False, value=None):
+    """Short human-readable label for a pin's electrical type."""
+    c = classify_pin(pin_type, is_ground, value)
+    if c["class"] == "ground":
+        return "GND"
+    if c["class"] == "power":
+        return f"{c['type']} {c['voltage']:g}V" if c["voltage"] else c["type"]
+    if c["class"] == "untyped":
+        return "no type"
+    return c["type"]
+
+
+def _pin_label(info):
+    """Label for a pin combo item, including its electrical type."""
+    num = info.get("pin_number")
+    name = info.get("name")
+    base = f"Pin {num}: {name}" if name else f"Pin {num}"
+    type_txt = pin_type_label(info.get("pin_type"), info.get("is_ground"), info.get("value"))
+    return f"{base} ({type_txt})"
+
 
 def get_all_pins_with_full_numbered_name():
     pins_map = {}
@@ -97,6 +123,11 @@ class AddInterfaceDialog(QDialog):
         
         style_manager.theme_changed.connect(self.on_theme_changed)
 
+        # Cached full pin lists (with type info) per side, used to filter
+        # the opposite side's combo by the same-type wiring rule.
+        self._side1_pins = []
+        self._side2_pins = []
+
         # Main vertical layout for top content and bottom buttons
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(15, 15, 15, 15)
@@ -107,6 +138,9 @@ class AddInterfaceDialog(QDialog):
 
         # Color selection
         self.create_color_section(main_layout)
+
+        # Connection current (the current lives on the connection itself)
+        self.create_current_section(main_layout)
 
         # Buttons (OK and Cancel)
         self.create_button_section(main_layout)
@@ -280,6 +314,22 @@ class AddInterfaceDialog(QDialog):
         color_layout.addStretch()
         main_layout.addLayout(color_layout)
 
+    def create_current_section(self, main_layout):
+        """Connection current in mA — decided per connection, not per pin."""
+        current_layout = QHBoxLayout()
+        current_label = QLabel("⚡ Current (mA):")
+        self.current_spin = QDoubleSpinBox()
+        self.current_spin.setFont(QFont("Roboto Mono", 11))
+        self.current_spin.setRange(0.0, 1000000.0)
+        self.current_spin.setDecimals(1)
+        self.current_spin.setValue(0.0)
+        self.current_spin.setSuffix(" mA")
+
+        current_layout.addWidget(current_label)
+        current_layout.addWidget(self.current_spin)
+        current_layout.addStretch()
+        main_layout.addLayout(current_layout)
+
     def create_button_section(self, main_layout):
         # دکمه‌های محلی: استایل بگیرند اما register نشوند
         ok_btn = create_styled_button("✅ OK", "large", register_global=False)
@@ -307,6 +357,10 @@ class AddInterfaceDialog(QDialog):
         self.side2_subsystem_combo.currentIndexChanged.connect(self.load_side2_modules)
         self.side2_module_combo.currentIndexChanged.connect(self.load_side2_connectors)
         self.side2_connector_combo.currentIndexChanged.connect(self.load_side2_pins)
+
+        # Same-type filtering between the two pin combos
+        self.side1_pin_combo.currentIndexChanged.connect(self._on_side1_pin_changed)
+        self.side2_pin_combo.currentIndexChanged.connect(self._on_side2_pin_changed)
 
     def on_theme_changed(self, theme_name):
         self.apply_dialog_style()
@@ -375,26 +429,76 @@ class AddInterfaceDialog(QDialog):
             print(f"Error loading connectors: {e}")
 
     # 9. اصلاح متد load_side1_pins
+    def _fill_pin_combo(self, combo, pin_infos, reference=None):
+        """
+        Populate a pin combo from cached pin info. When `reference` (a pin
+        info dict) is given, only pins compatible with it are listed.
+        """
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("Select Pin", None)
+            for info in pin_infos:
+                if reference is not None:
+                    ok, _ = pins_connectable_from_data(reference, info)
+                    if not ok:
+                        continue
+                combo.addItem(_pin_label(info), info["id"])
+        finally:
+            combo.blockSignals(False)
+
+    def _pin_info(self, side, pin_id):
+        """Return the cached pin info dict for a side, or None."""
+        infos = self._side1_pins if side == "side1" else self._side2_pins
+        for info in infos:
+            if info["id"] == pin_id:
+                return info
+        return None
+
+    def _on_side1_pin_changed(self, index):
+        """A side-1 pin was picked: show only compatible side-2 pins."""
+        ref = self._pin_info("side1", self.side1_pin_combo.currentData())
+        self._fill_pin_combo(self.side2_pin_combo, self._side2_pins, reference=ref)
+
+    def _on_side2_pin_changed(self, index):
+        """A side-2 pin was picked: show only compatible side-1 pins."""
+        ref = self._pin_info("side2", self.side2_pin_combo.currentData())
+        self._fill_pin_combo(self.side1_pin_combo, self._side1_pins, reference=ref)
+
     def load_side1_pins(self):
         """Load pins based on selected Side 1 connector."""
-        self.side1_pin_combo.clear()
-        
         con_id = self.side1_connector_combo.currentData()
         if con_id is None or not _ensure_project_selected():
             return
-            
+
         project_id = get_current_project_id()
-        
+
         try:
             with get_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT id, pin_number, name FROM pins WHERE connector_id = %s AND project_id = %s ORDER BY pin_number", (con_id, project_id))
-                self.side1_pin_combo.addItem("Select Pin", None)
-                for pin_id, pin_number, pin_name in cur.fetchall():
-                    display_text = f"Pin {pin_number}: {pin_name}" if pin_name else f"Pin {pin_number}"
-                    self.side1_pin_combo.addItem(display_text, pin_id)
+                cur.execute(
+                    "SELECT id, pin_number, name, pin_type, is_ground, value "
+                    "FROM pins WHERE connector_id = %s AND project_id = %s ORDER BY pin_number",
+                    (con_id, project_id),
+                )
+                self._side1_pins = [
+                    {
+                        "id": pid,
+                        "pin_number": num,
+                        "name": pname,
+                        "pin_type": ptype,
+                        "is_ground": bool(isg) if isg is not None else False,
+                        "value": val,
+                    }
+                    for pid, num, pname, ptype, isg, val in cur.fetchall()
+                ]
         except Exception as e:
             print(f"Error loading pins: {e}")
+            self._side1_pins = []
+
+        # Restrict to pins compatible with the currently selected side-2 pin
+        ref = self._pin_info("side2", self.side2_pin_combo.currentData())
+        self._fill_pin_combo(self.side1_pin_combo, self._side1_pins, reference=ref)
 
     # 10. اصلاح متد load_side2_modules
     def load_side2_modules(self):
@@ -444,31 +548,46 @@ class AddInterfaceDialog(QDialog):
     # 12. اصلاح متد load_side2_pins
     def load_side2_pins(self):
         """Load pins based on selected Side 2 connector."""
-        self.side2_pin_combo.clear()
-        
         con_id = self.side2_connector_combo.currentData()
         if con_id is None or not _ensure_project_selected():
             return
-            
+
         project_id = get_current_project_id()
-        
+
         try:
             with get_connection() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT id, pin_number, name FROM pins WHERE connector_id = %s AND project_id = %s ORDER BY pin_number", (con_id, project_id))
-                self.side2_pin_combo.addItem("Select Pin", None)
-                for pin_id, pin_number, pin_name in cur.fetchall():
-                    display_text = f"Pin {pin_number}: {pin_name}" if pin_name else f"Pin {pin_number}"
-                    self.side2_pin_combo.addItem(display_text, pin_id)
+                cur.execute(
+                    "SELECT id, pin_number, name, pin_type, is_ground, value "
+                    "FROM pins WHERE connector_id = %s AND project_id = %s ORDER BY pin_number",
+                    (con_id, project_id),
+                )
+                self._side2_pins = [
+                    {
+                        "id": pid,
+                        "pin_number": num,
+                        "name": pname,
+                        "pin_type": ptype,
+                        "is_ground": bool(isg) if isg is not None else False,
+                        "value": val,
+                    }
+                    for pid, num, pname, ptype, isg, val in cur.fetchall()
+                ]
         except Exception as e:
             print(f"Error loading pins: {e}")
+            self._side2_pins = []
+
+        # Restrict to pins compatible with the currently selected side-1 pin
+        ref = self._pin_info("side1", self.side1_pin_combo.currentData())
+        self._fill_pin_combo(self.side2_pin_combo, self._side2_pins, reference=ref)
 
     def get_data(self):
-        """Return (pin1_id, pin2_id, hex_color) or None on invalid."""
+        """Return (pin1_id, pin2_id, hex_color, current_mA) or None on invalid."""
         p1 = self.side1_pin_combo.currentData()
         p2 = self.side2_pin_combo.currentData()
         if p1 is None or p2 is None or p1 == p2:
             QMessageBox.warning(self, "Selection Error", "Please select two different pins.")
             return None
         color = PREDEFINED_COLORS[self.color_combo.currentIndex()][1]
-        return p1, p2, color
+        current = self.current_spin.value()
+        return p1, p2, color, current
