@@ -9,11 +9,12 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt5.QtWidgets import QMessageBox
 
 from database import (
-    get_connection, get_all_modes, create_mode, delete_mode,
+    get_connection, get_all_modes,
     get_mode_modules, save_mode_positions, get_mode_positions,
     clear_mode_positions
 )
 from auth_manager import auth
+from suggestions import propose_mode_change
 
 
 # Import here to avoid circular imports
@@ -130,8 +131,8 @@ class ModeController(QObject):
     
     def handle_mode_creation(self):
         """New: ask only for name, then blank scene for live build."""
-        if not auth.is_system():
-            QMessageBox.warning(self.parent(), "Access denied", "Only 'system' can create a mode.")
+        if not auth.is_logged_in():
+            QMessageBox.warning(self.parent(), "Access denied", "Please log in first.")
             return
 
         if not self.mode_manager:
@@ -187,8 +188,8 @@ class ModeController(QObject):
     
     def handle_mode_delete(self):
         """Process mode deletion"""
-        if not auth.is_system():
-            QMessageBox.warning(self.parent(), "Access denied", "Only 'system' can delete modes.")
+        if not auth.is_logged_in():
+            QMessageBox.warning(self.parent(), "Access denied", "Please log in first.")
             return
 
         if not self.mode_manager:
@@ -233,12 +234,15 @@ class ModeController(QObject):
                     self.modeDeleted.emit(mode_name)
             
             if deleted_modes:
-                if len(deleted_modes) == 1:
-                    QMessageBox.information(self.parent(), "Success", 
-                                          f"Mode '{deleted_modes[0]}' deleted successfully!")
+                if auth.is_system():
+                    msg = (f"Mode '{deleted_modes[0]}' deleted successfully!"
+                           if len(deleted_modes) == 1
+                           else f"{len(deleted_modes)} modes deleted successfully!")
                 else:
-                    QMessageBox.information(self.parent(), "Success", 
-                                          f"{len(deleted_modes)} modes deleted successfully!")
+                    msg = (f"Mode '{deleted_modes[0]}' delete submitted for approval."
+                           if len(deleted_modes) == 1
+                           else f"{len(deleted_modes)} mode deletes submitted for approval.")
+                QMessageBox.information(self.parent(), "Success", msg)
                 self._refresh_mode_list()
             else:
                 self._show_error("Failed to delete selected modes")
@@ -287,8 +291,8 @@ class ModeController(QObject):
             
     def handle_mode_save(self):
         """Persist current tree selection as mode's modules, then save positions."""
-        if not auth.is_system():
-            QMessageBox.warning(self.parent(), "Access denied", "Only 'system' can save a mode.")
+        if not auth.is_logged_in():
+            QMessageBox.warning(self.parent(), "Access denied", "Please log in first.")
             return
 
         if not self.current_mode:
@@ -307,16 +311,23 @@ class ModeController(QObject):
             QMessageBox.warning(self.parent(), "Empty", "Select at least one module for this mode.")
             return
 
-        # 1) upsert mode_modules
-        if not create_mode(self.current_mode, module_ids):
-            self._show_error("Saving modules failed.")
+        # 1) upsert mode_modules (system admins apply now, others suggest)
+        ok, msg = propose_mode_change("create", self.current_mode, module_ids)
+        if not ok:
+            self._show_error(msg)
             return
 
-        # 2) save current positions to mode_positions
+        # 2) save current positions to mode_positions (only when the mode is
+        # actually in the DB — pending suggestions aren't approved yet)
         try:
-            self.mode_manager.save_current_positions_to_mode(self.current_mode)
-            QMessageBox.information(self.parent(), "Saved",
-                                    f"Mode '{self.current_mode}' saved (modules + positions).")
+            if auth.is_system():
+                self.mode_manager.save_current_positions_to_mode(self.current_mode)
+                QMessageBox.information(self.parent(), "Saved",
+                                        f"Mode '{self.current_mode}' saved (modules + positions).")
+            else:
+                QMessageBox.information(self.parent(), "Submitted",
+                                        f"Mode '{self.current_mode}' modules submitted for approval.\n"
+                                        f"Save again after the system admin approves it to capture the position layout.")
             # refresh list (in case first time saved)
             self._refresh_mode_list()
         except Exception as e:
@@ -407,16 +418,16 @@ class ModeManager(QObject):
         return get_all_modes()
     
     def create_mode(self, mode_name, module_ids):
-        """Create a new mode with specified modules"""
-        success = create_mode(mode_name, module_ids)
+        """Create/update a mode — admins apply now, others submit a suggestion."""
+        success, _msg = propose_mode_change("create", mode_name, module_ids)
         if success:
             self.modeCreated.emit(mode_name)
             self.modeListUpdated.emit()
         return success
     
     def delete_mode(self, mode_name):
-        """Delete a mode and all its data"""
-        success = delete_mode(mode_name)
+        """Delete a mode and all its data — admins apply now, others suggest."""
+        success, _msg = propose_mode_change("delete", mode_name)
         if success:
             self.modeDeleted.emit(mode_name)
             self.modeListUpdated.emit()

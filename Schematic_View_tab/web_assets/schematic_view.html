@@ -68,6 +68,26 @@
   body.dragging-connection .pin-circle {
     cursor: crosshair !important;
   }
+  /* While dragging a connection, dim pins that cannot be dropped on and
+     glow the compatible (same-type) ones. */
+  body.dragging-connection .pin-circle {
+    opacity: 0.35;
+  }
+  body.dragging-connection .pin-circle.pin-compatible {
+    opacity: 1;
+    stroke: #4ade80;
+    stroke-width: 2.5;
+  }
+  /* The compatible-glow stroke lives on the <g>, but the per-shape CSS rules
+     beat inherited group values, so target the shapes explicitly too. */
+  body.dragging-connection .pin-circle.pin-compatible .pin-data-shape,
+  body.dragging-connection .pin-circle.pin-compatible .pin-power-shape {
+    stroke: #4ade80;
+    stroke-width: 2.5;
+  }
+  body.dragging-connection .pin-circle.pin-compatible .pin-ground-line {
+    stroke: #4ade80;
+  }
 
   /* ========= Module Styles ========= */
   .module-box { cursor: move; }
@@ -120,12 +140,82 @@
   }
 
   /* ========= Pin Styles ========= */
+  /* Each pin is a <g.pin-circle> holding a type-specific symbol. The class
+     name is kept so highlight / cursor / read-only behavior still applies. */
   .pin-circle {
-    fill: var(--accent); stroke: var(--primary-dark); stroke-width: 1.5;
     cursor: crosshair;
+  }
+  .pin-circle .pin-hit {
+    fill: transparent;
+    pointer-events: all;
+    cursor: crosshair;
+  }
+  .pin-circle .pin-data-shape {
+    fill: var(--accent);
+    stroke: var(--primary-dark);
+    stroke-width: 1.5;
+  }
+  .pin-circle .pin-power-shape {
+    fill: #e74c3c;
+    stroke: var(--primary-dark);
+    stroke-width: 1.2;
+  }
+  .pin-circle .pin-ground-line {
+    stroke: var(--text-primary);
+    stroke-width: 1.5;
+    stroke-linecap: round;
   }
   .pin-label {
     fill: var(--text-primary); font-size: 9px; pointer-events: none;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* ========= Pending Approval (suggested changes) ========= */
+  /* Non-admin edits are shown optimistically with these markers until the
+     system admin approves them. Pending = dashed amber; pending delete =
+     ghosted red. */
+  .pending-badge {
+    fill: #ffd76e;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  g.pending .module-rect,
+  g.pending .connector-line {
+    stroke: #ffd76e;
+    stroke-dasharray: 6 3;
+    stroke-width: 1.5;
+  }
+  g.pending .connector-bbox {
+    stroke: #ffd76e;
+    stroke-dasharray: 6 3;
+  }
+  g.pending-delete {
+    opacity: 0.35;
+  }
+  g.pending-delete .module-rect,
+  g.pending-delete .connector-line {
+    stroke: #e74c3c;
+    stroke-dasharray: 4 2;
+    stroke-width: 1.5;
+  }
+  g.pin-circle.pending * {
+    stroke: #ffd76e;
+    stroke-dasharray: 3 2;
+  }
+  path.interface-path.pending {
+    stroke: #ffd76e;
+    stroke-dasharray: 8 4;
+  }
+  path.interface-path.pending-delete {
+    opacity: 0.3;
+    stroke: #e74c3c;
+    stroke-dasharray: 4 3;
+  }
+  /* Data-type caption (UART, I2C, …) drawn on the module-edge side of the pin */
+  .pin-type-label {
+    fill: var(--text-primary); font-size: 8px; font-style: italic;
+    letter-spacing: 0.3px; opacity: 0.6; pointer-events: none;
     font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
     -webkit-user-select: none;
     user-select: none;
@@ -160,6 +250,21 @@
   .interface-path.interface-powered:hover {
     stroke-width: 3.5;
     filter: drop-shadow(0 0 10px rgba(241, 196, 15, 0.85));
+  }
+  /* Connection current label drawn on the wire (current lives on the connection) */
+  .wire-current-label {
+    fill: var(--accent);
+    font-size: 9px;
+    font-weight: 600;
+    opacity: 0.92;
+    pointer-events: none;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    -webkit-user-select: none;
+    user-select: none;
+    paint-order: stroke;
+    stroke: var(--primary-dark);
+    stroke-width: 3px;
+    stroke-linejoin: round;
   }
   @keyframes power-wire-pulse {
     0%, 100% { filter: drop-shadow(0 0 3px rgba(241, 196, 15, 0.4)); }
@@ -388,6 +493,13 @@
     margin-bottom: 4px;
     opacity: 0.8;
   }
+  .modal-hint {
+    color: var(--text-primary);
+    opacity: 0.7;
+    font-size: 12px;
+    line-height: 1.45;
+    margin: 0 0 12px 0;
+  }
 
   .modal-field input[type="text"],
   .modal-field input[type="number"],
@@ -422,6 +534,21 @@
   .modal-field select option {
     background: var(--primary-dark);
     color: var(--text-primary);
+  }
+
+  /* Two-stage pin type selector: category combo + concrete-type combo on
+     one row (mirrors the Architecture tab's Data→type / Power→VCC/GND). */
+  .modal-field .pin-type-selector {
+    display: flex;
+    gap: 8px;
+  }
+  .modal-field .pin-type-selector select {
+    width: auto;
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .modal-field .pin-type-selector select.pin-type-cat {
+    flex: 0 0 96px;
   }
 
   .modal-field .color-presets {

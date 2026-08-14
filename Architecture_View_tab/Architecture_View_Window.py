@@ -39,6 +39,7 @@ from database import (
 )
 from auth_manager import auth
 from access_control import can_edit_subsystem
+from suggestions import suggest_change, pending_tree_rows
 from Architecture_View_tab.Module_Dialog import ModuleDialog
 from Architecture_View_tab.Connector_Dialog import ConnectorDialog
 from Architecture_View_tab.Pin_Dialog import PinDialog
@@ -489,10 +490,9 @@ class ArchitectureViewTab(QWidget):
                 "Pin #",
                 "Pin Type",
                 "Voltage(V)",
-                "Current(mA)",
             ]
         )
-        self.data_tree.setColumnCount(10)
+        self.data_tree.setColumnCount(9)
 
         # تنظیمات هدر
         header = self.data_tree.header()
@@ -651,11 +651,92 @@ class ArchitectureViewTab(QWidget):
                 connector_rows = cur.fetchall()
 
                 cur.execute(
-                    "SELECT id, name, pin_number, pin_type, is_ground, value, current, connector_id "
+                    "SELECT id, name, pin_number, pin_type, is_ground, value, connector_id "
                     "FROM pins WHERE project_id = %s ORDER BY connector_id, pin_number",
                     (pid,),
                 )
                 pin_rows = cur.fetchall()
+
+                # ---- Optimistic preview: merge the current user's pending
+                # suggestions on top of the DB rows (adds/updates/deletes).
+                # Non-system users see their own suggested changes here,
+                # clearly marked; the DB is untouched until the admin approves.
+                pending_overlay = pending_tree_rows(pid) if not auth.is_system() else None
+                if pending_overlay:
+                    # pending module adds → synthesize rows
+                    for add in pending_overlay["module"]["adds"]:
+                        module_rows.append(
+                            (add.get("temp_id"), add.get("name", "Untitled"),
+                             add.get("subsystem_id"), add.get("mass", 0.0) or 0.0,
+                             add.get("power", 0.0) or 0.0, 0, add.get("color"))
+                        )
+                    for mid, f in pending_overlay["module"]["updates"].items():
+                        for i, r in enumerate(module_rows):
+                            if r[0] != mid:
+                                continue
+                            rr = list(r)
+                            if f.get("name") is not None: rr[1] = f["name"]
+                            if f.get("mass") is not None: rr[3] = f["mass"]
+                            if f.get("power") is not None: rr[4] = f["power"]
+                            if f.get("color") is not None: rr[6] = f["color"]
+                            module_rows[i] = tuple(rr)
+                    # pending connector adds
+                    for add in pending_overlay["connector"]["adds"]:
+                        connector_rows.append(
+                            (add.get("temp_id"), add.get("name", "Connector"),
+                             add.get("module_id"), int(add.get("number_of_pins", 0) or 0),
+                             add.get("color"))
+                        )
+                    for cid, f in pending_overlay["connector"]["updates"].items():
+                        for i, r in enumerate(connector_rows):
+                            if r[0] != cid:
+                                continue
+                            rr = list(r)
+                            if f.get("name") is not None: rr[1] = f["name"]
+                            if f.get("color") is not None: rr[4] = f["color"]
+                            connector_rows[i] = tuple(rr)
+                    # pending pin adds
+                    for add in pending_overlay["pin"]["adds"]:
+                        pin_rows.append(
+                            (add.get("temp_id"), add.get("name", "Pin"),
+                             None, add.get("pin_type"), bool(add.get("is_ground", False)),
+                             add.get("value"), add.get("connector_id"))
+                        )
+                    for p_id, f in pending_overlay["pin"]["updates"].items():
+                        for i, r in enumerate(pin_rows):
+                            if r[0] != p_id:
+                                continue
+                            rr = list(r)
+                            if f.get("name") is not None: rr[1] = f["name"]
+                            if f.get("pin_type") is not None: rr[3] = f["pin_type"]
+                            if "is_ground" in f: rr[4] = bool(f["is_ground"])
+                            if f.get("value") is not None: rr[5] = f["value"]
+                            pin_rows[i] = tuple(rr)
+
+                    # pending-delete id sets (kept rows are ghosted in the tree)
+                    module_deleted = pending_overlay["module"]["deletes"]
+                    connector_deleted = pending_overlay["connector"]["deletes"]
+                    pin_deleted = pending_overlay["pin"]["deletes"]
+                else:
+                    module_deleted = connector_deleted = pin_deleted = set()
+
+                # pending-state lookups: id -> 'create' | 'update' | 'delete'
+                module_pending = {}
+                connector_pending = {}
+                pin_pending = {}
+                if pending_overlay:
+                    for add in pending_overlay["module"]["adds"]:
+                        module_pending[add["temp_id"]] = "create"
+                    module_pending.update({mid: "update" for mid in pending_overlay["module"]["updates"]})
+                    module_pending.update({mid: "delete" for mid in module_deleted})
+                    for add in pending_overlay["connector"]["adds"]:
+                        connector_pending[add["temp_id"]] = "create"
+                    connector_pending.update({cid: "update" for cid in pending_overlay["connector"]["updates"]})
+                    connector_pending.update({cid: "delete" for cid in connector_deleted})
+                    for add in pending_overlay["pin"]["adds"]:
+                        pin_pending[add["temp_id"]] = "create"
+                    pin_pending.update({p: "update" for p in pending_overlay["pin"]["updates"]})
+                    pin_pending.update({p: "delete" for p in pin_deleted})
 
                 modules_by_subsystem = {}
                 for row in module_rows:
@@ -669,13 +750,14 @@ class ArchitectureViewTab(QWidget):
 
                 pins_by_connector = {}
                 for pin_row in pin_rows:
-                    _, _, _, _, _, _, _, connector_id = pin_row
+                    # pin_rows: (id, name, pin_number, pin_type, is_ground, value, connector_id)
+                    _, _, _, _, _, _, connector_id = pin_row
                     pins_by_connector.setdefault(connector_id, []).append(pin_row)
 
                 for sub_id, sub_name in subsystem_rows:
                     sub_item = QTreeWidgetItem(
                         self.data_tree,
-                        [f"◻️ {sub_name}", "Subsystem", "", "", "", "", "", "", "", ""],
+                        [f"◻️ {sub_name}", "Subsystem", "", "", "", "", "", "", ""],
                     )
                     sub_item.setFont(0, subsystem_font)
                     sub_item.setData(0, Qt.UserRole, sub_id)
@@ -693,7 +775,12 @@ class ArchitectureViewTab(QWidget):
                         nconn,
                         color,
                     ) in enumerate(modules_by_subsystem.get(sub_id, []), start=1):
-                        display_name = f"{mod_index}. {name}"
+                        pstate = module_pending.get(mod_id)
+                        marker = (
+                            "⏳ " if pstate in ("create", "update")
+                            else ("🗑️ " if pstate == "delete" else "")
+                        )
+                        display_name = f"{mod_index}. {marker}{name}"
                         mod_item = QTreeWidgetItem(
                             sub_item,
                             [
@@ -706,7 +793,6 @@ class ArchitectureViewTab(QWidget):
                                 "",
                                 "",
                                 "",
-                                "",
                             ],
                         )
                         mod_item.setFont(0, module_font)
@@ -715,9 +801,17 @@ class ArchitectureViewTab(QWidget):
                         mod_item.setIcon(4, self._get_color_icon(color or "#C8C8FF"))
                         mod_item.setData(0, Qt.UserRole, mod_id)
                         mod_item.setData(0, Qt.UserRole + 1, ITEM_TYPE_MODULE)
-                        mod_item.setForeground(
-                            0, QColor(theme_manager.get_color("text_secondary"))
-                        )
+                        if pstate == "delete":
+                            _f = QFont(module_font)
+                            _f.setStrikeOut(True)
+                            mod_item.setFont(0, _f)
+                            mod_item.setForeground(0, QColor("#e74c3c"))
+                        elif pstate:
+                            mod_item.setForeground(0, QColor("#ffd76e"))
+                        else:
+                            mod_item.setForeground(
+                                0, QColor(theme_manager.get_color("text_secondary"))
+                            )
 
                         for conn_index, (
                             cid,
@@ -729,7 +823,12 @@ class ArchitectureViewTab(QWidget):
                             pin_rows_for_connector = pins_by_connector.get(cid, [])
                             used = len(pin_rows_for_connector)
 
-                            display_cname = f"{conn_index}. {cname}"
+                            cstate = connector_pending.get(cid)
+                            cmarker = (
+                                "⏳ " if cstate in ("create", "update")
+                                else ("🗑️ " if cstate == "delete" else "")
+                            )
+                            display_cname = f"{conn_index}. {cmarker}{cname}"
                             conn_item = QTreeWidgetItem(
                                 mod_item,
                                 [
@@ -740,7 +839,6 @@ class ArchitectureViewTab(QWidget):
                                     "",
                                     "",
                                     f"{used}/{total_pins or 0}",
-                                    "",
                                     "",
                                     "",
                                 ],
@@ -755,7 +853,15 @@ class ArchitectureViewTab(QWidget):
                             )
                             conn_item.setData(0, Qt.UserRole, cid)
                             conn_item.setData(0, Qt.UserRole + 1, ITEM_TYPE_CONNECTOR)
-                            conn_item.setForeground(0, QColor("#7f8c8d"))
+                            if cstate == "delete":
+                                _f = QFont(connector_font)
+                                _f.setStrikeOut(True)
+                                conn_item.setFont(0, _f)
+                                conn_item.setForeground(0, QColor("#e74c3c"))
+                            elif cstate:
+                                conn_item.setForeground(0, QColor("#ffd76e"))
+                            else:
+                                conn_item.setForeground(0, QColor("#7f8c8d"))
 
                             for pin_index, (
                                 pid_row,
@@ -764,7 +870,6 @@ class ArchitectureViewTab(QWidget):
                                 ptype,
                                 isg,
                                 val,
-                                curm,
                                 _,
                             ) in enumerate(pin_rows_for_connector, start=1):
                                 if (ptype or "").lower() == "voltage":
@@ -772,10 +877,12 @@ class ArchitectureViewTab(QWidget):
                                     vstr = "" if isg else (f"{(val or 0):.2f}")
                                 else:
                                     tstr, vstr = (ptype or ""), ""
-                                curr_text = (
-                                    f"{(curm or 0):.2f}" if curm is not None else ""
+                                pstate2 = pin_pending.get(pid_row)
+                                pmarker = (
+                                    "⏳ " if pstate2 in ("create", "update")
+                                    else ("🗑️ " if pstate2 == "delete" else "")
                                 )
-                                display_pname = f"{pin_index}. {pname}"
+                                display_pname = f"{pin_index}. {pmarker}{pname}"
                                 pin_item = QTreeWidgetItem(
                                     conn_item,
                                     [
@@ -788,7 +895,6 @@ class ArchitectureViewTab(QWidget):
                                         str(pnum if pnum is not None else ""),
                                         tstr,
                                         vstr,
-                                        curr_text,
                                     ],
                                 )
                                 pin_item.setFont(0, pin_font)
@@ -798,7 +904,15 @@ class ArchitectureViewTab(QWidget):
                                 pin_item.setCheckState(0, Qt.Unchecked)
                                 pin_item.setData(0, Qt.UserRole, pid_row)
                                 pin_item.setData(0, Qt.UserRole + 1, ITEM_TYPE_PIN)
-                                pin_item.setForeground(0, QColor("#95a5a6"))
+                                if pstate2 == "delete":
+                                    _f = QFont(pin_font)
+                                    _f.setStrikeOut(True)
+                                    pin_item.setFont(0, _f)
+                                    pin_item.setForeground(0, QColor("#e74c3c"))
+                                elif pstate2:
+                                    pin_item.setForeground(0, QColor("#ffd76e"))
+                                else:
+                                    pin_item.setForeground(0, QColor("#95a5a6"))
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load data:\n{e}")
@@ -1158,7 +1272,7 @@ class ArchitectureViewTab(QWidget):
             with get_connection() as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT name, pin_number, pin_type, is_ground, value, current, description, connector_id "
+                    "SELECT name, pin_number, pin_type, is_ground, value, description, connector_id "
                     "FROM pins WHERE id = %s AND project_id = %s",
                     (pid_row, pid),
                 )
@@ -1177,10 +1291,9 @@ class ArchitectureViewTab(QWidget):
             "pin_type": row[2],
             "is_ground": row[3],
             "value": row[4],
-            "current": row[5],
-            "description": row[6],
+            "description": row[5],
         }
-        dlg = PinDialog(pin_data=data, connector_id=row[7], parent=self)
+        dlg = PinDialog(pin_data=data, connector_id=row[6], parent=self)
         auto_style_widget(dlg)
         dlg.pins_updated.connect(self.load_data_tree)
         dlg.exec_()
@@ -1249,43 +1362,67 @@ class ArchitectureViewTab(QWidget):
                 if it.data(0, Qt.UserRole + 1) != ITEM_TYPE_SUBSYSTEM
             ]
 
+            is_system = auth.is_system()
+            need_reload = bool(subsystem_items)
             self.data_tree.blockSignals(True)
-            # Regular module/connector/pin deletions
-            with get_connection() as conn:
-                cur = conn.cursor()
+            if is_system:
+                # System admin: delete directly from the DB.
+                with get_connection() as conn:
+                    cur = conn.cursor()
+                    for it in regular_items:
+                        t = it.data(0, Qt.UserRole + 1)
+                        iid = it.data(0, Qt.UserRole)
+
+                        if t == ITEM_TYPE_PIN:
+                            cur.execute(
+                                "DELETE FROM pins WHERE id = %s AND project_id = %s",
+                                (iid, pid),
+                            )
+
+                        elif t == ITEM_TYPE_CONNECTOR:
+                            cur.execute(
+                                "DELETE FROM connectors WHERE id = %s AND project_id = %s",
+                                (iid, pid),
+                            )
+
+                        elif t == ITEM_TYPE_MODULE:
+                            cur.execute(
+                                "DELETE FROM modules WHERE id = %s AND project_id = %s",
+                                (iid, pid),
+                            )
+
+                        parent = it.parent()
+                        if parent is None:
+                            top_index = self.data_tree.indexOfTopLevelItem(it)
+                            if top_index >= 0:
+                                self.data_tree.takeTopLevelItem(top_index)
+                        else:
+                            parent_index = parent.indexOfChild(it)
+                            if parent_index >= 0:
+                                parent.takeChild(parent_index)
+
+                    conn.commit()
+            else:
+                # Non-admin: every deletion becomes a suggestion awaiting
+                # system-admin approval (the tree preview ghosts the rows).
                 for it in regular_items:
                     t = it.data(0, Qt.UserRole + 1)
                     iid = it.data(0, Qt.UserRole)
-
                     if t == ITEM_TYPE_PIN:
-                        cur.execute(
-                            "DELETE FROM pins WHERE id = %s AND project_id = %s",
-                            (iid, pid),
-                        )
-
+                        suggest_change("pin", "delete", iid, get_pin_subsystem_id(iid),
+                                       {"id": iid}, f"Delete pin #{iid}")
                     elif t == ITEM_TYPE_CONNECTOR:
-                        cur.execute(
-                            "DELETE FROM connectors WHERE id = %s AND project_id = %s",
-                            (iid, pid),
-                        )
-
+                        suggest_change("connector", "delete", iid, get_connector_subsystem_id(iid),
+                                       {"id": iid}, f"Delete connector #{iid}")
                     elif t == ITEM_TYPE_MODULE:
-                        cur.execute(
-                            "DELETE FROM modules WHERE id = %s AND project_id = %s",
-                            (iid, pid),
-                        )
-
-                    parent = it.parent()
-                    if parent is None:
-                        top_index = self.data_tree.indexOfTopLevelItem(it)
-                        if top_index >= 0:
-                            self.data_tree.takeTopLevelItem(top_index)
-                    else:
-                        parent_index = parent.indexOfChild(it)
-                        if parent_index >= 0:
-                            parent.takeChild(parent_index)
-
-                conn.commit()
+                        suggest_change("module", "delete", iid, get_module_subsystem_id(iid),
+                                       {"id": iid}, f"Delete module #{iid}")
+                need_reload = True
+                QMessageBox.information(
+                    self, "Submitted",
+                    f"{len(regular_items)} deletion(s) submitted for system-admin approval."
+                    " They will be applied once approved.",
+                )
 
             # Subsystem deletions: full cascade via the guarded DB helper
             for it in subsystem_items:
@@ -1311,8 +1448,8 @@ class ArchitectureViewTab(QWidget):
             return
 
         # Reload the tree so the UI matches the database exactly
-        # (a subsystem deletion removes a whole subtree at once)
-        if subsystem_items:
+        # (subsystem deletion removes a whole subtree; suggestions show ghosts)
+        if need_reload:
             self.load_data_tree()
         self._checked.clear()
         self._rebuild_checked_list()
@@ -1393,7 +1530,6 @@ class ArchitectureViewTab(QWidget):
                         "Pin Number",
                         "Pin Format/Type",
                         "Pin Voltage(V)",
-                        "Pin Current(mA)",
                     ]
                 )
 
@@ -1402,7 +1538,7 @@ class ArchitectureViewTab(QWidget):
                     subsys = subsys_item.text(0).replace("🏢 ", "")
 
                     if subsys_item.childCount() == 0:
-                        writer.writerow([subsys] + [""] * 13)
+                        writer.writerow([subsys] + [""] * 12)
                         continue
 
                     for j in range(subsys_item.childCount()):
@@ -1422,7 +1558,7 @@ class ArchitectureViewTab(QWidget):
                         if mod_item.childCount() == 0:
                             writer.writerow(
                                 [subsys, module, m_mass, m_power, m_color, m_nconn]
-                                + [""] * 8
+                                + [""] * 7
                             )
                             continue
 
@@ -1453,7 +1589,7 @@ class ArchitectureViewTab(QWidget):
                                         conn_color,
                                         conn_pins,
                                     ]
-                                    + [""] * 5
+                                    + [""] * 4
                                 )
                                 continue
 
@@ -1479,7 +1615,6 @@ class ArchitectureViewTab(QWidget):
                                         pin_item.text(6),
                                         pin_item.text(7),
                                         pin_item.text(8),
-                                        pin_item.text(9),
                                     ]
                                 )
 
@@ -1515,7 +1650,6 @@ class ArchitectureViewTab(QWidget):
             "Pin Number",
             "Pin Format/Type",
             "Pin Voltage(V)",
-            "Pin Current(mA)",
         ]
         ws.append(headers)
 
@@ -1559,7 +1693,7 @@ class ArchitectureViewTab(QWidget):
                                 ccolor,
                                 ctotal,
                             ]
-                            + [""] * 5
+                            + [""] * 4
                         )
                     else:
                         for m in range(conn_item.childCount()):
@@ -1580,7 +1714,6 @@ class ArchitectureViewTab(QWidget):
                                     pin.text(6),
                                     pin.text(7),
                                     pin.text(8),
-                                    pin.text(9),
                                 ]
                             )
 

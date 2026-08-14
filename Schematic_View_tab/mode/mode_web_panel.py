@@ -19,10 +19,11 @@ from styles.theme_manager import theme_manager
 from styles.design_system import BorderRadius, Typography, Spacing
 
 from database import (
-    get_all_modes, create_mode, delete_mode, get_mode_modules,
+    get_all_modes, get_mode_modules,
     get_current_project_id, get_connection,
 )
 from auth_manager import auth
+from suggestions import propose_mode_change
 
 
 def _validate_module_ids(module_ids):
@@ -186,8 +187,8 @@ class ModeWebPanel(QFrame):
     # ------------------------------------------------------------------
     def _on_create(self):
         """Create a new mode from the current tree selection."""
-        if not auth.has_perm("mode.edit"):
-            QMessageBox.warning(self, "Access Denied", "Only 'system' can create modes.")
+        if not auth.is_logged_in():
+            QMessageBox.warning(self, "Access Denied", "Please log in first.")
             return
 
         name, ok = QInputDialog.getText(self, "New Mode", "Mode name:")
@@ -222,18 +223,18 @@ class ModeWebPanel(QFrame):
             if not valid_ids:
                 return
 
-        if create_mode(name, valid_ids):
+        ok, msg = propose_mode_change("create", name, valid_ids)
+        if ok:
             self.modeCreated.emit(name)
             self.refresh_modes()
-            QMessageBox.information(self, "Mode Created",
-                                    f"Mode '{name}' created with {len(module_ids)} module(s).")
+            QMessageBox.information(self, "Mode Created", msg)
         else:
-            QMessageBox.warning(self, "Error", f"Failed to create mode '{name}'.")
+            QMessageBox.warning(self, "Error", msg)
 
     def _on_delete(self):
         """Delete selected mode(s)."""
-        if not auth.has_perm("mode.edit"):
-            QMessageBox.warning(self, "Access Denied", "Only 'system' can delete modes.")
+        if not auth.is_logged_in():
+            QMessageBox.warning(self, "Access Denied", "Please log in first.")
             return
 
         selected = self._get_selected_mode_names()
@@ -250,7 +251,8 @@ class ModeWebPanel(QFrame):
             return
 
         mode_name = selected[0]
-        if delete_mode(mode_name):
+        ok, msg = propose_mode_change("delete", mode_name)
+        if ok:
             # If current mode was deleted, exit it
             if self._current_mode == mode_name:
                 self._current_mode = None
@@ -259,7 +261,7 @@ class ModeWebPanel(QFrame):
             self.modeDeleted.emit(mode_name)
             self.refresh_modes()
         else:
-            QMessageBox.warning(self, "Error", f"Failed to delete mode '{mode_name}'.")
+            QMessageBox.warning(self, "Error", msg)
 
     def _on_enter(self):
         """Enter the selected mode — filter tree to that mode's modules."""
@@ -297,8 +299,8 @@ class ModeWebPanel(QFrame):
 
     def _on_save(self):
         """Save current tree selection (modules) and positions into the mode."""
-        if not auth.has_perm("mode.edit"):
-            QMessageBox.warning(self, "Access Denied", "Only 'system' can save modes.")
+        if not auth.is_logged_in():
+            QMessageBox.warning(self, "Access Denied", "Please log in first.")
             return
 
         if not self._current_mode:
@@ -326,15 +328,13 @@ class ModeWebPanel(QFrame):
             if not valid_ids:
                 return
 
-        if create_mode(self._current_mode, valid_ids):
+        ok, msg = propose_mode_change("create", self._current_mode, valid_ids)
+        if ok:
             self.modeSaved.emit(self._current_mode)
             self.refresh_modes()
-            QMessageBox.information(
-                self, "Mode Saved",
-                f"Mode '{self._current_mode}' saved with {len(valid_ids)} module(s).",
-            )
+            QMessageBox.information(self, "Mode Saved", msg)
         else:
-            QMessageBox.warning(self, "Error", "Failed to save mode.")
+            QMessageBox.warning(self, "Error", msg)
 
     def _on_exit(self):
         """Exit the current mode — restore the previous tree selection."""
@@ -399,10 +399,12 @@ class ModeWebPanel(QFrame):
 
     def _apply_access_policy(self):
         """Enable/disable edit buttons based on auth."""
-        can_edit = auth.has_perm("mode.edit")
-        self._btn_create.setEnabled(can_edit)
-        self._btn_delete.setEnabled(can_edit)
-        self._btn_save.setEnabled(can_edit)
+        # Every logged-in user can propose mode changes; the system admin
+        # approves them in the Reviews tab.
+        can_propose = auth.is_logged_in()
+        self._btn_create.setEnabled(can_propose)
+        self._btn_delete.setEnabled(can_propose)
+        self._btn_save.setEnabled(can_propose)
 
     # ------------------------------------------------------------------
     # Styling

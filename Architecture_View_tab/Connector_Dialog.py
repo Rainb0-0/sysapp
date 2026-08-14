@@ -32,6 +32,12 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from database import get_connection, get_current_project_id, get_connector_subsystem_id
 from access_control import guard_write, can_edit_subsystem
 from auth_manager import auth
+from suggestions import suggest_change
+
+SUBMITTED_MSG = (
+    "Change submitted for approval — it will apply once the system admin "
+    "approves it."
+)
 
 from Architecture_View_tab.table_navigation import (
     NavigableLineEdit,
@@ -847,6 +853,33 @@ class ConnectorDialog(QDialog):
         cid = item.get("id")
         is_existing = bool(cid)
 
+        if not auth.is_system():
+            # Non-admin: record the change as a suggestion instead of writing.
+            parent_module = getattr(self, "module_combo", None)
+            module_id = parent_module.currentData()
+            if isinstance(module_id, dict):
+                module_id = module_id.get("id")
+            if module_id is None:
+                module_id = getattr(self, "_initial_module_id", None)
+            if is_existing:
+                suggest_change("connector", "update", cid, subsystem_id,
+                               {"id": cid,
+                                "fields": {"name": name, "number_of_pins": num_pins,
+                                            "color": color}},
+                               f"Edit connector '{name}'")
+            else:
+                suggest_change("connector", "create", None, subsystem_id,
+                               {"module_id": module_id, "name": name, "side": "top",
+                                "color": color, "number_of_pins": num_pins},
+                               f"Add connector '{name}'")
+            if show_message:
+                QMessageBox.information(self, "Submitted", SUBMITTED_MSG)
+            self._changed_rows.discard(row)
+            if hasattr(self, "table"):
+                self.table.viewport().update()
+            self.connectors_updated.emit()
+            return
+
         if is_existing:
             try:
                 with get_connection() as conn:
@@ -913,6 +946,46 @@ class ConnectorDialog(QDialog):
             return True
         if not self._ensure_project_selected():
             return False
+
+        if not auth.is_system():
+            # Non-admin: every row becomes a suggestion (no DB writes).
+            subsystem_id = getattr(self, "subsystem_id", None)
+            suggested = 0
+            for row in rows:
+                item = self.model.item(row)
+                if not item:
+                    continue
+                name = item.get("name", "").strip()
+                if not name:
+                    continue
+                try:
+                    num_pins = int(item.get("num_pins", 0) or 0)
+                except Exception:
+                    num_pins = 0
+                color = item.get("color", "Default")
+                cid = item.get("id")
+                if cid:
+                    c2 = suggest_change("connector", "update", cid, subsystem_id,
+                                        {"id": cid,
+                                         "fields": {"name": name, "number_of_pins": num_pins,
+                                                     "color": color}},
+                                        f"Edit connector '{name}'")
+                else:
+                    module_id = getattr(self, "module_id", None) or getattr(self, "_initial_module_id", None)
+                    c2 = suggest_change("connector", "create", None, subsystem_id,
+                                        {"module_id": module_id, "name": name, "side": "top",
+                                         "color": color, "number_of_pins": num_pins},
+                                        f"Add connector '{name}'")
+                if c2 is not None:
+                    suggested += 1
+            QMessageBox.information(self, "Submitted", SUBMITTED_MSG)
+            for row in rows:
+                self._changed_rows.discard(row)
+            if hasattr(self, "table"):
+                self.table.viewport().update()
+            self.connectors_updated.emit()
+            return True
+
         project_id = get_current_project_id()
         try:
             with get_connection() as conn:
@@ -1083,6 +1156,13 @@ class ConnectorDialog(QDialog):
                     if reply == QMessageBox.Yes:
                         cid = item.get("id") if item else None
                         if cid:
+                            if not auth.is_system():
+                                suggest_change("connector", "delete", cid, subsystem_id,
+                                               {"id": cid},
+                                               f"Delete connector '{item.get('name', '')}'")
+                                empty_new_rows.append(row)
+                                self.connectors_updated.emit()
+                                continue
                             try:
                                 with get_connection() as conn:
                                     cur = conn.cursor()

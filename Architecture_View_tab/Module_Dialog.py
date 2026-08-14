@@ -37,7 +37,13 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from database import get_connection, get_current_project_id, get_module_subsystem_id
 from access_control import guard_write, can_edit_subsystem
 from auth_manager import auth
+from suggestions import suggest_change
 from util import profile
+
+SUBMITTED_MSG = (
+    "Change submitted for approval — it will apply once the system admin "
+    "approves it."
+)
 from Architecture_View_tab.table_navigation import (
     NavigableLineEdit,
     NavigableSpinBox,
@@ -842,6 +848,18 @@ class ModuleDialog(QDialog):
         mid = item.get("id") if item else None
 
         if mid:
+            if not auth.is_system():
+                # Non-admin: deletion becomes a suggestion awaiting approval.
+                suggest_change("module", "delete", mid, subsystem_id,
+                               {"id": mid},
+                               f"Delete module '{item.get('name', '')}'")
+                QMessageBox.information(self, "Submitted", SUBMITTED_MSG)
+                self.model.removeRowItem(row)
+                self._changed_rows = {
+                    r if r < row else r - 1 for r in self._changed_rows if r != row
+                }
+                self.modules_updated.emit()
+                return
             try:
                 with get_connection() as conn:
                     cur = conn.cursor()
@@ -1057,6 +1075,28 @@ class ModuleDialog(QDialog):
         mid = item.get("id")
         is_existing = bool(mid)
 
+        if not auth.is_system():
+            # Non-admin: record the change as a suggestion instead of writing.
+            fields = {
+                "name": name, "mass": mass, "power": power,
+                "num_connectors": num_conn, "color": color, "photo": photo,
+            }
+            if is_existing:
+                suggest_change("module", "update", mid, subsystem_id,
+                               {"id": mid, "fields": fields},
+                               f"Edit module '{name}'")
+            else:
+                fields["subsystem_id"] = sid
+                suggest_change("module", "create", None, subsystem_id,
+                               fields, f"Add module '{name}'")
+            if show_message:
+                QMessageBox.information(self, "Submitted", SUBMITTED_MSG)
+            self._changed_rows.discard(row)
+            if hasattr(self, "table"):
+                self.table.viewport().update()
+            self.modules_updated.emit()
+            return
+
         if is_existing:
             try:
                 with get_connection() as conn:
@@ -1140,6 +1180,49 @@ class ModuleDialog(QDialog):
             return True
         if not self._ensure_project_selected():
             return False
+
+        if not auth.is_system():
+            # Non-admin: every row becomes a suggestion (no DB writes).
+            sid = self.subsystem_combo.currentData()
+            subsystem_id = getattr(self, "subsystem_id", None) or sid
+            suggested = 0
+            for row in rows:
+                item = self.model.item(row)
+                if not item:
+                    continue
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                try:
+                    mass = float(item.get("mass", 0) or 0)
+                    power = float(item.get("power", 0) or 0)
+                except Exception:
+                    mass, power = 0.0, 0.0
+                num_conn = int(item.get("num_connectors", 0) or 0)
+                color = item.get("color", "")
+                photo = item.get("photo", "")
+                mid = item.get("id")
+                fields = {"name": name, "mass": mass, "power": power,
+                          "num_connectors": num_conn, "color": color,
+                          "photo": photo}
+                if mid:
+                    cid2 = suggest_change("module", "update", mid, subsystem_id,
+                                          {"id": mid, "fields": fields},
+                                          f"Edit module '{name}'")
+                else:
+                    fields["subsystem_id"] = sid
+                    cid2 = suggest_change("module", "create", None, subsystem_id,
+                                          fields, f"Add module '{name}'")
+                if cid2 is not None:
+                    suggested += 1
+            QMessageBox.information(self, "Submitted", SUBMITTED_MSG)
+            for row in rows:
+                self._changed_rows.discard(row)
+            if hasattr(self, "table"):
+                self.table.viewport().update()
+            self.modules_updated.emit()
+            return True
+
         project_id = get_current_project_id()
         sid = self.subsystem_combo.currentData()
         try:
@@ -1342,6 +1425,16 @@ class ModuleDialog(QDialog):
                     if reply == QMessageBox.Yes:
                         mid = item.get("id") if item else None
                         if mid:
+                            if not auth.is_system():
+                                # Non-admin: propose the deletion instead.
+                                suggest_change(
+                                    "module", "delete", mid, subsystem_id,
+                                    {"id": mid},
+                                    f"Delete module '{item.get('name', '')}'",
+                                )
+                                empty_new_rows.append(row)
+                                self.modules_updated.emit()
+                                continue
                             try:
                                 with get_connection() as conn:
                                     cur = conn.cursor()

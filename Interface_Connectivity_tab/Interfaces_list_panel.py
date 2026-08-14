@@ -9,10 +9,8 @@ from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from auth_manager import auth
-from database import (
-    get_connection, get_current_project_id,
-    add_interface_guarded, update_interface_guarded, delete_interface_guarded
-)
+from database import get_connection, get_current_project_id
+from suggestions import propose_interface_change
 from Interface_Connectivity_tab.wiring_utils import (AddInterfaceDialog, get_all_pins_with_full_numbered_name,
                            color_icon, PREDEFINED_COLORS, CenteredIconDelegate)
 
@@ -158,10 +156,11 @@ class InterfacesListPanel(QWidget):
     def create_table_widget(self, layout):
         """ایجاد ویجت جدول"""
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
+        self.table.setColumnCount(10)
         self.table.setHorizontalHeaderLabels([
             "Subsystem 1", "Module 1", "Connector 1", "Pin 1",
-            "Subsystem 2", "Module 2", "Connector 2", "Pin 2", "Connection Color"
+            "Subsystem 2", "Module 2", "Connector 2", "Pin 2",
+            "Connection Color", "Current (mA)"
         ])
         
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -309,7 +308,7 @@ class InterfacesListPanel(QWidget):
                     SELECT 
                         s1.name, m1.name, c1.name, p1.id,
                         s2.name, m2.name, c2.name, p2.id,
-                        con.id, con.color
+                        con.id, con.color, con.current
                     FROM interfaces con
                     JOIN pins p1 ON con.pin1_id = p1.id AND p1.project_id = %s
                     JOIN connectors c1 ON p1.connector_id = c1.id AND c1.project_id = %s
@@ -328,7 +327,7 @@ class InterfacesListPanel(QWidget):
             return
 
         self.table.setRowCount(len(rows))
-        for row, (s1, m1, c1, p1, s2, m2, c2, p2, iface_id, color) in enumerate(rows):
+        for row, (s1, m1, c1, p1, s2, m2, c2, p2, iface_id, color, cur_mA) in enumerate(rows):
             self.table.setRowHeight(row, 40)
             p1_display = " ".join(all_pins_map.get(p1, "Unknown Pin").split(' ')[-2:])
             p2_display = " ".join(all_pins_map.get(p2, "Unknown Pin").split(' ')[-2:])
@@ -352,6 +351,11 @@ class InterfacesListPanel(QWidget):
             color_item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, 8, color_item)
 
+            cur_item = QTableWidgetItem(f"{cur_mA or 0:g}")
+            cur_item.setTextAlignment(Qt.AlignCenter)
+            cur_item.setFont(QFont("Roboto Mono", 11))
+            self.table.setItem(row, 9, cur_item)
+
             # Store iface_id in the first column as hidden data
             item = self.table.item(row, 0)
             if item:
@@ -368,19 +372,17 @@ class InterfacesListPanel(QWidget):
     def handle_add(self):
         if not self._ensure_project_selected():
             return
-        if not auth.is_system():
-            QMessageBox.warning(self, "Access denied", "Only 'system' can add interfaces.")
-            return
 
-        project_id = get_current_project_id()
         dialog = AddInterfaceDialog(self)
         auto_style_widget(dialog)
 
         if dialog.exec_() == QDialog.Accepted:
             data = dialog.get_data()
             if data:
-                pin1_id, pin2_id, color = data
-                ok, msg = add_interface_guarded(auth.user_id, pin1_id, pin2_id, color, project_id)
+                pin1_id, pin2_id, color, current = data
+                # System admins write straight to the DB; everyone else's
+                # change is recorded as a suggestion for approval.
+                ok, msg = propose_interface_change("create", pin1_id, pin2_id, color, current)
                 if ok:
                     QMessageBox.information(self, "Success", msg)
                     self.load_interfaces()
@@ -389,9 +391,6 @@ class InterfacesListPanel(QWidget):
                     QMessageBox.information(self, "Info", msg)
     def handle_edit(self):
         if not self._ensure_project_selected():
-            return
-        if not auth.is_system():
-            QMessageBox.warning(self, "Access denied", "Only 'system' can edit interfaces.")
             return
 
         project_id = get_current_project_id()
@@ -407,7 +406,7 @@ class InterfacesListPanel(QWidget):
             with get_connection() as conn:
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT p1.id, p2.id, con.color
+                    SELECT p1.id, p2.id, con.color, con.current
                     FROM interfaces con
                     JOIN pins p1 ON con.pin1_id = p1.id
                     JOIN pins p2 ON con.pin2_id = p2.id
@@ -420,10 +419,11 @@ class InterfacesListPanel(QWidget):
         if not data:
             QMessageBox.critical(self, "Error", "Could not find the selected interface in the database.")
             return
-        pin1_id, pin2_id, color = data
+        pin1_id, pin2_id, color, cur_mA = data
 
         dialog = AddInterfaceDialog(self)
         auto_style_widget(dialog)
+        dialog.current_spin.setValue(float(cur_mA or 0.0))
 
         # Load pin details for Side 1 (pin1_id)
         try:
@@ -507,8 +507,10 @@ class InterfacesListPanel(QWidget):
         if dialog.exec_() == QDialog.Accepted:
             new_data = dialog.get_data()
             if new_data:
-                new_pin1_id, new_pin2_id, new_color = new_data
-                ok, msg = update_interface_guarded(auth.user_id, iface_id, new_pin1_id, new_pin2_id, new_color, project_id)
+                new_pin1_id, new_pin2_id, new_color, new_current = new_data
+                ok, msg = propose_interface_change(
+                    "update", new_pin1_id, new_pin2_id, new_color, new_current, iface_id=iface_id
+                )
                 if ok:
                     QMessageBox.information(self, "Success", msg)
                     self.load_interfaces()
@@ -520,11 +522,7 @@ class InterfacesListPanel(QWidget):
     def handle_delete(self):
         if not self._ensure_project_selected():
             return
-        if not auth.is_system():
-            QMessageBox.warning(self, "Access denied", "Only 'system' can delete interfaces.")
-            return
 
-        project_id = get_current_project_id()
         selected = self.table.selectionModel().selectedRows()
         if not selected:
             QMessageBox.warning(self, "Selection Error", "Please select at least one Interface to delete.")
@@ -537,17 +535,21 @@ class InterfacesListPanel(QWidget):
         if confirm != QMessageBox.Yes:
             return
 
-        try:
-            with get_connection() as conn:
-                for index in selected:
-                    row = index.row()
-                    iface_id = self.table.item(row, 0).data(Qt.UserRole)
-                    delete_interface_guarded(auth.user_id, iface_id, project_id)
-            QMessageBox.information(self, "Success", "Selected interfaces deleted.")
-            self.load_interfaces()
-            self.interface_changed.emit()
-        except Exception as e:
-            QMessageBox.critical(self, "Database Error", f"Failed to delete: {e}")
+        # System admins delete directly; others submit suggestions.
+        for index in selected:
+            row = index.row()
+            iface_id = self.table.item(row, 0).data(Qt.UserRole)
+            ok, msg = propose_interface_change("delete", None, None, iface_id=iface_id)
+            if not ok:
+                QMessageBox.warning(self, "Cannot Delete", msg)
+                return
+        self.load_interfaces()
+        self.interface_changed.emit()
+        QMessageBox.information(
+            self, "Success",
+            "Selected interfaces deleted." if auth.is_system()
+            else "Delete change(s) submitted for system-admin approval.",
+        )
 
     def handle_export_csv(self):
         """
@@ -567,7 +569,7 @@ class InterfacesListPanel(QWidget):
                 writer = csv.writer(csvfile)
                 writer.writerow([
                     "Subsystem 1", "Module 1", "Connector 1", "Pin 1",
-                    "Subsystem 2", "Module 2", "Connector 2", "Pin 2", "Color"
+                    "Subsystem 2", "Module 2", "Connector 2", "Pin 2", "Color", "Current (mA)"
                 ])
                 for row in range(self.table.rowCount()):
                     row_data = [self.table.item(row, col).text() if self.table.item(row, col) else ""
@@ -581,23 +583,20 @@ class InterfacesListPanel(QWidget):
                         color = result[0] if result else "#0000FF"
                     
                     color_name = next((name for name, hex_code in PREDEFINED_COLORS if hex_code == color), "Unknown")
-                    row_data[-1] = color_name
+                    row_data[8] = color_name  # Color column (Current (mA) is the last one)
                     writer.writerow(row_data)
             QMessageBox.information(self, "Success", "Interfaces exported to CSV successfully.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to export CSV: {e}")
 
     def handle_double_click(self, row, col):
-        if not auth.is_system():
-            QMessageBox.warning(self, "Access denied", "Only 'system' can edit interfaces.")
-            return
         self.table.selectRow(row)
         self.handle_edit()
 
     def apply_access_policy(self):
-        is_sys = auth.is_system()
-        # Only system can add/edit/delete; export always enabled
-        self.add_btn.setEnabled(is_sys)
-        self.edit_btn.setEnabled(is_sys)
-        self.delete_btn.setEnabled(is_sys)
+        # Every logged-in user can propose interface changes; the system
+        # admin approves them in the Reviews tab. Export is always enabled.
+        self.add_btn.setEnabled(auth.is_logged_in())
+        self.edit_btn.setEnabled(auth.is_logged_in())
+        self.delete_btn.setEnabled(auth.is_logged_in())
         self.export_btn.setEnabled(True)

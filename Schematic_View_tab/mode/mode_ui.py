@@ -676,11 +676,13 @@ class ModeDialog(QDialog):
             if w is not None:
                 w.setEnabled(enabled)
 
-        can_edit_modes = auth.has_perm("mode.edit")
+        # Every logged-in user can propose mode changes; the system admin
+        # approves them in the Reviews tab.
+        can_propose = auth.is_logged_in()
         # Adjust names to your actual buttons:
-        _set_enabled("btn_mode_new", can_edit_modes)
-        _set_enabled("btn_mode_save", can_edit_modes)
-        _set_enabled("btn_mode_delete", can_edit_modes)
+        _set_enabled("btn_mode_new", can_propose)
+        _set_enabled("btn_mode_save", can_propose)
+        _set_enabled("btn_mode_delete", can_propose)
 
 
 
@@ -1216,22 +1218,23 @@ class ModeGraphics(QWidget):
 
     def apply_access_policy(self):
         """
-        Only 'system' can create/delete/save.
+        Every logged-in user can propose create/delete/save; the system
+        admin approves them in the Reviews tab.
         Everyone can enter/exit and view.
         """
         try:
-            is_sys = bool(getattr(auth, "is_system", lambda: False)())
+            can_propose = bool(getattr(auth, "is_logged_in", lambda: False)())
         except Exception:
-            is_sys = False
+            can_propose = False
 
-        # Create/Delete only for system
+        # Create/Delete/Save available to any logged-in user (as suggestions)
         if hasattr(self, "create_mode_btn"):
-            self.create_mode_btn.setEnabled(is_sys)
+            self.create_mode_btn.setEnabled(can_propose)
         if hasattr(self, "delete_mode_btn"):
-            self.delete_mode_btn.setEnabled(is_sys)
+            self.delete_mode_btn.setEnabled(can_propose)
 
         if hasattr(self, "save_pos_btn"):
-            self.save_pos_btn.setEnabled(is_sys)
+            self.save_pos_btn.setEnabled(can_propose)
 
         if hasattr(self, "enter_exit_btn"):
             self.enter_exit_btn.setEnabled(True)

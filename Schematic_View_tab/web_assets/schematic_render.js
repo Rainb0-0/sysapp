@@ -648,7 +648,11 @@ function renderSubsystemHalos(scene) {
 
     // Build pin->subsystem lookup ONCE for all groups (performance)
     var pinModMap = _buildPinToSubsystem(scene);
-    const haloGroup = g.append('g').attr('class', 'subsystem-halos');
+    // SVG paints later siblings on top, and some paths (module drag end,
+    // connector side-change) remove + re-render this group, which would
+    // otherwise append it on top of modules/wires. `.lower()` re-inserts it
+    // as the first child of `g` so halos always sit beneath everything.
+    const haloGroup = g.append('g').attr('class', 'subsystem-halos').lower();
 
     Object.keys(groups).forEach(function (ssId) {
         const group = groups[ssId];
@@ -1023,84 +1027,53 @@ function _buildPowerLookup(scene) {
     return _powerLookupCache;
 }
 
-// Compute per-module pin power — only counts pins connected via an interface
-// to a voltage pin belonging to the "Power" subsystem. Disconnected pins or
-// pins connected to non-Power subsystems contribute nothing.
-// Voltage is in V, current is in mA → voltage * current = power in mW.
-function computeModulePinPower(modId, scene) {
+// Compute connected power — voltage × current — where the current now lives
+// on the CONNECTION (interfaces.current), not on the pins. Only interfaces
+// whose voltage pin belongs to the "Power" subsystem contribute, matching
+// the pre-existing HUD behavior. Voltage is in V, current in mA → mW.
+function _computeConnectedPower(scene, modId) {
     var lookup = _buildPowerLookup(scene);
     if (lookup === null) return 0;
 
     var pinToSubsystem = lookup.pinToSubsystem;
-    var pinInterfaces = lookup.pinInterfaces;
     var powerSubsystemId = lookup.powerSubsystemId;
 
+    var pinMod = {};
+    var voltByPin = {};
+    scene.connectors.forEach(function (c) {
+        (c.pins || []).forEach(function (p) {
+            pinMod[p.id] = c.module_id;
+            voltByPin[p.id] = Number(p.voltage) || 0;
+        });
+    });
+
     var total = 0.0;
-    for (var ci = 0; ci < scene.connectors.length; ci++) {
-        var c = scene.connectors[ci];
-        if (String(c.module_id) !== String(modId)) continue;
-        for (var pi = 0; pi < c.pins.length; pi++) {
-            var p = c.pins[pi];
-            var v = Number(p.voltage) || 0;
-            var i = Number(p.current) || 0;
-            if (v === 0 || i === 0) continue;
+    scene.interfaces.forEach(function (iface) {
+        var cur = Number(iface.current) || 0;
+        if (cur <= 0) return;
 
-            // Pin must be connected to something via an interface
-            var connectedPins = pinInterfaces[p.id];
-            if (!connectedPins) continue;
+        var aIsPower = pinToSubsystem[iface.from_pin] === powerSubsystemId;
+        var bIsPower = pinToSubsystem[iface.to_pin] === powerSubsystemId;
+        if (!aIsPower && !bIsPower) return;
 
-            // At least one connected pin must belong to the Power subsystem
-            var hasPowerConnection = false;
-            for (var cp = 0; cp < connectedPins.length; cp++) {
-                if (pinToSubsystem[connectedPins[cp]] === powerSubsystemId) {
-                    hasPowerConnection = true;
-                    break;
-                }
-            }
+        var v = aIsPower ? (voltByPin[iface.from_pin] || 0) : (voltByPin[iface.to_pin] || 0);
+        if (v <= 0) return;
 
-            if (hasPowerConnection) {
-                total += v * i;
-            }
-        }
-    }
+        var loadPin = aIsPower ? iface.to_pin : iface.from_pin;
+        if (modId != null && String(pinMod[loadPin]) !== String(modId)) return;
+        total += v * cur;
+    });
     return total;
 }
 
-// Compute the total connected pin power across ALL modules currently in the scene.
+// Per-module connected pin power (used in the module info labels).
+function computeModulePinPower(modId, scene) {
+    return _computeConnectedPower(scene, modId);
+}
+
+// Total connected pin power across ALL modules currently in the scene.
 function computeTotalScenePower(scene) {
-    var lookup = _buildPowerLookup(scene);
-    if (lookup === null) return 0;
-
-    var pinToSubsystem = lookup.pinToSubsystem;
-    var pinInterfaces = lookup.pinInterfaces;
-    var powerSubsystemId = lookup.powerSubsystemId;
-
-    var total = 0.0;
-    for (var ci = 0; ci < scene.connectors.length; ci++) {
-        var c = scene.connectors[ci];
-        for (var pi = 0; pi < c.pins.length; pi++) {
-            var p = c.pins[pi];
-            var v = Number(p.voltage) || 0;
-            var i = Number(p.current) || 0;
-            if (v === 0 || i === 0) continue;
-
-            var connectedPins = pinInterfaces[p.id];
-            if (!connectedPins) continue;
-
-            var hasPowerConnection = false;
-            for (var cp = 0; cp < connectedPins.length; cp++) {
-                if (pinToSubsystem[connectedPins[cp]] === powerSubsystemId) {
-                    hasPowerConnection = true;
-                    break;
-                }
-            }
-
-            if (hasPowerConnection) {
-                total += v * i;
-            }
-        }
-    }
-    return total;
+    return _computeConnectedPower(scene, null);
 }
 
 // Update the power HUD in the top-right corner.
@@ -1151,12 +1124,30 @@ function renderModules(scene) {
             showModuleContextMenu(event, d);
         });
 
+    // Pending markers: edits/creates awaiting system-admin approval are
+    // dashed amber; pending deletions are ghosted red.
+    moduleSel
+        .classed('pending', function (d) { return d.pending && d.pending !== 'delete'; })
+        .classed('pending-delete', function (d) { return d.pending_delete || d.pending === 'delete'; });
+
     var modRect = moduleSel.append('rect')
         .attr('class', 'module-rect')
         .attr('width', d => Math.max(MODULE_MIN_WIDTH, d.width))
         .attr('height', d => Math.max(MODULE_MIN_HEIGHT, d.height))
         .attr('rx', 6).attr('ry', 6)
         .attr('fill', d => d.color || '#e67e22');
+
+    // "⏳ pending" badge for proposed changes
+    moduleSel.filter(function (d) { return d.pending && d.pending !== 'delete'; })
+        .append('text')
+        .attr('class', 'pending-badge')
+        .attr('x', d => Math.max(MODULE_MIN_WIDTH, d.width) - 6)
+        .attr('y', 4)
+        .attr('text-anchor', 'end')
+        .attr('font-size', 9)
+        .attr('font-weight', '700')
+        .attr('fill', '#ffd76e')
+        .text('⏳ pending');
 
     modRect.append('title')
         .text(d => {
@@ -1236,10 +1227,12 @@ function renderModules(scene) {
 
         // Use tree-view colors: orange for module fill, green for connector strokes, red for pins
         const connectorColor = c.color || '#27ae60';   // tree view connector color, fallback to green
-        const pinColor = '#e74c3c';         // tree view pin color
 
         // Connector interactive group — contains visible line, handle, hitbox
-        var connGroup = parent.append('g').attr('class', 'connector-interactive');
+        var connPendingCls = (c.pending || c.pending_delete)
+            ? (c.pending === 'delete' || c.pending_delete ? ' pending-delete' : ' pending')
+            : '';
+        var connGroup = parent.append('g').attr('class', 'connector-interactive' + connPendingCls);
 
         // --- Connector bounding box (visible background rect) ---
         const bbox = connectorBBox(module, c);
@@ -1323,15 +1316,27 @@ function renderModules(scene) {
             const px = mid.x + tangent.x * offset;
             const py = mid.y + tangent.y * offset;
 
-            var pinCircle = parent.append('circle')
-                .attr('class', 'pin-circle')
+            // Distinct symbols per electrical class (data / VCC / GND).
+            // The group keeps the `pin-circle` class so highlight / cursor /
+            // read-only behavior driven by that class keeps working.
+            const pcls = pinClassOf(p);
+            var pinPendingCls = (p.pending || p.pending_delete)
+                ? (p.pending === 'delete' || p.pending_delete ? ' pending-delete' : ' pending')
+                : '';
+            var pinG = parent.append('g')
+                .attr('class', 'pin-circle pin-' + pcls.cls + pinPendingCls)
                 .attr('data-pin-id', p.id)
-                .attr('cx', px).attr('cy', py)
-                .attr('fill', pinColor)
-                .attr('r', PIN_RADIUS);
-            pinCircle.append('title').text(p.name + ' | Connector: ' + c.name);
-            pinCircle.on('mousedown', function (event) {
+                .attr('transform', 'translate(' + px + ',' + py + ')');
+            appendPinSymbol(pinG, pcls);
+            // Invisible hit area so grabbing the exact symbol is easy
+            pinG.append('circle').attr('class', 'pin-hit').attr('r', PIN_RADIUS);
+            pinG.append('title').text(p.name + ' | Connector: ' + c.name);
+            pinG.on('mousedown', function (event) {
                     event.stopPropagation();
+                    if (p.pending || p.pending_delete) {
+                        showToast('This pin is pending approval', 'error');
+                        return;
+                    }
                     startConnectDrag(p.id, px, py, parent);
                 })
                 .on('mouseup', function (event) {
@@ -1357,6 +1362,25 @@ function renderModules(scene) {
                 .attr('text-anchor', anchor)
                 .attr('dominant-baseline', 'middle')
                 .text(p.name);
+
+            // Data pins also show a small caption with their concrete type
+            // (UART, I2C, …) on the side facing the module edge. The generic
+            // "Data" type is skipped to avoid noise.
+            if (pcls.cls === 'data' && String(p.pin_type || '').trim().toUpperCase() !== 'DATA') {
+                var tDx = 0, tDy = 0, tAnchor = 'middle';
+                if (side === 'right') { tDx = -PIN_RADIUS - 4; tAnchor = 'end'; }
+                else if (side === 'left') { tDx = PIN_RADIUS + 4; tAnchor = 'start'; }
+                else if (side === 'top') { tDy = PIN_RADIUS + 4; }
+                else { tDy = -PIN_RADIUS - 4; }
+                parent.append('text')
+                    .attr('class', 'pin-type-label')
+                    .attr('data-pin-id', p.id)
+                    .attr('x', px + tDx)
+                    .attr('y', py + tDy)
+                    .attr('text-anchor', tAnchor)
+                    .attr('dominant-baseline', 'middle')
+                    .text(p.pin_type);
+            }
         });
     });
 }
@@ -1409,6 +1433,94 @@ function connectorBBox(module, c) {
 }
 
 // ---------------------------------------------------------------------
+// Same-type wiring rule (mirrors database.pins_connectable_from_data)
+// ---------------------------------------------------------------------
+var GROUND_ALIASES = ['GND', 'GROUND', 'VSS', 'AGND', 'DGND'];
+var POWER_ALIASES = ['VCC', 'VDD', 'POWER', 'PWR', 'VOLTAGE'];
+
+function pinClassOf(p) {
+    var t = String((p && p.pin_type) || '').trim().toUpperCase();
+    if (p && (p.is_ground || GROUND_ALIASES.indexOf(t) >= 0)) {
+        return { cls: 'ground', type: t || 'GND', voltage: 0 };
+    }
+    if (POWER_ALIASES.indexOf(t) >= 0) {
+        return { cls: 'power', type: t, voltage: Number(p.voltage) || 0 };
+    }
+    if (!t) return { cls: 'untyped', type: '' };
+    return { cls: 'data', type: t };
+}
+
+// Draw the electrical-class symbol inside a pin group (centered on 0,0):
+//   data   → rounded square
+//   power  → upward triangle (VCC)
+//   ground → classic three-bar ground symbol
+function appendPinSymbol(g, pcls) {
+    if (pcls.cls === 'ground') {
+        g.append('line').attr('class', 'pin-ground-line').attr('x1', 0).attr('y1', -3).attr('x2', 0).attr('y2', 4);
+        g.append('line').attr('class', 'pin-ground-line').attr('x1', -3).attr('y1', 4).attr('x2', 3).attr('y2', 4);
+        g.append('line').attr('class', 'pin-ground-line').attr('x1', -5).attr('y1', 7).attr('x2', 5).attr('y2', 7);
+        g.append('line').attr('class', 'pin-ground-line').attr('x1', -7).attr('y1', 10).attr('x2', 7).attr('y2', 10);
+        return;
+    }
+    if (pcls.cls === 'power') {
+        g.append('path').attr('class', 'pin-power-shape').attr('d', 'M0,-6 L5,3 L-5,3 Z');
+        return;
+    }
+    g.append('rect').attr('class', 'pin-data-shape')
+        .attr('x', -4.5).attr('y', -4.5).attr('width', 9).attr('height', 9).attr('rx', 1.5);
+}
+
+// Same-type wiring rule. NOTE: keep in sync with database.classify_pin /
+// database.pins_connectable_from_data — the DB is the source of truth and
+// re-validates on every create/update; this copy only drives the UI
+// (highlight + friendly drop rejection).
+function pinsCompatible(a, b) {
+    if (!a || !b) return { ok: false, reason: 'Unknown pin.' };
+    var ca = pinClassOf(a), cb = pinClassOf(b);
+    if (ca.cls === 'untyped' || cb.cls === 'untyped') {
+        return { ok: false, reason: 'Set a pin type (GND, VCC/voltage or a data type) before connecting.' };
+    }
+    if (ca.cls === 'ground' || cb.cls === 'ground') {
+        if (ca.cls === 'ground' && cb.cls === 'ground') return { ok: true, reason: '' };
+        return { ok: false, reason: 'Ground pins can only connect to other ground pins.' };
+    }
+    if (ca.cls === 'power' || cb.cls === 'power') {
+        if (ca.cls !== 'power' || cb.cls !== 'power') {
+            return { ok: false, reason: 'Voltage (VCC) pins can only connect to other voltage pins.' };
+        }
+        if (ca.voltage && cb.voltage && Math.abs(ca.voltage - cb.voltage) > 1e-6) {
+            return { ok: false, reason: 'Voltage pins must have the same voltage (' + ca.voltage + 'V ≠ ' + cb.voltage + 'V).' };
+        }
+        return { ok: true, reason: '' };
+    }
+    if (ca.type !== cb.type) {
+        return { ok: false, reason: "'" + ca.type + "' pins can only connect to other '" + ca.type + "' pins (cannot connect '" + ca.type + "' to '" + cb.type + "')." };
+    }
+    return { ok: true, reason: '' };
+}
+
+function findPinById(pinId) {
+    var target = Number(pinId);
+    for (var ci = 0; ci < sceneData.connectors.length; ci++) {
+        var pins = sceneData.connectors[ci].pins || [];
+        for (var pi = 0; pi < pins.length; pi++) {
+            if (Number(pins[pi].id) === target) return pins[pi];
+        }
+    }
+    return null;
+}
+
+// Highlight the pins the user may drop on while a connect drag is active.
+function highlightCompatiblePins(fromPinId) {
+    var fromPin = findPinById(fromPinId);
+    g.selectAll('.pin-circle').classed('pin-compatible', function () {
+        var pid = Number(d3.select(this).attr('data-pin-id'));
+        if (pid === Number(fromPinId)) return false;
+        return pinsCompatible(fromPin, findPinById(pid)).ok;
+    });
+}
+
+// ---------------------------------------------------------------------
 // Pin-to-pin drag to create a new connection
 // ---------------------------------------------------------------------
 function startConnectDrag(pinId, localX, localY, moduleSelection) {
@@ -1423,6 +1535,7 @@ function startConnectDrag(pinId, localX, localY, moduleSelection) {
         .attr('d', `M${startAbs.x},${startAbs.y} L${startAbs.x},${startAbs.y}`);
 
     connectDrag = { fromPinId: pinId, fromPoint: startAbs, tempPath: tempPath };
+    highlightCompatiblePins(pinId);
 
     // Lock cursor to crosshair during connect drag so it does not flicker
     // between grab (SVG default) and crosshair (pin-circle) when hovering
@@ -1447,31 +1560,102 @@ function finishConnectDrag(toPinId) {
     cancelConnectDrag();
 
     if (!bridge || toPinId === fromPinId) return;
-    const newId = bridge.create_interface(fromPinId, toPinId, '');
-    if (newId > 0) {
-        // Immediately render the new interface so the user sees it right away
-        const pinLookup = buildPinLookup(sceneData);
-        const a = pinLookup[fromPinId];
-        const b = pinLookup[toPinId];
-        if (a && b) {
-            const obstacleRects = sceneData.modules.map(function (m) {
-                return { x: m.x, y: m.y, width: m.width, height: m.height };
-            });
-            const points = computeRoutePoints(a, b, obstacleRects);
-            sceneData.interfaces.push({
-                id: newId,
-                from_pin: fromPinId,
-                to_pin: toPinId,
-                color: '',
-                points: points.slice(),
-            });
-            // Re-render just the interface layer (no full scene rebuild)
-            g.select('.interfaces-layer').remove();
-            renderInterfaces(sceneData, pinLookup, new Set()); // don't reroute anything, use cached points
-        }
+
+    // Same-type wiring rule: only drop on a compatible pin.
+    var compat = pinsCompatible(findPinById(fromPinId), findPinById(toPinId));
+    if (!compat.ok) {
+        showToast(compat.reason || 'Pins are not compatible.', 'error');
+        return;
     }
-    // Refresh from DB in background to ensure routing persistence is consistent
-    setTimeout(function () { bridge.get_scene_data(); }, 50);
+
+    // The current is decided on the connection itself — ask for it now.
+    // If the user cancels, no connection is created.
+    promptConnectionCurrent(0, function (cur) {
+        const newId = bridge.create_interface(fromPinId, toPinId, '', cur);
+        if (newId > 0) {
+            // Immediately render the new interface so the user sees it right away
+            const pinLookup = buildPinLookup(sceneData);
+            const a = pinLookup[fromPinId];
+            const b = pinLookup[toPinId];
+            if (a && b) {
+                const obstacleRects = sceneData.modules.map(function (m) {
+                    return { x: m.x, y: m.y, width: m.width, height: m.height };
+                });
+                const points = computeRoutePoints(a, b, obstacleRects);
+                sceneData.interfaces.push({
+                    id: newId,
+                    from_pin: fromPinId,
+                    to_pin: toPinId,
+                    color: '',
+                    current: cur,
+                    points: points.slice(),
+                });
+                // Re-render just the interface layer (no full scene rebuild)
+                g.select('.interfaces-layer').remove();
+                renderInterfaces(sceneData, pinLookup, new Set()); // don't reroute anything, use cached points
+            }
+        }
+        // Refresh from DB in background to ensure routing persistence is consistent
+        setTimeout(function () { bridge.get_scene_data(); }, 50);
+    });
+}
+
+// Modal that asks for the connection current (mA) before a wire is created.
+// onConfirm receives the numeric mA value; canceling the dialog aborts.
+function promptConnectionCurrent(defaultValue, onConfirm) {
+    removeModal();
+
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    var dialog = document.createElement('div');
+    dialog.className = 'modal-dialog';
+
+    var title = document.createElement('h3');
+    title.textContent = 'Set Connection Current';
+    dialog.appendChild(title);
+
+    var hint = document.createElement('p');
+    hint.className = 'modal-hint';
+    hint.textContent = 'The current flows through this connection. Pins no longer carry their own current.';
+    dialog.appendChild(hint);
+
+    var field = createModalField(dialog, 'Current (mA)');
+    var input = document.createElement('input');
+    input.type = 'number';
+    input.min = '0';
+    input.step = '0.1';
+    input.value = (defaultValue != null && defaultValue > 0) ? defaultValue : '';
+    input.placeholder = 'e.g. 500';
+    field.appendChild(input);
+
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'modal-btn modal-btn-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', removeModal);
+    actions.appendChild(cancelBtn);
+
+    var okBtn = document.createElement('button');
+    okBtn.className = 'modal-btn modal-btn-primary';
+    okBtn.textContent = 'Create Connection';
+    okBtn.addEventListener('click', function () {
+        var val = parseFloat(input.value);
+        if (isNaN(val) || val < 0) val = 0;
+        removeModal();
+        onConfirm(val);
+    });
+    actions.appendChild(okBtn);
+
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    _modalEscHandler = function (e) { if (e.key === 'Escape') removeModal(); };
+    document.addEventListener('keydown', _modalEscHandler);
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) removeModal(); });
+    setTimeout(function () { input.focus(); }, 100);
 }
 
 function cancelConnectDrag() {
@@ -1479,6 +1663,7 @@ function cancelConnectDrag() {
     connectDrag = null;
     svg.on('mousemove.connect', null);
     svg.on('mouseup.connect', null);
+    g.selectAll('.pin-circle').classed('pin-compatible', false);
     // Release custom cursor so SVG/pin defaults take over again
     document.body.classList.remove('dragging-connection');
 }
@@ -1650,6 +1835,11 @@ function removeContextMenu() {
 function showModuleContextMenu(event, moduleDatum) {
     // If the module is not editable, show no context menu at all.
     if (moduleDatum.editable === false) return;
+    // Pending items cannot be edited until the system admin approves them.
+    if (moduleDatum.pending || moduleDatum.pending_delete) {
+        showToast('This item is pending approval', 'error');
+        return;
+    }
     showContextMenu(event, [
         { icon: '\u2795', label: 'Add Connector', action: function () { addConnectorPrompt(moduleDatum); }, shortcut: 'N' },
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showModuleEditDialog(moduleDatum); } },
@@ -1661,6 +1851,10 @@ function showConnectorContextMenu(event, connectorDatum) {
     // Derive editability from the parent module
     var parentModule = sceneData.modules.find(function (m) { return String(m.id) === String(connectorDatum.module_id); });
     if (!parentModule || parentModule.editable === false) return;
+    if (connectorDatum.pending || connectorDatum.pending_delete || parentModule.pending) {
+        showToast('This item is pending approval', 'error');
+        return;
+    }
     showContextMenu(event, [
         { icon: '\uD83D\uDD04', label: 'Reorder Pins', action: function () { openPinOrderDialog(connectorDatum); } },
         { icon: '\u2795', label: 'Add Pin', action: function () { addPinPrompt(connectorDatum); }, shortcut: 'N' },
@@ -1673,6 +1867,10 @@ function showPinContextMenu(event, pinDatum, connectorDatum) {
     // Derive editability from the parent module
     var parentModule = sceneData.modules.find(function (m) { return String(m.id) === String(connectorDatum.module_id); });
     if (!parentModule || parentModule.editable === false) return;
+    if (pinDatum.pending || pinDatum.pending_delete || connectorDatum.pending || parentModule.pending) {
+        showToast('This item is pending approval', 'error');
+        return;
+    }
     showContextMenu(event, [
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showPinEditDialog(pinDatum, connectorDatum); } },
         { icon: '\u274C', label: 'Delete', action: function () { deletePinConfirm(pinDatum); }, shortcut: 'Del' },
@@ -1890,8 +2088,11 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
         // display-only and never persisted.
         var displayPoints = isManual ? enforceOrthogonalRoute(points) : points;
         var isPowerIface = poweredInterfaceIds.has(iface.id);
+        var ifacePendingCls = (iface.pending || iface.pending_delete)
+            ? (iface.pending === 'delete' || iface.pending_delete ? ' pending-delete' : ' pending')
+            : '';
         var path = interfaceGroup.append('path')
-            .attr('class', isPowerIface ? 'interface-path interface-powered' : 'interface-path')
+            .attr('class', (isPowerIface ? 'interface-path interface-powered' : 'interface-path') + ifacePendingCls)
             .attr('data-interface-id', iface.id)
             .attr('d', line(displayPoints))
             .on('click', function (event) {
@@ -2130,7 +2331,32 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
                 })
             );
         })(iface, points, path, interfaceGroup, line);
+
+        // --- Wire current indicator ---
+        // The current belongs to the connection (set when it is created), so
+        // show it right on the wire: a small label at the route midpoint.
+        var wireCurrent = Number(iface.current) || 0;
+        if (wireCurrent > 0 && displayPoints && displayPoints.length >= 2) {
+            var midIdx = Math.floor((displayPoints.length - 1) / 2);
+            var midPt = displayPoints[midIdx];
+            var mx = midPt[0] !== undefined ? midPt[0] : midPt.x;
+            var my = midPt[1] !== undefined ? midPt[1] : midPt.y;
+            interfaceGroup.append('text')
+                .attr('class', 'wire-current-label')
+                .attr('data-interface-id', iface.id)
+                .attr('x', mx + 5)
+                .attr('y', my - 5)
+                .attr('text-anchor', 'middle')
+                .text(formatCurrentText(wireCurrent));
+        }
     });
+}
+
+// Human-friendly current label: A for >= 1000 mA, mA otherwise.
+function formatCurrentText(mA) {
+    mA = Number(mA) || 0;
+    if (mA >= 1000) return (mA / 1000) + ' A';
+    return (Math.round(mA * 10) / 10) + ' mA';
 }
 
 // Uses the ported A* orthogonal router from schematic_routing.js when
@@ -2237,16 +2463,25 @@ function computeRoutePoints(fromPin, toPin, obstacleRects) {
     return snapRoutePointsToGrid(direct);
 }
 
+// A module can be dragged/resized when it is editable and not a pending
+// create or pending delete. Pending *update* modules stay draggable: the
+// optimistic preview shows the proposed position, and a new drag simply
+// refreshes the pending suggestion (the bridge dedupes per module), so a
+// subsystem admin can keep arranging their own modules without waiting for
+// approval between every move.
+function isDraggableModule(d) {
+    if (IS_READONLY || d == null || d.editable === false) return false;
+    if (d.pending_delete || d.pending === 'create' || d.pending === 'delete') return false;
+    return true;
+}
+
 // ---------------------------------------------------------------------
 // Drag-to-move (auto-saves each module's new position on drag end)
 // ---------------------------------------------------------------------
 function dragBehavior() {
     return d3.drag()
         .filter(function (event, d) {
-            // Only allow dragging of editable modules, and never in
-            // read-only mode (the global IS_READONLY flag is the source of
-            // truth — `editable` can lag behind after an auth change).
-            return !IS_READONLY && d.editable !== false;
+            return isDraggableModule(d);
         })
         .on('start', function (event, d) {
             d3.select(this).raise();
@@ -2264,10 +2499,10 @@ function dragBehavior() {
                 selectedModuleIds = idsToMove;
                 g.selectAll('.module-box').classed('selected', function (dd) { return selectedModuleIds.has(dd.id); });
             }
-            // Filter out non-editable modules from batch move
+            // Filter out modules that can't move from a batch drag
             idsToMove.forEach(function (mid) {
                 var mod = sceneData.modules.find(function (m) { return m.id === mid; });
-                if (mod != null && mod.editable === false) {
+                if (mod != null && !isDraggableModule(mod)) {
                     idsToMove.delete(mid);
                 }
             });
@@ -2432,9 +2667,7 @@ function dragBehavior() {
 function resizeBehavior(direction) {
     return d3.drag()
         .filter(function (event, d) {
-            // Only allow resizing of editable modules, and never in
-            // read-only mode (see dragBehavior's filter for why).
-            return !IS_READONLY && d.editable !== false;
+            return isDraggableModule(d);
         })
         .on('start', function (event, d) {
             event.sourceEvent.stopPropagation();
@@ -2613,7 +2846,7 @@ function updateModuleConnectorsSvg(module, modGroup) {
             .attr('y', c.y + labelOffY)
             .attr('text-anchor', isHoriz ? 'start' : (side === 'left' ? 'end' : 'start'));
 
-        // 5. Update pin circles and labels
+        // 5. Update pin symbols and labels
         var count = c.pins.length;
         var mid = connectorBodyMidpoint(module, c);
 
@@ -2622,9 +2855,9 @@ function updateModuleConnectorsSvg(module, modGroup) {
             var px = mid.x + tangent.x * offset;
             var py = mid.y + tangent.y * offset;
 
-            // Move pin circle
-            modGroup.select('circle.pin-circle[data-pin-id="' + p.id + '"]')
-                .attr('cx', px).attr('cy', py);
+            // Move pin symbol group
+            modGroup.select('g.pin-circle[data-pin-id="' + p.id + '"]')
+                .attr('transform', 'translate(' + px + ',' + py + ')');
 
             // Move pin label
             var isVert = (side === 'top' || side === 'bottom');
@@ -2636,6 +2869,17 @@ function updateModuleConnectorsSvg(module, modGroup) {
                 .attr('x', px + labelDx)
                 .attr('y', py + labelDy)
                 .attr('text-anchor', anchor);
+
+            // Move data type caption
+            var tDx = 0, tDy = 0, tAnchor = 'middle';
+            if (side === 'right') { tDx = -PIN_RADIUS - 4; tAnchor = 'end'; }
+            else if (side === 'left') { tDx = PIN_RADIUS + 4; tAnchor = 'start'; }
+            else if (side === 'top') { tDy = PIN_RADIUS + 4; }
+            else { tDy = -PIN_RADIUS - 4; }
+            modGroup.select('text.pin-type-label[data-pin-id="' + p.id + '"]')
+                .attr('x', px + tDx)
+                .attr('y', py + tDy)
+                .attr('text-anchor', tAnchor);
         });
     });
 }
@@ -2726,6 +2970,14 @@ function updateInterfacesInPlace(movedModule) {
         var path = g.select('.interface-path[data-interface-id="' + iface.id + '"]');
         if (path.node()) {
             path.attr('d', line(points));
+        }
+        // Keep the wire current label glued to the route midpoint
+        var wl = g.select('.wire-current-label[data-interface-id="' + iface.id + '"]');
+        if (wl.node() && points.length >= 2) {
+            var li = Math.floor((points.length - 1) / 2);
+            var lp = points[li];
+            wl.attr('x', (lp[0] !== undefined ? lp[0] : lp.x) + 5)
+              .attr('y', (lp[1] !== undefined ? lp[1] : lp.y) - 5);
         }
     });
 }
@@ -2962,7 +3214,9 @@ function enableConnectorSideDrag(group, c, module) {
         .filter(function () {
             // Only allow dragging on editable modules, and never in
             // read-only mode (see dragBehavior's filter for why).
-            return !IS_READONLY && module.editable !== false;
+            // Pending connectors must not be side-dragged before approval.
+            return !IS_READONLY && module.editable !== false
+                && !c.pending && !c.pending_delete && !module.pending;
         })
         .on('start', function (event) {
             event.sourceEvent.stopPropagation();
@@ -3059,9 +3313,9 @@ function enableConnectorSideDrag(group, c, module) {
                 var px = mid.x + tangent.x * offset;
                 var py = mid.y + tangent.y * offset;
 
-                // Move pin circle
-                moduleGroup.select('circle[data-pin-id="' + p.id + '"]')
-                    .attr('cx', px).attr('cy', py);
+                // Move pin symbol group
+                moduleGroup.select('g.pin-circle[data-pin-id="' + p.id + '"]')
+                    .attr('transform', 'translate(' + px + ',' + py + ')');
 
                 // Move pin label
                 var isVert = (newSide === 'top' || newSide === 'bottom');
@@ -3074,6 +3328,18 @@ function enableConnectorSideDrag(group, c, module) {
                     .attr('x', px + labelDx)
                     .attr('y', py + labelDy)
                     .attr('text-anchor', anchor);
+
+                // Move data type caption (precise data-pin-id selector, so
+                // duplicate types on the same connector never swap labels)
+                var tDx = 0, tDy = 0, tAnchor = 'middle';
+                if (newSide === 'right') { tDx = -PIN_RADIUS - 4; tAnchor = 'end'; }
+                else if (newSide === 'left') { tDx = PIN_RADIUS + 4; tAnchor = 'start'; }
+                else if (newSide === 'top') { tDy = PIN_RADIUS + 4; }
+                else { tDy = -PIN_RADIUS - 4; }
+                moduleGroup.select('text.pin-type-label[data-pin-id="' + p.id + '"]')
+                    .attr('x', px + tDx)
+                    .attr('y', py + tDy)
+                    .attr('text-anchor', tAnchor);
             });
 
             // Mark as manually positioned so assignFallbackConnectorPositions won't redistribute
@@ -3264,6 +3530,90 @@ function showConnectorDialog(moduleDatum) {
     });
 }
 
+// Fill a pin type <select> with the managed data types plus the generic
+// Two-stage pin type selector mirroring the Architecture tab: pick the
+// category (Data / Power), then the concrete type in a second combo right
+// next to it (Data → generic "Data" + admin-managed types; Power → VCC/GND).
+// Resolves to { pin_type, is_ground } for the bridge. Any type already on
+// the pin that is not in the managed list is preserved as a custom option.
+function createPinTypeSelector(initialType, initialIsGround) {
+    var catSelect = document.createElement('select');
+    catSelect.className = 'pin-type-cat';
+    ['Data', 'Power'].forEach(function (t) {
+        var opt = document.createElement('option');
+        opt.value = t; opt.textContent = t;
+        catSelect.appendChild(opt);
+    });
+
+    // Data type combo (visible when "Data" is selected)
+    var dataSelect = document.createElement('select');
+    var dataItems = ['Data'].concat(sceneData.pin_types || []);
+    var normInitial = String(initialType || 'Data').trim().toUpperCase();
+    dataItems.forEach(function (t) {
+        var opt = document.createElement('option');
+        opt.value = t; opt.textContent = t;
+        dataSelect.appendChild(opt);
+    });
+    // Keep a custom data type editable even if it was removed from the list.
+    // (Power/ground aliases never belong here — they are resolved via the
+    // category + power subtype below.)
+    if (initialType && dataItems.map(function (s) { return String(s).toUpperCase(); }).indexOf(normInitial) < 0) {
+        var cls0 = pinClassOf({ pin_type: initialType, is_ground: initialIsGround });
+        if (cls0.cls === 'data' || cls0.cls === 'untyped') {
+            var opt = document.createElement('option');
+            opt.value = initialType; opt.textContent = initialType + ' (custom)';
+            dataSelect.appendChild(opt);
+        }
+    }
+
+    // Power subtype combo (visible when "Power" is selected)
+    var powerSelect = document.createElement('select');
+    ['VCC', 'GND'].forEach(function (t) {
+        var opt = document.createElement('option');
+        opt.value = t; opt.textContent = t;
+        powerSelect.appendChild(opt);
+    });
+
+    // Resolve the initial state from the stored pin_type + is_ground.
+    // For power/ground pins the data subtype is irrelevant, so it is reset
+    // to "Data" rather than carrying a power alias (e.g. "VCC") into the
+    // Data combo if the user switches categories.
+    var cls = pinClassOf({ pin_type: initialType, is_ground: initialIsGround });
+    var category = 'Data';
+    var dataType = initialType || 'Data';
+    var powerType = 'VCC';
+    if (cls.cls === 'ground') { category = 'Power'; powerType = 'GND'; dataType = 'Data'; }
+    else if (cls.cls === 'power') { category = 'Power'; powerType = 'VCC'; dataType = 'Data'; }
+
+    catSelect.value = category;
+    for (var di = 0; di < dataSelect.options.length; di++) {
+        if (String(dataSelect.options[di].value).toUpperCase() === String(dataType).toUpperCase()) {
+            dataSelect.selectedIndex = di; break;
+        }
+    }
+    powerSelect.value = powerType;
+
+    function updateVisibility() {
+        var isData = catSelect.value === 'Data';
+        dataSelect.style.display = isData ? '' : 'none';
+        powerSelect.style.display = isData ? 'none' : '';
+    }
+    catSelect.addEventListener('change', updateVisibility);
+
+    return {
+        catSelect: catSelect,
+        dataSelect: dataSelect,
+        powerSelect: powerSelect,
+        getType: function () {
+            if (catSelect.value === 'Power') {
+                return { pin_type: 'Voltage', is_ground: powerSelect.value === 'GND' };
+            }
+            return { pin_type: dataSelect.value || 'Data', is_ground: false };
+        },
+        updateVisibility: updateVisibility,
+    };
+}
+
 function showPinDialog(connectorDatum) {
     if (!bridge) return;
     removeModal();
@@ -3286,32 +3636,17 @@ function showPinDialog(connectorDatum) {
     nameInput.placeholder = 'Enter pin name';
     nameField.appendChild(nameInput);
 
-    // Pin Type (Data / Voltage)
+    // Pin Type — two-stage selector (Data → data types, Power → VCC/GND)
     var typeField = createModalField(dialog, 'Pin Type');
-    var typeSelect = document.createElement('select');
-    ['Data', 'Voltage'].forEach(function (t) {
-        var opt = document.createElement('option');
-        opt.value = t;
-        opt.textContent = t;
-        typeSelect.appendChild(opt);
-    });
-    typeField.appendChild(typeSelect);
+    var typeSel = createPinTypeSelector(null, false);
+    var typeRow = document.createElement('div');
+    typeRow.className = 'pin-type-selector';
+    typeRow.appendChild(typeSel.catSelect);
+    typeRow.appendChild(typeSel.dataSelect);
+    typeRow.appendChild(typeSel.powerSelect);
+    typeField.appendChild(typeRow);
 
-    // Is Ground checkbox (only relevant for Voltage type)
-    var gndField = createModalField(dialog, '');
-    var gndRow = document.createElement('div');
-    gndRow.className = 'checkbox-row';
-    var gndCheck = document.createElement('input');
-    gndCheck.type = 'checkbox';
-    gndCheck.id = 'pin-is-ground';
-    var gndLabel = document.createElement('label');
-    gndLabel.htmlFor = 'pin-is-ground';
-    gndLabel.textContent = 'Is Ground (GND)';
-    gndRow.appendChild(gndCheck);
-    gndRow.appendChild(gndLabel);
-    gndField.appendChild(gndRow);
-
-    // Voltage value (only for non-ground Voltage type)
+    // Voltage value (only for Power/VCC type)
     var voltField = createModalField(dialog, 'Voltage (V)');
     var voltInput = document.createElement('input');
     voltInput.type = 'number';
@@ -3321,15 +3656,8 @@ function showPinDialog(connectorDatum) {
     voltInput.placeholder = 'e.g. 3.3';
     voltField.appendChild(voltInput);
 
-    // Current (mA)
-    var currField = createModalField(dialog, 'Current (mA)');
-    var currInput = document.createElement('input');
-    currInput.type = 'number';
-    currInput.value = '0';
-    currInput.min = '0';
-    currInput.step = '0.1';
-    currInput.placeholder = 'e.g. 500';
-    currField.appendChild(currInput);
+    // NOTE: pins no longer carry a current value — the current belongs to
+    // the connection and is asked for when wiring two pins together.
 
     // Description
     var descField = createModalField(dialog, 'Description (optional)');
@@ -3339,17 +3667,14 @@ function showPinDialog(connectorDatum) {
     descInput.placeholder = 'e.g. Main power input';
     descField.appendChild(descInput);
 
-    // Show/hide voltage based on type and ground
+    // Show/hide voltage based on category and power subtype
     function updateVoltageVisibility() {
-        var isVoltage = typeSelect.value === 'Voltage';
-        var isGnd = gndCheck.checked;
-        voltField.style.display = (isVoltage && !isGnd) ? '' : 'none';
+        var sel = typeSel.getType();
+        voltField.style.display = (sel.pin_type === 'Voltage' && !sel.is_ground) ? '' : 'none';
     }
-    typeSelect.addEventListener('change', function () {
-        if (typeSelect.value === 'Data') gndCheck.checked = false;
-        updateVoltageVisibility();
-    });
-    gndCheck.addEventListener('change', updateVoltageVisibility);
+    typeSel.catSelect.addEventListener('change', updateVoltageVisibility);
+    typeSel.powerSelect.addEventListener('change', updateVoltageVisibility);
+    typeSel.updateVisibility();
     updateVoltageVisibility();
 
     // Actions
@@ -3368,13 +3693,13 @@ function showPinDialog(connectorDatum) {
     createBtn.addEventListener('click', function () {
         var name = nameInput.value.trim();
         if (!name) { showToast('Pin name is required', 'error'); return; }
-        var pinType = typeSelect.value;
-        var isGround = gndCheck.checked;
+        var sel = typeSel.getType();
+        var pinType = sel.pin_type;
+        var isGround = sel.is_ground;
         var voltage = isGround ? 0 : (parseFloat(voltInput.value) || 0);
-        var current = parseFloat(currInput.value) || 0;
         var description = descInput.value.trim();
         removeModal();
-        bridge.create_pin(connectorDatum.id, name, pinType, isGround, voltage, current, description);
+        bridge.create_pin(connectorDatum.id, name, pinType, isGround, voltage, 0, description);
     });
     actions.appendChild(createBtn);
 
@@ -3790,50 +4115,34 @@ function showPinEditDialog(pinDatum, connectorDatum) {
     nameF.appendChild(nameI);
 
     var typeF = createModalField(dialog, 'Pin Type');
-    var typeS = document.createElement('select');
-    var initialType = (pinDatum.pin_type || 'Data');
-    ['Data', 'Voltage'].forEach(function (t) {
-        var opt = document.createElement('option');
-        opt.value = t; opt.textContent = t;
-        if (t === initialType) opt.selected = true;
-        typeS.appendChild(opt);
-    });
-    typeF.appendChild(typeS);
-
-    var gndF = createModalField(dialog, '');
-    var gndR = document.createElement('div');
-    gndR.className = 'checkbox-row';
-    var gndC = document.createElement('input');
-    gndC.type = 'checkbox'; gndC.id = 'edit-pin-gnd';
-    if (pinDatum.is_ground) gndC.checked = true;
-    var gndL = document.createElement('label');
-    gndL.htmlFor = 'edit-pin-gnd'; gndL.textContent = 'Is Ground (GND)';
-    gndR.appendChild(gndC); gndR.appendChild(gndL);
-    gndF.appendChild(gndR);
+    var typeSel = createPinTypeSelector(pinDatum.pin_type, pinDatum.is_ground);
+    var typeRow = document.createElement('div');
+    typeRow.className = 'pin-type-selector';
+    typeRow.appendChild(typeSel.catSelect);
+    typeRow.appendChild(typeSel.dataSelect);
+    typeRow.appendChild(typeSel.powerSelect);
+    typeF.appendChild(typeRow);
 
     var voltF = createModalField(dialog, 'Voltage (V)');
     var voltI = document.createElement('input');
     voltI.type = 'number'; voltI.value = (pinDatum.voltage != null ? pinDatum.voltage : '0'); voltI.min = '0'; voltI.step = '0.1';
     voltF.appendChild(voltI);
 
-    var currF = createModalField(dialog, 'Current (mA)');
-    var currI = document.createElement('input');
-    currI.type = 'number'; currI.value = (pinDatum.current != null ? pinDatum.current : '0'); currI.min = '0'; currI.step = '0.1';
-    currF.appendChild(currI);
-
     var descF = createModalField(dialog, 'Description (optional)');
     var descI = document.createElement('input');
     descI.type = 'text'; descI.value = (pinDatum.description || ''); descI.placeholder = 'e.g. Main power input';
     descF.appendChild(descI);
 
+    // NOTE: pins no longer carry a current value — the current belongs to
+    // the connection and is asked for when wiring two pins together.
+
     function updateVis() {
-        voltF.style.display = (typeS.value === 'Voltage' && !gndC.checked) ? '' : 'none';
+        var sel = typeSel.getType();
+        voltF.style.display = (sel.pin_type === 'Voltage' && !sel.is_ground) ? '' : 'none';
     }
-    typeS.addEventListener('change', function () {
-        if (typeS.value === 'Data') gndC.checked = false;
-        updateVis();
-    });
-    gndC.addEventListener('change', updateVis);
+    typeSel.catSelect.addEventListener('change', updateVis);
+    typeSel.powerSelect.addEventListener('change', updateVis);
+    typeSel.updateVisibility();
     updateVis();
 
     var actions = document.createElement('div');
@@ -3847,13 +4156,13 @@ function showPinEditDialog(pinDatum, connectorDatum) {
     saveBtn.addEventListener('click', function () {
         var name = nameI.value.trim();
         if (!name) { showToast('Pin name is required', 'error'); return; }
-        var pinType = typeS.value;
-        var isGround = gndC.checked;
+        var sel = typeSel.getType();
+        var pinType = sel.pin_type;
+        var isGround = sel.is_ground;
         var voltage = isGround ? 0 : (parseFloat(voltI.value) || 0);
-        var current = parseFloat(currI.value) || 0;
         var description = descI.value.trim();
         removeModal();
-        bridge.update_pin(pinDatum.id, name, pinType, isGround, voltage, current, description);
+        bridge.update_pin(pinDatum.id, name, pinType, isGround, voltage, 0, description);
     });
     actions.appendChild(saveBtn);
     dialog.appendChild(actions);

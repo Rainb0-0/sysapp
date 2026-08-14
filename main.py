@@ -43,7 +43,7 @@ from database import (
 
 from project_dialogs import ProjectSelectionDialog, LoginDialog
 from project_dialogs import UserProfileDialog, ActiveUsersDialog
-from project_dialogs import SubsystemManagementDialog
+from project_dialogs import SubsystemManagementDialog, DataPinTypesDialog
 from auth_manager import auth
 
 from styles.style_manager import style_manager, register_widget
@@ -56,6 +56,8 @@ from Interface_Connectivity_tab.enhanced_wiring_matrix_tab import (
 )
 from Component_Tree_tab.Component_Tree_Window import ComponentTreeTab
 from Schematic_View_tab.schematic_view_tab import SchematicViewTab
+from suggestions import pending_counts as _pending_counts
+from suggestions_tab import SuggestionsTab
 
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 
@@ -430,14 +432,24 @@ class ModuleWiringApp(QMainWindow):
             self.wiring_matrix_tab = EnhancedWiringMatrixTab(self)
             self.component_tree_tab = ComponentTreeTab(self)
             self.schematic_view_tab = SchematicViewTab(self)
+            self.suggestions_tab = SuggestionsTab(self)
 
             self.tabs.addTab(self.architecture_view_tab, "🗂️ Architecture")
             self.tabs.addTab(self.wiring_matrix_tab, "🔌 Interface")
             self.tabs.addTab(self.schematic_view_tab, "📋 Schematic View")
             self.tabs.addTab(self.component_tree_tab, "🌳 Component Tree")
+            self.tabs.addTab(self.suggestions_tab, "📥 Reviews")
 
             # Connect tab change signal
             self.tabs.currentChanged.connect(self.on_tab_changed)
+
+            # Reviews ↔ other tabs: badge counts, approvals refresh everything,
+            # and "Jump to item" switches to the owning tab.
+            self.suggestions_tab.pending_count_changed.connect(
+                lambda _n: self._update_pending_badges()
+            )
+            self.suggestions_tab.changes_applied.connect(self._on_suggestions_applied)
+            self.suggestions_tab.jump_requested.connect(self._jump_to_entity)
 
             self.tabs_initialized = True
             self._update_menu_states(True)
@@ -445,6 +457,7 @@ class ModuleWiringApp(QMainWindow):
 
             # Initial refresh
             self.on_tab_changed(0)
+            self._update_pending_badges()
 
         except Exception as e:
             QMessageBox.critical(
@@ -508,6 +521,18 @@ class ModuleWiringApp(QMainWindow):
         # enabled only for system admins with a project open
         self.manage_subsystems_action.setEnabled(False)
         auth.auth_changed.connect(self._update_manage_subsystems_enabled)
+
+        # Manage Data Pin Types (system only)
+        self.manage_pin_types_action = QAction("🔌 Manage Data &Pin Types…", self)
+        self.manage_pin_types_action.setStatusTip(
+            "Add or remove data pin types used for interface compatibility (system only)"
+        )
+        self.manage_pin_types_action.triggered.connect(self._manage_pin_types)
+        file_menu.addAction(self.manage_pin_types_action)
+
+        # enabled only for system admins (global list, no project required)
+        self.manage_pin_types_action.setEnabled(False)
+        auth.auth_changed.connect(self._update_manage_pin_types_enabled)
 
         file_menu.addSeparator()
 
@@ -691,6 +716,7 @@ class ModuleWiringApp(QMainWindow):
         self.close_project_action.setEnabled(has_project)
         self.refresh_action.setEnabled(has_project)
         self._update_manage_subsystems_enabled(has_project)
+        self._update_manage_pin_types_enabled()
         self.export_csv_action.setEnabled(has_project)
         self.export_excel_action.setEnabled(has_project)
         self.export_json_action.setEnabled(has_project)
@@ -756,6 +782,8 @@ class ModuleWiringApp(QMainWindow):
                 current_tab.refresh_all()
             elif isinstance(current_tab, ComponentTreeTab):
                 current_tab.refresh_tree()
+            elif isinstance(current_tab, SuggestionsTab):
+                current_tab.refresh()
 
             self.statusBar().showMessage(f"🔄 Switched to {tab_name}", 2000)
 
@@ -766,6 +794,8 @@ class ModuleWiringApp(QMainWindow):
 
         if hasattr(current_tab, "apply_access_policy"):
             current_tab.apply_access_policy()
+
+        self._update_pending_badges()
 
     # ==================================================================
     # MENU ACTION HANDLERS
@@ -1193,6 +1223,7 @@ class ModuleWiringApp(QMainWindow):
             "wiring_matrix_tab",
             "schematic_view_tab",
             "component_tree_tab",
+            "suggestions_tab",
         ):
             w = getattr(self, name, None)
             if w and hasattr(w, "apply_access_policy"):
@@ -1200,6 +1231,53 @@ class ModuleWiringApp(QMainWindow):
                     w.apply_access_policy()
                 except Exception:
                     pass
+
+    def _update_pending_badges(self):
+        """Show the pending-suggestion count on the Reviews + Schematic tabs."""
+        if not getattr(self, "tabs_initialized", False):
+            return
+        try:
+            counts = _pending_counts()
+        except Exception:
+            return
+        pending = int(counts.get("pending", 0))
+        mine = int(counts.get("mine", 0))
+
+        def _label(base, n):
+            return f"{base} ({n})" if n else base
+
+        for idx in range(self.tabs.count()):
+            w = self.tabs.widget(idx)
+            if w is self.suggestions_tab:
+                self.tabs.setTabText(idx, _label("📥 Reviews", pending))
+            elif w is self.schematic_view_tab:
+                self.tabs.setTabText(idx, _label("📋 Schematic View", mine))
+
+    def _on_suggestions_applied(self):
+        """An approval/rejection/withdrawal happened — refresh all tabs so the
+        optimistic previews settle against the real data."""
+        if not getattr(self, "tabs_initialized", False):
+            return
+        try:
+            self._refresh_everything()
+            self.suggestions_tab.refresh()
+        except Exception:
+            pass
+        self._update_pending_badges()
+
+    def _jump_to_entity(self, entity_type: str, entity_id):
+        """Switch to the tab that owns the given entity type."""
+        if not getattr(self, "tabs_initialized", False):
+            return
+        target = None
+        if entity_type == "interface":
+            target = self.wiring_matrix_tab
+        elif entity_type == "mode":
+            target = self.schematic_view_tab
+        else:
+            target = self.architecture_view_tab
+        if target is not None:
+            self.tabs.setCurrentWidget(target)
 
     def _on_auth_changed_timer(self):
         if auth.is_logged_in():
@@ -1270,6 +1348,25 @@ class ModuleWiringApp(QMainWindow):
         dlg = SubsystemManagementDialog(self)
         dlg.exec_()
         # refresh every tab so subsystem changes propagate everywhere
+        self._refresh_everything()
+
+    def _update_manage_pin_types_enabled(self):
+        """Enable 'Manage Data Pin Types' only for system admins (no project needed)."""
+        if not hasattr(self, "manage_pin_types_action"):
+            return
+        self.manage_pin_types_action.setEnabled(auth.is_system())
+
+    def _manage_pin_types(self):
+        """Open the data pin types management dialog (system admin only)."""
+        if not auth.is_system():
+            QMessageBox.warning(
+                self, "Access denied", "Only the system admin can manage data pin types."
+            )
+            return
+
+        dlg = DataPinTypesDialog(self)
+        dlg.exec_()
+        # pin-type changes affect which connections are allowed in every tab
         self._refresh_everything()
 
 
