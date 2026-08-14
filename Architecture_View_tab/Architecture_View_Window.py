@@ -34,6 +34,8 @@ from database import (
     get_module_subsystem_id,
     get_connector_subsystem_id,
     get_pin_subsystem_id,
+    delete_subsystem_guarded,
+    UnauthorizedError,
 )
 from auth_manager import auth
 from access_control import can_edit_subsystem
@@ -838,7 +840,7 @@ class ArchitectureViewTab(QWidget):
             ITEM_TYPE_MODULE: "module.delete",
             ITEM_TYPE_CONNECTOR: "connector.delete",
             ITEM_TYPE_PIN: "pin.delete",
-            ITEM_TYPE_SUBSYSTEM: "module.delete",
+            ITEM_TYPE_SUBSYSTEM: "subsystem.delete",
         }
         required = set(type_to_perm.get(t, "") for t in types) - {""}
         return all(auth.has_perm(p) for p in required)
@@ -1199,7 +1201,11 @@ class ArchitectureViewTab(QWidget):
             t = it.data(0, Qt.UserRole + 1)
             iid = it.data(0, Qt.UserRole)
             sid = self._resolve_subsystem_id(t, iid)
-            if not (auth.is_system() or can_edit_subsystem(sid)):
+            if t == ITEM_TYPE_SUBSYSTEM:
+                # subsystem removal is a system-admin-only operation
+                if not auth.is_system():
+                    invalid.append(it.text(0))
+            elif not (auth.is_system() or can_edit_subsystem(sid)):
                 invalid.append(it.text(0))
         if invalid:
             QMessageBox.warning(
@@ -1228,15 +1234,26 @@ class ArchitectureViewTab(QWidget):
             )
             return
 
+        subsystem_items = []
         try:
             items_to_delete = [
                 it for it in checked if not self._has_checked_ancestor(it, checked)
             ]
 
+            subsystem_items = [
+                it for it in items_to_delete
+                if it.data(0, Qt.UserRole + 1) == ITEM_TYPE_SUBSYSTEM
+            ]
+            regular_items = [
+                it for it in items_to_delete
+                if it.data(0, Qt.UserRole + 1) != ITEM_TYPE_SUBSYSTEM
+            ]
+
             self.data_tree.blockSignals(True)
+            # Regular module/connector/pin deletions
             with get_connection() as conn:
                 cur = conn.cursor()
-                for it in items_to_delete:
+                for it in regular_items:
                     t = it.data(0, Qt.UserRole + 1)
                     iid = it.data(0, Qt.UserRole)
 
@@ -1258,12 +1275,6 @@ class ArchitectureViewTab(QWidget):
                             (iid, pid),
                         )
 
-                    elif t == ITEM_TYPE_SUBSYSTEM:
-                        cur.execute(
-                            "DELETE FROM subsystems WHERE id = %s AND project_id = %s",
-                            (iid, pid),
-                        )
-
                     parent = it.parent()
                     if parent is None:
                         top_index = self.data_tree.indexOfTopLevelItem(it)
@@ -1275,12 +1286,34 @@ class ArchitectureViewTab(QWidget):
                             parent.takeChild(parent_index)
 
                 conn.commit()
+
+            # Subsystem deletions: full cascade via the guarded DB helper
+            for it in subsystem_items:
+                sid = it.data(0, Qt.UserRole)
+                try:
+                    ok, msg = delete_subsystem_guarded(auth.user_id, sid)
+                except UnauthorizedError:
+                    QMessageBox.warning(
+                        self,
+                        "Access denied",
+                        "Only the system admin can delete subsystems.",
+                    )
+                    continue
+                if not ok:
+                    QMessageBox.critical(
+                        self, "Error", f"Failed to delete subsystem:\n{msg}"
+                    )
+
             self.data_tree.blockSignals(False)
         except Exception as e:
             self.data_tree.blockSignals(False)
             QMessageBox.critical(self, "Error", f"Failed to delete items:\n{e}")
             return
 
+        # Reload the tree so the UI matches the database exactly
+        # (a subsystem deletion removes a whole subtree at once)
+        if subsystem_items:
+            self.load_data_tree()
         self._checked.clear()
         self._rebuild_checked_list()
         self.update_button_states()
