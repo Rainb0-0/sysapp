@@ -86,15 +86,34 @@ class SchematicBridge(QObject):
     # ------------------------------------------------------------------
     # Permission helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _require_system_admin() -> bool:
+        """
+        The schematic view is read-only for everyone except the system
+        admin (subsystem admins included). Returns True only for a logged-in
+        system admin.
+        """
+        return auth.is_logged_in() and auth.is_system()
+
+    def _deny_read_only(self) -> bool:
+        """Emit the read-only denial toast and return False."""
+        if not auth.is_logged_in():
+            self.save_finished.emit(False, "You must sign in first to edit.")
+        else:
+            self.save_finished.emit(
+                False, "The schematic view is read-only for your account."
+            )
+        return False
+
     def _check_perm(self, perm_code: str, subsystem_id: int | None, action_desc: str) -> bool:
         """
-        Check permission code + subsystem scope. Emits save_finished on
+        Check the caller may edit the schematic view (system admin only),
+        then the permission code + subsystem scope. Emits save_finished on
         failure so the JS front-end sees a toast / status message.
         Returns True if the operation is allowed.
         """
-        if not auth.is_logged_in():
-            self.save_finished.emit(False, "You must sign in first to edit.")
-            return False
+        if not self._require_system_admin():
+            return self._deny_read_only()
         if not auth.has_perm(perm_code):
             self.save_finished.emit(False, f"You don't have permission to {action_desc}.")
             return False
@@ -108,17 +127,16 @@ class SchematicBridge(QObject):
 
     def _check_all_subsystems(self, perm_code: str, subsystem_ids: Set[int], action_desc: str) -> bool:
         """
-        Check permission + ALL subsystems in the set. Fails if any one is
-        not editable by the current user.
+        Check the caller may edit the schematic view (system admin only),
+        then permission + ALL subsystems in the set.
         """
-        if not auth.is_logged_in():
-            self.save_finished.emit(False, "You must sign in first to edit.")
-            return False
+        if not self._require_system_admin():
+            return self._deny_read_only()
         if not auth.has_perm(perm_code):
             self.save_finished.emit(False, f"You don't have permission to {action_desc}.")
             return False
-        if auth.is_system():
-            return True
+        # can_edit_subsystem() already returns True for system admins (and
+        # for None), so iterating here is safe for the system admin too.
         if not subsystem_ids:
             # No subsystem scope to check — could be unassigned items
             return True
@@ -136,8 +154,15 @@ class SchematicBridge(QObject):
     @pyqtSlot()
     def get_scene_data(self):
         """Send the current schematic scene to JavaScript."""
+        readonly = not self._require_system_admin()
         if get_current_project_id() is None:
-            empty_scene = {"subsystems": [], "modules": [], "connectors": [], "interfaces": []}
+            empty_scene = {
+                "subsystems": [],
+                "modules": [],
+                "connectors": [],
+                "interfaces": [],
+                "readonly": readonly,
+            }
             self.scene_data_ready.emit(json.dumps(empty_scene))
             return
 
@@ -148,6 +173,7 @@ class SchematicBridge(QObject):
                 connector_ids=conn_ids,
                 pin_ids=pin_ids,
             )
+            scene["readonly"] = readonly
             self.scene_data_ready.emit(json.dumps(scene))
         except Exception as e:
             self.scene_data_ready.emit(
@@ -157,6 +183,7 @@ class SchematicBridge(QObject):
                         "modules": [],
                         "connectors": [],
                         "interfaces": [],
+                        "readonly": readonly,
                         "error": str(e),
                     }
                 )
@@ -215,10 +242,12 @@ class SchematicBridge(QObject):
           '{"1": {"x": 120.0, "y": 80.0}, "2": {"x": 340.0, "y": 80.0}}'
         (JS object keys are always strings, so we cast back to int here.)
 
-        Only saves positions for modules whose subsystem the current user can
-        edit.  Modules the user cannot edit are silently skipped so the save
-        never fails with a misleading permission toast.
+        Only saves positions for modules the current user can edit (system
+        admin only — the schematic view is read-only for everyone else).
         """
+        if not self._require_system_admin():
+            self._deny_read_only()
+            return
         try:
             raw: Dict[str, Any] = json.loads(positions_json)
             all_positions = {int(mod_id): pos for mod_id, pos in raw.items()}
@@ -248,9 +277,13 @@ class SchematicBridge(QObject):
         """Save connector positions. Each entry can include x, y, and optionally side.
         Example: '{"1": {"x": 100, "y": 50, "side": "right"}}'
 
-        Only saves positions for connectors whose subsystem the current user can
-        edit.  Unauthorised connectors are silently skipped.
+        Only saves positions for connectors the current user can edit
+        (system admin only — the schematic view is read-only for everyone
+        else). Unauthorised connectors are silently skipped.
         """
+        if not self._require_system_admin():
+            self._deny_read_only()
+            return
         try:
             raw: Dict[str, Any] = json.loads(positions_json)
             all_positions = {int(conn_id): pos for conn_id, pos in raw.items()}
@@ -290,6 +323,9 @@ class SchematicBridge(QObject):
         so dragging an editable module never produces a spurious permission
         toast about a completely unrelated interface.
         """
+        if not self._require_system_admin():
+            self._deny_read_only()
+            return
         try:
             raw: Dict[str, Any] = json.loads(routing_json)
             all_interface_data: Dict[int, Any] = {}
@@ -400,11 +436,8 @@ class SchematicBridge(QObject):
             if subsystem_id < 0 or subsystem_id is None:
                 self.save_finished.emit(False, "A subsystem must be selected to create a module.")
                 return -1
-            if not auth.is_logged_in():
-                self.save_finished.emit(False, "You must sign in first to create modules.")
-                return -1
-            if not auth.has_perm("module.create"):
-                self.save_finished.emit(False, "You don't have permission to create modules.")
+            if not self._require_system_admin():
+                self._deny_read_only()
                 return -1
 
             c = color if color else None

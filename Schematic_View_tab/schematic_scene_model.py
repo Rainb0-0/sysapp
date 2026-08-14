@@ -35,10 +35,8 @@ from database import (
     get_connection,
     get_current_project_id,
     get_complete_layout,
-    get_interface_subsystem_ids,
 )
 from auth_manager import auth
-from access_control import can_edit_subsystem
 
 # Matches the defaults actually used in schematic_graphics.py's ModuleGraphics(...)
 DEFAULT_MODULE_WIDTH = 160.0
@@ -276,13 +274,11 @@ def load_schematic_scene(
             else:
                 module_color = SUBSYSTEM_COLORS[idx % len(SUBSYSTEM_COLORS)]
 
-            # Check whether the current user can edit this module's subsystem.
-            # can_edit_subsystem() already handles system admins and None.
-            can_edit = (
-                auth.is_logged_in()
-                and auth.has_perm("module.edit")
-                and can_edit_subsystem(subsystem_id)
-            )
+            # The schematic view is read-only for everyone except the system
+            # admin (subsystem admins included). `editable` drives every
+            # interaction guard on the JS side (context menus, drag, resize,
+            # re-routing), and the bridge re-checks auth on each write.
+            can_edit = auth.is_logged_in() and auth.is_system()
 
             scene["modules"].append({
                 "id": mod_id,
@@ -331,14 +327,9 @@ def load_schematic_scene(
                 else:
                     points, meta = [], {}
 
-                # Determine if the user can edit this interface (both
-                # connected subsystems must be editable).
-                iface_sids = get_interface_subsystem_ids(iface_id)
-                iface_can_edit = (
-                    auth.is_logged_in()
-                    and auth.has_perm("interface.edit")
-                    and all(can_edit_subsystem(s) for s in iface_sids)
-                )
+                # Read-only for everyone except the system admin (see the
+                # module `editable` comment above).
+                iface_can_edit = auth.is_logged_in() and auth.is_system()
 
                 scene["interfaces"].append({
                     "id": iface_id,

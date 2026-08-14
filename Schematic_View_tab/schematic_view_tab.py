@@ -51,6 +51,8 @@ from styles.style_manager import style_manager, create_styled_button
 from styles.design_system import BorderRadius
 from styles.theme_manager import theme_manager
 
+from auth_manager import auth
+
 from Schematic_View_tab.schematic_bridge import SchematicBridge
 from Schematic_View_tab.schematic_tree_selector import SchematicTreeSelector
 from Schematic_View_tab.mode.mode_web_panel import ModeWebPanel
@@ -76,6 +78,11 @@ class SchematicViewTab(QWidget):
         style_manager.theme_changed.connect(self.on_theme_changed)
 
         self.setup_ui()
+
+        # The schematic view is read-only for everyone except the system
+        # admin (subsystem admins included).
+        auth.auth_changed.connect(self._apply_access_policy)
+        self._apply_access_policy()
 
         QTimer.singleShot(500, lambda: self.bridge.get_scene_data())
 
@@ -178,6 +185,15 @@ class SchematicViewTab(QWidget):
         title = QLabel("Schematic View")
         title.setStyleSheet("font-weight: bold; font-size: 16px;")
         layout.addWidget(title)
+
+        self.readonly_label = QLabel("🔒 Read-only")
+        self.readonly_label.setStyleSheet(
+            "color: #ffd76e; font-weight: 600; font-size: 11px;"
+            "background: rgba(255,215,110,0.12); border: 1px solid rgba(255,215,110,0.3);"
+            "border-radius: 8px; padding: 2px 10px;"
+        )
+        self.readonly_label.setVisible(False)
+        layout.addWidget(self.readonly_label)
         layout.addSpacing(30)
 
         self.fit_view_btn = create_styled_button("Fit View", "normal")
@@ -301,8 +317,42 @@ class SchematicViewTab(QWidget):
             self.export_png_btn,
         ):
             btn.setEnabled(self.page_ready)
+        self._apply_access_policy()
         if self.page_ready:
             self.bridge.get_scene_data()
+
+    def _apply_access_policy(self):
+        """
+        Enforce read-only mode: only the system admin may modify the
+        schematic (Save Layout button + JS-side guards handle the rest).
+        """
+        readonly = not (auth.is_logged_in() and auth.is_system())
+        if hasattr(self, "readonly_label"):
+            self.readonly_label.setVisible(readonly)
+        if hasattr(self, "save_layout_btn"):
+            self.save_layout_btn.setEnabled(
+                self.page_ready and not readonly
+            )
+            self.save_layout_btn.setToolTip(
+                "Read-only view — only the system admin can modify the schematic."
+                if readonly
+                else "Save current module/connector positions"
+            )
+
+        # Re-fetch the scene whenever the access policy *changes* (login,
+        # logout, account switch). The scene payload carries per-module
+        # `editable` flags + the global `readonly` flag — if we keep serving
+        # the data from a previous session (e.g. loaded while the system
+        # admin was signed in), the JS would still allow drag/resize for the
+        # new user, and only the save would be rejected. Refreshing here
+        # makes the UI match the current account immediately.
+        if (
+            hasattr(self, "_last_readonly_state")
+            and self._last_readonly_state != readonly
+            and getattr(self, "page_ready", False)
+        ):
+            self.bridge.get_scene_data()
+        self._last_readonly_state = readonly
 
     def _on_save_finished(self, success: bool, message: str):
         # Silent save — the JS side already shows a toast notification

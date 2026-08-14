@@ -29,6 +29,11 @@ let _selectionDragCompleted = false;  // guard to prevent click handler from cle
 let connectDrag = null; // { fromPinId, tempPath }
 let toastCount = 0;
 
+// True when the signed-in user is NOT the system admin: the schematic view
+// is read-only for everyone else (subsystem admins included). Set from the
+// `readonly` field of every scene payload the bridge sends.
+let IS_READONLY = false;
+
 // Cached power lookup tables — rebuilt once per render() call to avoid
 // O(connectors × modules × interfaces) work repeated for every module.
 let _powerLookupCache = null;
@@ -119,6 +124,7 @@ function initializeWebChannel() {
         bridge.scene_data_ready.connect(function (jsonData) {
             try {
                 sceneData = JSON.parse(jsonData);
+                IS_READONLY = !!(sceneData.readonly);
                 render(sceneData);
             } catch (e) {
                 console.error('Failed to parse scene data:', e);
@@ -287,11 +293,15 @@ function setupKeyboardShortcuts() {
         }
     });
 
-    // Right-click on empty canvas shows 'Add Module'
+    // Right-click on empty canvas shows 'Add Module' (system admin only)
     svg.on('contextmenu', function (event) {
         if (event.target !== svg.node() && !event.target.classList.contains('scene-root')) return;
         event.preventDefault();
         event.stopPropagation();
+        if (IS_READONLY) {
+            showToast('The schematic view is read-only for your account.', 'error');
+            return;
+        }
         showContextMenu(event, [
             { icon: '\u2795', label: 'Add Module', action: function () { showModuleDialog(); } },
         ]);
@@ -299,6 +309,7 @@ function setupKeyboardShortcuts() {
 }
 
 function handleDeleteKey() {
+    if (IS_READONLY) return;
     // Delete all selected interfaces first
     if (selectedInterfaceIds.size > 0) {
         var ids = Array.from(selectedInterfaceIds);
@@ -531,6 +542,8 @@ function render(scene) {
 
     // Update the power HUD with the current scene's total connected power
     updatePowerHud(scene);
+
+    updateReadOnlyBadge(IS_READONLY);
 
     if (!render.hasFitOnce) {
         setTimeout(() => { fitView(); render.hasFitOnce = true; }, 300);
@@ -1098,6 +1111,14 @@ function updatePowerHud(scene) {
     el.textContent = '⚡ ' + total.toFixed(1) + ' mW';
 }
 
+// Show/hide the read-only badge in the top-left corner and neutralise
+// the edit-cursor affordances (move / crosshair) in read-only mode.
+function updateReadOnlyBadge(readonly) {
+    var el = document.getElementById('readonly-badge');
+    if (el) el.style.display = readonly ? 'block' : 'none';
+    document.body.classList.toggle('readonly', readonly);
+}
+
 function renderModules(scene) {
     const moduleSel = g.selectAll('.module-box')
         .data(scene.modules, d => d.id)
@@ -1391,6 +1412,7 @@ function connectorBBox(module, c) {
 // Pin-to-pin drag to create a new connection
 // ---------------------------------------------------------------------
 function startConnectDrag(pinId, localX, localY, moduleSelection) {
+    if (IS_READONLY) return;
     cancelConnectDrag();
 
     const d = moduleSelection.datum();
@@ -1555,6 +1577,7 @@ function showSelectionHint() {
 // Context menu
 // ---------------------------------------------------------------------
 function showContextMenu(event, items) {
+    if (IS_READONLY) return;  // belt & braces — per-item menus are also gated by `editable`
     removeContextMenu();
 
     const menu = document.createElement('div');
@@ -1785,6 +1808,7 @@ function deletePinConfirm(pinDatum) {
 // on the Python/GUI thread until the modal dialog is closed, which is
 // expected since it's only triggered by a deliberate double-click.
 function openPinOrderDialog(connectorDatum) {
+    if (IS_READONLY) return;
     if (!bridge) return;
     const pinNames = connectorDatum.pins.map(p => p.name);
     bridge.request_pin_order_dialog(connectorDatum.id, connectorDatum.name, JSON.stringify(pinNames));
@@ -1901,7 +1925,7 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
         // A*-computed waypoints and virtual pivots get NO handles — they
         // are routing aids, not user-placed pivots.
         var isManual = (iface.manual_override || iface._manualOverride);
-        if (isManual && iface.editable !== false) {
+        if (isManual && !IS_READONLY && iface.editable !== false) {
             for (var i = 0; i < points.length; i++) {
                 if (i === 0 || i === points.length - 1) continue;
 
@@ -1965,9 +1989,10 @@ function renderInterfaces(scene, pinLookup, movedPinIds) {
         // --- Drag any point ON the path (not just vertices) to reroute ---
         // When user clicks and drags on a path segment, a new waypoint is
         // inserted at that position and becomes draggable.
-        // Non-editable interfaces get no path drag behavior.
+        // Non-editable interfaces get no path drag behavior, and
+        // read-only mode blocks it entirely.
         (function (iface, points, path, interfaceGroup, line) {
-            if (iface.editable === false) return;
+            if (IS_READONLY || iface.editable === false) return;
             var dragState = null;
 
             function distToSegmentSq(px, py, ax, ay, bx, by) {
@@ -2218,8 +2243,10 @@ function computeRoutePoints(fromPin, toPin, obstacleRects) {
 function dragBehavior() {
     return d3.drag()
         .filter(function (event, d) {
-            // Only allow dragging of editable modules
-            return d.editable !== false;
+            // Only allow dragging of editable modules, and never in
+            // read-only mode (the global IS_READONLY flag is the source of
+            // truth — `editable` can lag behind after an auth change).
+            return !IS_READONLY && d.editable !== false;
         })
         .on('start', function (event, d) {
             d3.select(this).raise();
@@ -2405,8 +2432,9 @@ function dragBehavior() {
 function resizeBehavior(direction) {
     return d3.drag()
         .filter(function (event, d) {
-            // Only allow resizing of editable modules
-            return d.editable !== false;
+            // Only allow resizing of editable modules, and never in
+            // read-only mode (see dragBehavior's filter for why).
+            return !IS_READONLY && d.editable !== false;
         })
         .on('start', function (event, d) {
             event.sourceEvent.stopPropagation();
@@ -2839,6 +2867,10 @@ function fitView(duration) {
 // Manual "Save Layout" button (schematic_view_tab.py -> save_layout())
 // ---------------------------------------------------------------------
 function triggerSaveLayout() {
+    if (IS_READONLY) {
+        showToast('Read-only view — nothing to save.', 'error');
+        return;
+    }
     if (!bridge) return;
 
     const modulePositions = {};
@@ -2928,8 +2960,9 @@ function enableConnectorSideDrag(group, c, module) {
 
     group.call(d3.drag()
         .filter(function () {
-            // Only allow dragging on editable modules
-            return module.editable !== false;
+            // Only allow dragging on editable modules, and never in
+            // read-only mode (see dragBehavior's filter for why).
+            return !IS_READONLY && module.editable !== false;
         })
         .on('start', function (event) {
             event.sourceEvent.stopPropagation();

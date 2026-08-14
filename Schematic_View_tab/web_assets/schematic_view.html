@@ -43,6 +43,23 @@
   }
   svg:active { cursor: grabbing; }
 
+  /* Read-only mode: neutralise edit cursors (dragging is blocked in JS) */
+  body.readonly .module-box,
+  body.readonly .resize-handle,
+  body.readonly .connector-drag-handle,
+  body.readonly .pin-circle {
+    cursor: default !important;
+  }
+  /* Read-only mode: don't show resize handles at all — hovering a module
+     must not suggest it can be resized. */
+  body.readonly .resize-handle {
+    display: none !important;
+  }
+  /* Read-only mode: don't show wire-drag handles on manual routes. */
+  body.readonly .interface-drag-handle {
+    display: none !important;
+  }
+
   /* ========= Connect Drag State ========= */
   body.dragging-connection,
   body.dragging-connection * {
@@ -193,6 +210,21 @@
   }
   #hint-select.hidden {
     opacity: 0; transform: translateX(-50%) translateY(8px);
+  }
+
+  /* ======= Read-only Badge ======= */
+  #readonly-badge {
+    position: absolute; top: 10px; left: 12px;
+    color: #ffd76e;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    padding: 4px 12px; border-radius: 8px; font-size: 11px;
+    pointer-events: none; user-select: none;
+    border: 1px solid rgba(255, 215, 110, 0.25);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    white-space: nowrap;
   }
 
   /* ======= Zoom Indicator ======= */
@@ -451,6 +483,7 @@
 <body>
   <div id="scene-container">
     <svg id="schematic-svg"></svg>
+    <div id="readonly-badge" style="display:none;">🔒 Read-only</div>
     <div id="zoom-info">Zoom: 100%</div>
     <div id="power-hud">⚡ 0.0 mW</div>
     <div id="hint-select" class="hidden">Click &amp; drag on empty canvas to rectangle-select</div>
