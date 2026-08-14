@@ -14,7 +14,10 @@ from database import (get_all_projects, create_new_project_guarded,
                       verify_credentials, set_user_password, set_user_full_name,
                       get_login_audit, get_all_users_simple,
                       get_all_projects, open_existing_project, create_new_project_guarded,
-                     get_project_id_by_name, delete_project_guarded)  # added
+                     get_project_id_by_name, delete_project_guarded,  # added
+                     get_current_project_id, get_current_project_name,
+                     list_subsystems_for_project, count_subsystem_data,
+                     add_subsystem_guarded, delete_subsystem_guarded)
 
 from project_config import project_config
 from auth_manager import auth
@@ -544,4 +547,215 @@ class ActiveUsersDialog(QDialog):
             self.tbl_audit.setItem(i, 2, QTableWidgetItem(r.get("full_name","")))
             self.tbl_audit.setItem(i, 3, QTableWidgetItem(r["action"]))
         self.tbl_audit.resizeColumnsToContents()
-    
+
+
+class SubsystemManagementDialog(QDialog):
+    """
+    System-admin only: add / remove subsystems for the current project.
+    Removing a subsystem cascades to its modules, connectors, pins and
+    connections (interfaces). Subsystem admins cannot use this dialog.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Subsystems")
+        self.setModal(True)
+        self.setMinimumSize(520, 460)
+
+        self._build_ui()
+        self._load_subsystems()
+
+        auth.auth_changed.connect(self.apply_access_policy)
+        self.apply_access_policy()
+
+    # ---------------------------
+    # UI
+    # ---------------------------
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Header
+        header = QLabel("🗂️ Manage Subsystems")
+        hf = QFont(); hf.setPointSize(14); hf.setBold(True)
+        header.setFont(hf)
+        header.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header)
+
+        self.lbl_project = QLabel("")
+        self.lbl_project.setAlignment(Qt.AlignCenter)
+        self.lbl_project.setStyleSheet("color:#666;")
+        layout.addWidget(self.lbl_project)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(sep)
+
+        # Subsystem list
+        list_group = QGroupBox("Subsystems in this project")
+        list_layout = QVBoxLayout()
+        self.sub_list = QListWidget()
+        self.sub_list.setMinimumHeight(220)
+        self.sub_list.itemSelectionChanged.connect(self.apply_access_policy)
+        list_layout.addWidget(self.sub_list)
+        list_group.setLayout(list_layout)
+        layout.addWidget(list_group)
+
+        # Add row
+        add_row = QHBoxLayout()
+        self.new_name_edit = QLineEdit()
+        self.new_name_edit.setPlaceholderText("New subsystem name...")
+        self.new_name_edit.returnPressed.connect(self._add_subsystem)
+        self.btn_add = QPushButton("➕ Add Subsystem")
+        add_row.addWidget(self.new_name_edit, 1)
+        add_row.addWidget(self.btn_add)
+        layout.addLayout(add_row)
+
+        # Buttons row
+        btn_row = QHBoxLayout()
+        self.btn_remove = QPushButton("🗑️ Remove Selected")
+        self.btn_close = QPushButton("Close")
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_remove)
+        btn_row.addWidget(self.btn_close)
+        layout.addLayout(btn_row)
+
+        self.lbl_hint = QLabel(
+            "Only the system admin can add or remove subsystems. Removing a "
+            "subsystem permanently deletes all of its modules, connectors, "
+            "pins and connections."
+        )
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setStyleSheet("color:#888; font-size:11px;")
+        layout.addWidget(self.lbl_hint)
+
+        # Connections
+        self.btn_add.clicked.connect(self._add_subsystem)
+        self.btn_remove.clicked.connect(self._remove_selected)
+        self.btn_close.clicked.connect(self.accept)
+
+    # ---------------------------
+    # Access policy
+    # ---------------------------
+    def apply_access_policy(self):
+        can_manage = auth.is_system()
+        if hasattr(self, "btn_add"):
+            self.btn_add.setEnabled(can_manage)
+        if hasattr(self, "new_name_edit"):
+            self.new_name_edit.setEnabled(can_manage)
+        if hasattr(self, "btn_remove"):
+            self.btn_remove.setEnabled(
+                can_manage and self.sub_list.currentItem() is not None
+            )
+        if not can_manage:
+            self.lbl_hint.setText(
+                "Only the system admin can add or remove subsystems. "
+                "You have read-only access here."
+            )
+
+    # ---------------------------
+    # Data loading
+    # ---------------------------
+    def _load_subsystems(self):
+        self.sub_list.clear()
+        try:
+            pid = get_current_project_id()
+            name = get_current_project_name()
+            self.lbl_project.setText(
+                f"Project: {name or pid or '(none)'}"
+            )
+            rows = list_subsystems_for_project(pid) or []
+            for sub_id, sub_name in rows:
+                counts = count_subsystem_data(sub_id, pid)
+                item = QListWidgetItem(
+                    f"📦 {sub_name}   "
+                    f"({counts['modules']} modules, {counts['connectors']} connectors, "
+                    f"{counts['pins']} pins, {counts['interfaces']} connections)"
+                )
+                item.setData(Qt.UserRole, sub_id)
+                item.setData(Qt.UserRole + 1, sub_name)
+                self.sub_list.addItem(item)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load subsystems:\n{e}")
+        self.apply_access_policy()
+
+    def _selected_subsystem_id(self):
+        item = self.sub_list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    # ---------------------------
+    # Actions
+    # ---------------------------
+    def _add_subsystem(self):
+        if not auth.is_system():
+            QMessageBox.warning(
+                self, "Access denied", "Only the system admin can add subsystems."
+            )
+            return
+
+        name = self.new_name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Invalid name", "Please enter a subsystem name.")
+            return
+
+        ok, msg = add_subsystem_guarded(auth.user_id, name)
+        if not ok:
+            QMessageBox.critical(self, "Create failed", msg)
+            return
+
+        QMessageBox.information(self, "Created", msg)
+        self.new_name_edit.clear()
+        self._load_subsystems()
+        # select the new subsystem (match by exact name stored in item data)
+        for i in range(self.sub_list.count()):
+            if self.sub_list.item(i).data(Qt.UserRole + 1) == name:
+                self.sub_list.setCurrentRow(i)
+                break
+
+    def _remove_selected(self):
+        if not auth.is_system():
+            QMessageBox.warning(
+                self, "Access denied", "Only the system admin can remove subsystems."
+            )
+            return
+
+        sub_id = self._selected_subsystem_id()
+        if sub_id is None:
+            QMessageBox.information(self, "Remove Subsystem", "Select a subsystem first.")
+            return
+
+        item = self.sub_list.currentItem()
+        sub_name = item.data(Qt.UserRole + 1) or ""
+        counts = count_subsystem_data(sub_id)
+
+        # step 1: confirm (with explicit data-loss warning)
+        msg = (
+            f"Delete subsystem '{sub_name}'?\n\n"
+            "This will permanently remove:\n"
+            f"  • {counts['modules']} module(s)\n"
+            f"  • {counts['connectors']} connector(s)\n"
+            f"  • {counts['pins']} pin(s)\n"
+            f"  • {counts['interfaces']} connection(s)\n\n"
+            "This cannot be undone."
+        )
+        r = QMessageBox.question(
+            self, "Confirm delete", msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if r != QMessageBox.Yes:
+            return
+
+        # step 2: typing confirmation for extra safety
+        text, ok = QInputDialog.getText(
+            self, "Type to confirm",
+            f"Type the subsystem name exactly to confirm:\n{sub_name}",
+        )
+        if not ok or (text or "").strip() != sub_name:
+            QMessageBox.information(self, "Cancelled", "Subsystem deletion cancelled.")
+            return
+
+        ok, msg = delete_subsystem_guarded(auth.user_id, sub_id)
+        if not ok:
+            QMessageBox.critical(self, "Delete failed", msg)
+            return
+
+        QMessageBox.information(self, "Deleted", msg)
+        self._load_subsystems()

@@ -43,6 +43,7 @@ from database import (
 
 from project_dialogs import ProjectSelectionDialog, LoginDialog
 from project_dialogs import UserProfileDialog, ActiveUsersDialog
+from project_dialogs import SubsystemManagementDialog
 from auth_manager import auth
 
 from styles.style_manager import style_manager, register_widget
@@ -187,9 +188,7 @@ class DatabaseConfigDialog(QDialog):
                     f"Please fix the settings and try again.",
                 )
         except Exception as e:
-            QMessageBox.critical(
-                self, "❌ Error", f"Configuration error:\n{str(e)}"
-            )
+            QMessageBox.critical(self, "❌ Error", f"Configuration error:\n{str(e)}")
         finally:
             self._testing = False
 
@@ -332,9 +331,7 @@ class ModuleWiringApp(QMainWindow):
                             5000,
                         )
                     return
-                self.statusBar().showMessage(
-                    f"⚠️ DB init failed: {message}", 5000
-                )
+                self.statusBar().showMessage(f"⚠️ DB init failed: {message}", 5000)
             except Exception:
                 pass  # Saved config failed, fall through to dialog
 
@@ -369,9 +366,7 @@ class ModuleWiringApp(QMainWindow):
                     "✅ Database configured successfully", 3000
                 )
             else:
-                self.statusBar().showMessage(
-                    f"⚠️ DB init failed: {message}", 5000
-                )
+                self.statusBar().showMessage(f"⚠️ DB init failed: {message}", 5000)
         else:
             # User cancelled — don't close the app
             if not self.db_configured:
@@ -383,8 +378,7 @@ class ModuleWiringApp(QMainWindow):
 
     def _show_welcome_widget(self):
         """Show a welcome widget when no project is loaded."""
-        welcome_label = QLabel(
-            """
+        welcome_label = QLabel("""
         <div style="text-align: center; padding: 50px;">
             <h1>🗂️ System Architecture</h1>
             <h3>🎉 Welcome!</h3>
@@ -393,8 +387,7 @@ class ModuleWiringApp(QMainWindow):
                 Use the <b>📁 File</b> menu to create or open a project.
             </p>
         </div>
-        """
-        )
+        """)
         welcome_label.setAlignment(Qt.AlignCenter)
         self.tabs.addTab(welcome_label, "🏠 Welcome")
 
@@ -503,6 +496,18 @@ class ModuleWiringApp(QMainWindow):
                 auth.has_perm("project.delete")
             )
         )
+
+        # Manage Subsystems (system only)
+        self.manage_subsystems_action = QAction("🗂️ &Manage Subsystems…", self)
+        self.manage_subsystems_action.setStatusTip(
+            "Add or remove subsystems (system only)"
+        )
+        self.manage_subsystems_action.triggered.connect(self._manage_subsystems)
+        file_menu.addAction(self.manage_subsystems_action)
+
+        # enabled only for system admins with a project open
+        self.manage_subsystems_action.setEnabled(False)
+        auth.auth_changed.connect(self._update_manage_subsystems_enabled)
 
         file_menu.addSeparator()
 
@@ -685,6 +690,7 @@ class ModuleWiringApp(QMainWindow):
         """Update menu items based on whether a project is loaded."""
         self.close_project_action.setEnabled(has_project)
         self.refresh_action.setEnabled(has_project)
+        self._update_manage_subsystems_enabled(has_project)
         self.export_csv_action.setEnabled(has_project)
         self.export_excel_action.setEnabled(has_project)
         self.export_json_action.setEnabled(has_project)
@@ -1241,6 +1247,30 @@ class ModuleWiringApp(QMainWindow):
         dialog = ProjectSelectionDialog(self)
         # use modal exec_ so user completes delete in the dialog
         dialog.exec_()
+
+    def _update_manage_subsystems_enabled(self, has_project=None):
+        """Enable 'Manage Subsystems' only for system admins with a project open."""
+        if not hasattr(self, "manage_subsystems_action"):
+            return
+        if has_project is None:
+            has_project = bool(getattr(self, "tabs_initialized", False))
+        self.manage_subsystems_action.setEnabled(has_project and auth.is_system())
+
+    def _manage_subsystems(self):
+        """Open the subsystem management dialog (system admin only)."""
+        if not auth.is_system():
+            QMessageBox.warning(
+                self, "Access denied", "Only the system admin can manage subsystems."
+            )
+            return
+        if not getattr(self, "tabs_initialized", False):
+            QMessageBox.warning(self, "No Project", "Please open a project first.")
+            return
+
+        dlg = SubsystemManagementDialog(self)
+        dlg.exec_()
+        # refresh every tab so subsystem changes propagate everywhere
+        self._refresh_everything()
 
 
 if __name__ == "__main__":
