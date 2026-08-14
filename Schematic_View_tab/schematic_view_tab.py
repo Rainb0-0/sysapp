@@ -58,6 +58,22 @@ from Schematic_View_tab.schematic_tree_selector import SchematicTreeSelector
 from Schematic_View_tab.mode.mode_web_panel import ModeWebPanel
 from access_control import guard_export
 
+
+class _SchematicWebEngineView(QWebEngineView):
+    """
+    QWebEngineView that suppresses the native browser context menu.
+
+    The schematic page renders its own custom context menu (HTML div) inside
+    the web view. On some Windows setups Qt/Chromium still shows the built-in
+    browser menu on right-click — which can swallow the mouse release or
+    appear instead of the custom menu. Swallowing the native event here
+    guarantees only the in-page menu ever shows.
+    """
+
+    def contextMenuEvent(self, event):
+        event.accept()  # never show the native menu; the page's JS handles it
+
+
 class SchematicViewTab(QWidget):
     """New web-based schematic view tab (Python data + JS/SVG rendering)."""
 
@@ -265,7 +281,7 @@ class SchematicViewTab(QWidget):
         layout = QVBoxLayout(self.container)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        self.web_view = QWebEngineView()
+        self.web_view = _SchematicWebEngineView()
         self.web_view.page().setWebChannel(self.channel)
         self.web_view.setFocusPolicy(Qt.StrongFocus)
 

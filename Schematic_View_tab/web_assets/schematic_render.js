@@ -1333,6 +1333,7 @@ function renderModules(scene) {
             pinG.append('title').text(p.name + ' | Connector: ' + c.name);
             pinG.on('mousedown', function (event) {
                     event.stopPropagation();
+                    if (event.button !== 0) return;  // left button only (right-click = context menu)
                     if (p.pending || p.pending_delete) {
                         showToast('This pin is pending approval', 'error');
                         return;
@@ -1761,9 +1762,40 @@ function showSelectionHint() {
 // ---------------------------------------------------------------------
 // Context menu
 // ---------------------------------------------------------------------
+
+// The currently open menu (if any), with the timestamp it was opened at.
+// A single dismiss listener is registered once on `document` (capture phase)
+// and consults this reference, so re-opening the menu never leaks listeners.
+let currentContextMenu = null;
+const CONTEXT_MENU_GRACE_MS = 150;
+
+function setupContextMenuDismiss() {
+    if (setupContextMenuDismiss.installed) return;
+    setupContextMenuDismiss.installed = true;
+    document.addEventListener('mousedown', contextMenuOutside, true);
+    document.addEventListener('click', contextMenuOutside, true);
+    document.addEventListener('contextmenu', contextMenuOutside, true);
+}
+
+function contextMenuOutside(e) {
+    const m = currentContextMenu;
+    if (!m) return;
+    // Absorb interactions that arrive in the grace window right after the
+    // menu opens: some Windows mouse/touchpad drivers emit a stray left-click
+    // after the right-click that opened the menu. Without this the menu is
+    // dismissed (or the item under the cursor is activated) before it ever
+    // paints — the "context menu doesn't open" symptom on some Windows
+    // machines. The window is kept short so deliberate fast clicks still work.
+    if (Date.now() - m.openedAt < CONTEXT_MENU_GRACE_MS) return;
+    if (m.menu.contains(e.target)) return;  // item clicks handled separately
+    removeContextMenu();
+}
+
 function showContextMenu(event, items) {
     if (IS_READONLY) return;  // belt & braces — per-item menus are also gated by `editable`
     removeContextMenu();
+
+    const openedAt = Date.now();
 
     const menu = document.createElement('div');
     menu.id = 'schematic-context-menu';
@@ -1800,6 +1832,9 @@ function showContextMenu(event, items) {
 
         el.addEventListener('click', function (e) {
             e.stopPropagation();
+            // Absorb a stray click that lands on an item under the cursor
+            // within the grace window (Windows right-click drivers).
+            if (Date.now() - openedAt < CONTEXT_MENU_GRACE_MS) return;
             item.action();
             removeContextMenu();
         });
@@ -1807,27 +1842,12 @@ function showContextMenu(event, items) {
     });
 
     document.body.appendChild(menu);
-
-    // Dismiss on click outside. Use queueMicrotask instead of
-    // setTimeout(0) to avoid Windows timer resolution issues (~15ms).
-    // queueMicrotask fires at the end of the current microtask queue,
-    // after any synchronous stray click events from the right-click
-    // sequence have already fired, but before any user follow-up clicks.
-    // Right-clicks (button !== 0) are ignored since some Windows
-    // configurations generate stray click events after a right-click.
-    // Menu items call stopPropagation() so their clicks never reach
-    // this dismiss handler — only outside-clicks dismiss the menu.
-    queueMicrotask(function () {
-        document.addEventListener('click', function dismiss(e) {
-            if (e.button !== 0) return;
-            if (!document.getElementById('schematic-context-menu')) return;
-            removeContextMenu();
-            document.removeEventListener('click', dismiss);
-        }, { once: true });
-    });
+    currentContextMenu = { menu: menu, openedAt: openedAt };
+    setupContextMenuDismiss();
 }
 
 function removeContextMenu() {
+    currentContextMenu = null;
     const existing = document.getElementById('schematic-context-menu');
     if (existing) existing.remove();
 }
@@ -2481,7 +2501,11 @@ function isDraggableModule(d) {
 function dragBehavior() {
     return d3.drag()
         .filter(function (event, d) {
-            return isDraggableModule(d);
+            // Left button only. d3.drag's default filter already restricts
+            // to the primary button, but a custom filter replaces it — a
+            // right-click must NEVER start a drag, or it will capture the
+            // mouse and swallow the contextmenu event on Windows.
+            return event.button === 0 && isDraggableModule(d);
         })
         .on('start', function (event, d) {
             d3.select(this).raise();
@@ -2667,7 +2691,7 @@ function dragBehavior() {
 function resizeBehavior(direction) {
     return d3.drag()
         .filter(function (event, d) {
-            return isDraggableModule(d);
+            return event.button === 0 && isDraggableModule(d);
         })
         .on('start', function (event, d) {
             event.sourceEvent.stopPropagation();
@@ -3211,11 +3235,14 @@ function enableConnectorSideDrag(group, c, module) {
     var dragState = { currentSide: normalizeSide(c.side), hadDrag: false };
 
     group.call(d3.drag()
-        .filter(function () {
-            // Only allow dragging on editable modules, and never in
-            // read-only mode (see dragBehavior's filter for why).
-            // Pending connectors must not be side-dragged before approval.
-            return !IS_READONLY && module.editable !== false
+        .filter(function (event) {
+            // Left button only — a right-click must never start a drag or it
+            // will capture the mouse and swallow the contextmenu on Windows.
+            // Only allow dragging on editable modules, and never in read-only
+            // mode (see dragBehavior's filter for why). Pending connectors
+            // must not be side-dragged before approval.
+            return event.button === 0
+                && !IS_READONLY && module.editable !== false
                 && !c.pending && !c.pending_delete && !module.pending;
         })
         .on('start', function (event) {
