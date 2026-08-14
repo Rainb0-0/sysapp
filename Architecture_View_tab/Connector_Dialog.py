@@ -278,6 +278,18 @@ class ColorDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         cur = index.model().data(index, Qt.EditRole)
         editor = ColorComboBox(cur if cur else "Default", parent)
+        # Commit the picked color to the model immediately (when the user
+        # selects from the drop-down) instead of relying on the view's
+        # focus-out commit. A click on a button outside the table does not
+        # move focus away from the editor, so the old color used to linger
+        # in the model and the global Save/OK button saved the stale value.
+        # The editor is deliberately left open after a pick so the user can
+        # pick again without re-entering edit mode (which used to require
+        # clicking the cell several times to reach the drop-down).
+        editor.combo.activated.connect(lambda *_: self.commitData.emit(editor))
+        # Open the drop-down as soon as the editor appears, so one click on
+        # the cell is enough to reach the color list.
+        QTimer.singleShot(0, editor.combo.showPopup)
         return editor
 
     def setEditorData(self, editor, index):
@@ -1029,6 +1041,14 @@ class ConnectorDialog(QDialog):
 
         if not self._ensure_project_selected():
             return False
+
+        # If a cell editor is still open, force the view to commit it into
+        # the model before we snapshot rows. Clicking a button outside the
+        # table does not reliably move focus away from the editor, so the
+        # last edit (color, name, pins, …) would otherwise be silently lost.
+        if self.table.state() == QAbstractItemView.EditingState:
+            self.table.setFocus()
+            QApplication.processEvents()
 
         project_id = get_current_project_id()
         rows_to_save = []
