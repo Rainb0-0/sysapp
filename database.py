@@ -1430,6 +1430,7 @@ def seed_auth_basics():
             # add to perms list (alongside others)
             "interface.create", "interface.edit", "interface.delete",
             "project.delete",
+            "subsystem.create", "subsystem.delete",
         ]
         for code in perms:
             add_permission(code, code.replace(".", " "))
@@ -1892,6 +1893,358 @@ def delete_project_guarded(user_id: int, project_id: int) -> tuple[bool, str]:
         except Exception:
             pass
         return False, f"Failed to delete project: {e}"
+
+
+# =============================================================================
+# Subsystem Management (system admin only)
+# =============================================================================
+
+def list_subsystems_for_project(project_id: int | None = None) -> list[tuple[int, str]]:
+    """
+    Return [(id, name), ...] for the current project, ordered by name.
+    """
+    _ensure_project_selected()
+    pid = project_id or current_project_id
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, name FROM subsystems WHERE project_id = %s ORDER BY name",
+                (pid,),
+            )
+            return list(cur.fetchall())
+    except Exception as e:
+        print(f"Error listing subsystems: {e}")
+        return []
+
+
+def count_subsystem_data(subsystem_id: int, project_id: int | None = None) -> dict:
+    """
+    Return a small breakdown of how much data belongs to a subsystem
+    (modules / connectors / pins / interfaces), used by the delete UI.
+    """
+    _ensure_project_selected()
+    pid = project_id or current_project_id
+    counts = {"modules": 0, "connectors": 0, "pins": 0, "interfaces": 0}
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM modules WHERE subsystem_id = %s AND project_id = %s",
+                (subsystem_id, pid),
+            )
+            counts["modules"] = cur.fetchone()[0]
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM connectors
+                WHERE project_id = %s AND module_id IN (
+                    SELECT id FROM modules
+                    WHERE subsystem_id = %s AND project_id = %s
+                )
+                """,
+                (pid, subsystem_id, pid),
+            )
+            counts["connectors"] = cur.fetchone()[0]
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM pins
+                WHERE project_id = %s AND connector_id IN (
+                    SELECT id FROM connectors
+                    WHERE project_id = %s AND module_id IN (
+                        SELECT id FROM modules
+                        WHERE subsystem_id = %s AND project_id = %s
+                    )
+                )
+                """,
+                (pid, pid, subsystem_id, pid),
+            )
+            counts["pins"] = cur.fetchone()[0]
+            cur.execute(
+                """
+                SELECT COUNT(DISTINCT i.id) FROM interfaces i
+                JOIN pins p ON (p.id = i.pin1_id OR p.id = i.pin2_id)
+                JOIN connectors c ON c.id = p.connector_id
+                JOIN modules m ON m.id = c.module_id
+                WHERE i.project_id = %s AND m.subsystem_id = %s AND m.project_id = %s
+                """,
+                (pid, subsystem_id, pid),
+            )
+            counts["interfaces"] = cur.fetchone()[0]
+    except Exception as e:
+        print(f"Error counting subsystem data: {e}")
+    return counts
+
+
+def add_subsystem_guarded(user_id: int, subsystem_name: str) -> tuple[bool, str]:
+    """
+    Add a new subsystem to the current project. System admin only
+    ('subsystem.create' permission — granted solely to system_admin).
+    Also auto-creates the '<name>.Admin' subsystem-admin account, matching
+    the behaviour of seed_subsystem_admins_from_db() on startup.
+    """
+    name = (subsystem_name or "").strip()
+    if not name:
+        return False, "Subsystem name cannot be empty."
+    guard_or_raise(
+        user_id,
+        "subsystem.create",
+        None,
+        "subsystem.create",
+        details={"subsystem_name": name},
+    )
+    try:
+        _ensure_project_selected()
+        with get_connection() as conn:
+            conn.autocommit = False
+            cur = conn.cursor()
+
+            # friendly duplicate check (case-insensitive)
+            cur.execute(
+                "SELECT id FROM subsystems WHERE project_id = %s AND LOWER(name) = LOWER(%s)",
+                (current_project_id, name),
+            )
+            if cur.fetchone():
+                conn.rollback()
+                return False, f"Subsystem '{name}' already exists in this project."
+
+            cur.execute(
+                "INSERT INTO subsystems (name, project_id) VALUES (%s, %s) RETURNING id",
+                (name, current_project_id),
+            )
+            new_id = cur.fetchone()[0]
+
+            # auto-create the matching subsystem-admin account (idempotent)
+            admin_username = f"{name}.Admin"
+            cur.execute(
+                "SELECT id FROM users WHERE LOWER(username) = LOWER(%s)",
+                (admin_username,),
+            )
+            if not cur.fetchone():
+                cur.execute(
+                    "INSERT INTO users (username, password_hash, full_name, is_active) "
+                    "VALUES (%s, %s, %s, TRUE) RETURNING id",
+                    (admin_username, _hash_password("Aa123456"), f"{name} Admin"),
+                )
+                admin_uid = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT id FROM roles WHERE name = 'subsystem_admin'",
+                )
+                role_row = cur.fetchone()
+                if role_row:
+                    cur.execute(
+                        "INSERT INTO user_roles (user_id, role_id) VALUES (%s, %s) "
+                        "ON CONFLICT DO NOTHING",
+                        (admin_uid, role_row[0]),
+                    )
+                cur.execute(
+                    "INSERT INTO user_subsystems (user_id, subsystem_id) VALUES (%s, %s) "
+                    "ON CONFLICT DO NOTHING",
+                    (admin_uid, new_id),
+                )
+
+            conn.commit()
+
+        try:
+            record_audit(
+                user_id,
+                "subsystem.create",
+                {"subsystem_id": new_id, "subsystem_name": name, "project_id": current_project_id},
+            )
+        except Exception:
+            pass
+        return True, f"Subsystem '{name}' created (admin account '{admin_username}' ready)."
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, f"Failed to create subsystem: {e}"
+
+
+def delete_subsystem_guarded(user_id: int, subsystem_id: int) -> tuple[bool, str]:
+    """
+    Delete a subsystem and everything related to it:
+
+      * interfaces (connections) touching any of its pins — including
+        cross-subsystem links whose other end lives elsewhere,
+      * interface routing points,
+      * pins, connectors, modules of the subsystem,
+      * mode references (mode_modules / mode_positions),
+      * user_subsystems grants (subsystem-admin scope),
+      * the auto-created '<name>.Admin' account when it is a pure
+        subsystem admin with no other roles/grants,
+      * the subsystem row itself.
+
+    System admin only ('subsystem.delete' permission).
+    """
+    guard_or_raise(
+        user_id,
+        "subsystem.delete",
+        subsystem_id,
+        "subsystem.delete",
+        details={"subsystem_id": subsystem_id},
+    )
+    try:
+        with get_connection() as conn:
+            conn.autocommit = False
+            cur = conn.cursor()
+
+            # 0) identify subsystem
+            cur.execute(
+                "SELECT name, project_id FROM subsystems WHERE id = %s",
+                (subsystem_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return False, "Subsystem not found."
+            sub_name, project_id = row
+
+            # 1) interfaces (connections) touching any pin of this subsystem
+            cur.execute(
+                """
+                SELECT DISTINCT i.id
+                FROM interfaces i
+                JOIN pins p ON (p.id = i.pin1_id OR p.id = i.pin2_id)
+                JOIN connectors c ON c.id = p.connector_id
+                JOIN modules m ON m.id = c.module_id
+                WHERE i.project_id = %s AND m.subsystem_id = %s AND m.project_id = %s
+                """,
+                (project_id, subsystem_id, project_id),
+            )
+            iface_ids = [r[0] for r in cur.fetchall()]
+
+            # 2) interface routing points → interfaces
+            if iface_ids:
+                cur.execute(
+                    "DELETE FROM interface_points WHERE interface_id = ANY(%s)",
+                    (iface_ids,),
+                )
+                cur.execute(
+                    "DELETE FROM interfaces WHERE id = ANY(%s)",
+                    (iface_ids,),
+                )
+
+            # 3) pins → connectors → modules of this subsystem
+            cur.execute(
+                """
+                DELETE FROM pins
+                WHERE project_id = %s AND connector_id IN (
+                    SELECT id FROM connectors
+                    WHERE project_id = %s AND module_id IN (
+                        SELECT id FROM modules
+                        WHERE project_id = %s AND subsystem_id = %s
+                    )
+                )
+                """,
+                (project_id, project_id, project_id, subsystem_id),
+            )
+            cur.execute(
+                """
+                DELETE FROM connectors
+                WHERE project_id = %s AND module_id IN (
+                    SELECT id FROM modules
+                    WHERE project_id = %s AND subsystem_id = %s
+                )
+                """,
+                (project_id, project_id, subsystem_id),
+            )
+
+            # 4) mode references (item_id has no FK in legacy schemas)
+            cur.execute(
+                """
+                DELETE FROM mode_positions
+                WHERE project_id = %s AND (
+                    (item_type = 'module' AND item_id IN (
+                        SELECT id FROM modules WHERE project_id = %s AND subsystem_id = %s))
+                    OR (item_type = 'connector' AND item_id IN (
+                        SELECT id FROM connectors WHERE project_id = %s AND module_id IN (
+                            SELECT id FROM modules WHERE project_id = %s AND subsystem_id = %s)))
+                    OR (item_type = 'interface' AND item_id = ANY(%s))
+                )
+                """,
+                (project_id, project_id, subsystem_id,
+                 project_id, project_id, subsystem_id,
+                 iface_ids or [-1]),
+            )
+            cur.execute(
+                """
+                DELETE FROM mode_modules
+                WHERE project_id = %s AND module_id IN (
+                    SELECT id FROM modules WHERE project_id = %s AND subsystem_id = %s
+                )
+                """,
+                (project_id, project_id, subsystem_id),
+            )
+
+            # 5) modules
+            cur.execute(
+                "DELETE FROM modules WHERE project_id = %s AND subsystem_id = %s",
+                (project_id, subsystem_id),
+            )
+
+            # 6) auto-created '<name>.Admin' account — only when it is a pure
+            #    subsystem admin with exactly one role and one grant.
+            #    (Checked BEFORE removing grants below, so we can still see it.)
+            admin_username = f"{sub_name.strip()}.Admin"
+            cur.execute(
+                "SELECT id FROM users WHERE LOWER(username) = LOWER(%s)",
+                (admin_username,),
+            )
+            admin_row = cur.fetchone()
+            if admin_row:
+                admin_uid = admin_row[0]
+                cur.execute(
+                    "SELECT COUNT(*) FROM user_roles WHERE user_id = %s",
+                    (admin_uid,),
+                )
+                n_roles = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM user_roles ur
+                    JOIN roles r ON r.id = ur.role_id
+                    WHERE ur.user_id = %s AND r.name <> 'subsystem_admin'
+                    """,
+                    (admin_uid,),
+                )
+                n_other_roles = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT COUNT(*) FROM user_subsystems WHERE user_id = %s",
+                    (admin_uid,),
+                )
+                n_grants = cur.fetchone()[0]
+                if n_other_roles == 0 and n_roles == 1 and n_grants == 1:
+                    # cascades user_roles / user_subsystems / user_sessions
+                    cur.execute("DELETE FROM users WHERE id = %s", (admin_uid,))
+
+            # 7) remaining user grants (user_subsystems has no FK to subsystems)
+            cur.execute(
+                "DELETE FROM user_subsystems WHERE subsystem_id = %s",
+                (subsystem_id,),
+            )
+
+            # 8) the subsystem itself
+            cur.execute(
+                "DELETE FROM subsystems WHERE id = %s AND project_id = %s",
+                (subsystem_id, project_id),
+            )
+            conn.commit()
+
+        try:
+            record_audit(
+                user_id,
+                "subsystem.delete",
+                {"subsystem_id": subsystem_id, "subsystem_name": sub_name, "project_id": project_id},
+            )
+        except Exception:
+            pass
+        return True, f"Subsystem '{sub_name}' and all related data deleted."
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, f"Failed to delete subsystem: {e}"
 
 
 # =============================================================================
