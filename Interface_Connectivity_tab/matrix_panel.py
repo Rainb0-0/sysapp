@@ -86,6 +86,9 @@ class MatrixPanel(QWidget):
         # Header Widget
         self.create_header_widget(layout)
 
+        # Filter Bar (subsystem / module / connector)
+        self.create_filter_widget(layout)
+
         # Matrix Table
         self.create_matrix_table(layout)
 
@@ -93,6 +96,10 @@ class MatrixPanel(QWidget):
 
         self.connector_ids_for_matrix = []
         self.connectors_for_matrix = []
+        self.matrix_row_connector_ids = []
+        self.matrix_col_connector_ids = []
+        self.matrix_row_connectors = []
+        self.matrix_col_connectors = []
 
         self.load_matrix_data()
 
@@ -192,6 +199,383 @@ class MatrixPanel(QWidget):
         """
         self.header_widget.setStyleSheet(header_style)
 
+    # ------------------------------------------------------------------
+    # Filter bar: two cascading chains (Rows / Columns)
+    # Each chain narrows Subsystem → Module → Connector with an "All …"
+    # option at every level. The matrix always shows the relation between
+    # the connectors selected on the ROWS axis and those on the COLUMNS axis.
+    # ------------------------------------------------------------------
+    def create_filter_widget(self, layout):
+        """
+        Two cascading filter chains — one for the matrix ROWS and one for
+        the COLUMNS. Every level has an "All …" entry so a chain can stop at
+        subsystem, module, or connector granularity.
+        """
+        self.filter_widget = QWidget()
+        self.filter_widget.setObjectName("MatrixFilterBar")
+
+        filter_layout = QVBoxLayout(self.filter_widget)
+        filter_layout.setContentsMargins(12, 8, 12, 8)
+        filter_layout.setSpacing(6)
+
+        # ---- Rows chain: Subsystem → Module → Connector ----
+        row_bar = QHBoxLayout()
+        row_bar.setSpacing(8)
+        row_label = QLabel("⬇ Rows:")
+        row_label.setFont(QFont("Roboto Mono", 10, QFont.Bold))
+        row_bar.addWidget(row_label)
+
+        self.row_sub_combo = self._new_filter_combo("All subsystems")
+        self.row_mod_combo = self._new_filter_combo("All modules")
+        self.row_con_combo = self._new_filter_combo("All connectors")
+        row_bar.addWidget(self.row_sub_combo)
+        row_bar.addWidget(self.row_mod_combo)
+        row_bar.addWidget(self.row_con_combo)
+        row_bar.addStretch()
+        filter_layout.addLayout(row_bar)
+
+        # ---- Columns chain: Subsystem → Module → Connector ----
+        col_bar = QHBoxLayout()
+        col_bar.setSpacing(8)
+        col_label = QLabel("➡ Columns:")
+        col_label.setFont(QFont("Roboto Mono", 10, QFont.Bold))
+        col_bar.addWidget(col_label)
+
+        self.col_sub_combo = self._new_filter_combo("All subsystems")
+        self.col_mod_combo = self._new_filter_combo("All modules")
+        self.col_con_combo = self._new_filter_combo("All connectors")
+        col_bar.addWidget(self.col_sub_combo)
+        col_bar.addWidget(self.col_mod_combo)
+        col_bar.addWidget(self.col_con_combo)
+
+        self.clear_filter_btn = create_styled_button("✖ Clear", "small")
+        self.clear_filter_btn.clicked.connect(self.clear_filter)
+        col_bar.addWidget(self.clear_filter_btn)
+        col_bar.addStretch()
+        filter_layout.addLayout(col_bar)
+
+        # Current scope summary
+        self.scope_label = QLabel("")
+        self.scope_label.setObjectName("MatrixScopeLabel")
+        self.scope_label.setFont(QFont("Roboto Mono", 9))
+        filter_layout.addWidget(self.scope_label)
+
+        layout.addWidget(self.filter_widget)
+        self.update_filter_style()
+
+        # Seed the subsystem lists (the fillers block signals, so no handler
+        # fires before self.matrix_table exists).
+        for side in ("row", "col"):
+            self._fill_subsystems(self._side_combos(side)[0])
+
+        # Cascade: a subsystem pick repopulates modules, a module pick
+        # repopulates connectors; every user pick reloads the matrix.
+        self.row_sub_combo.currentIndexChanged.connect(lambda _: self._on_sub_changed("row"))
+        self.row_mod_combo.currentIndexChanged.connect(lambda _: self._on_mod_changed("row"))
+        self.row_con_combo.currentIndexChanged.connect(lambda _: self._on_con_changed("row"))
+        self.col_sub_combo.currentIndexChanged.connect(lambda _: self._on_sub_changed("col"))
+        self.col_mod_combo.currentIndexChanged.connect(lambda _: self._on_mod_changed("col"))
+        self.col_con_combo.currentIndexChanged.connect(lambda _: self._on_con_changed("col"))
+
+    def _new_filter_combo(self, placeholder):
+        """Create a filter combo seeded with its 'All …' placeholder."""
+        combo = QComboBox()
+        combo.setFont(QFont("Roboto Mono", 10))
+        combo.addItem(placeholder, None)
+        return combo
+
+    def _side_combos(self, side):
+        """Return (subsystem, module, connector) combo for 'row' or 'col'."""
+        if side == "row":
+            return self.row_sub_combo, self.row_mod_combo, self.row_con_combo
+        return self.col_sub_combo, self.col_mod_combo, self.col_con_combo
+
+    def update_filter_style(self):
+        """بروزرسانی استایل نوار فیلتر"""
+        self.filter_widget.setStyleSheet(f"""
+            QWidget#MatrixFilterBar {{
+                background: {theme_manager.get_gradient("primary", "x1:0, y1:0, x2:1, y2:0")};
+                border-radius: {BorderRadius.LARGE};
+                border: 1px solid {theme_manager.get_color('primary_light')};
+            }}
+            QLabel {{
+                color: {theme_manager.get_color('text_primary')};
+                font-family: {Typography.FONT_FAMILY};
+                font-size: {Typography.SIZE_SMALL};
+                font-weight: {Typography.WEIGHT_BOLD};
+                background: transparent;
+                border: none;
+            }}
+            QLabel#MatrixScopeLabel {{
+                color: {theme_manager.get_color('text_secondary')};
+                font-size: {Typography.SIZE_SMALL};
+                font-weight: {Typography.WEIGHT_NORMAL};
+            }}
+            QComboBox {{
+                background: {theme_manager.get_color('primary_dark')};
+                color: {theme_manager.get_color('text_primary')};
+                font-family: {Typography.FONT_FAMILY};
+                font-size: {Typography.SIZE_MEDIUM};
+                border: 1px solid {theme_manager.get_color('primary_light')};
+                border-radius: {BorderRadius.MEDIUM};
+                padding: {Spacing.MD} {Spacing.LG};
+                min-width: 150px;
+            }}
+            QComboBox:disabled {{
+                color: rgba(128, 128, 128, 0.6);
+            }}
+            QComboBox QAbstractItemView {{
+                background: {theme_manager.get_color('primary_dark')};
+                color: {theme_manager.get_color('text_primary')};
+                selection-background-color: rgba(74, 144, 226, 40);
+                selection-color: #ffffff;
+                border: 1px solid {theme_manager.get_color('primary_light')};
+            }}
+        """)
+
+    def _fill_subsystems(self, combo, keep=None):
+        """Fill a subsystem combo with 'All subsystems' + project subsystems."""
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("All subsystems", None)
+            project_id = get_current_project_id()
+            if project_id is None:
+                return
+            with get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, name FROM subsystems WHERE project_id = %s ORDER BY name",
+                    (project_id,),
+                )
+                for sub_id, name in cur.fetchall():
+                    combo.addItem(name, sub_id)
+            if keep is not None:
+                idx = combo.findData(keep)
+                if idx != -1:
+                    combo.setCurrentIndex(idx)
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", f"Error loading subsystems: {str(e)}")
+        finally:
+            combo.blockSignals(False)
+
+    def _fill_modules(self, combo, sub_id, keep=None):
+        """Fill a module combo with 'All modules' + modules of sub_id (or all)."""
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("All modules", None)
+            project_id = get_current_project_id()
+            if project_id is None:
+                return
+            with get_connection() as conn:
+                cur = conn.cursor()
+                if sub_id is None:
+                    cur.execute(
+                        "SELECT id, name FROM modules WHERE project_id = %s ORDER BY name",
+                        (project_id,),
+                    )
+                else:
+                    cur.execute(
+                        """SELECT id, name FROM modules
+                           WHERE subsystem_id = %s AND project_id = %s ORDER BY name""",
+                        (sub_id, project_id),
+                    )
+                for mod_id, name in cur.fetchall():
+                    combo.addItem(name, mod_id)
+            if keep is not None:
+                idx = combo.findData(keep)
+                if idx != -1:
+                    combo.setCurrentIndex(idx)
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", f"Error loading modules: {str(e)}")
+        finally:
+            combo.blockSignals(False)
+
+    def _fill_connectors(self, combo, mod_id, keep=None, sub_id=None):
+        """
+        Fill a connector combo with 'All connectors' + the connectors that
+        belong to mod_id, or (when no module is chosen) to sub_id, or all
+        project connectors when neither is given.
+        """
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("All connectors", None)
+            project_id = get_current_project_id()
+            if project_id is None:
+                return
+            with get_connection() as conn:
+                cur = conn.cursor()
+                if mod_id is not None:
+                    cur.execute(
+                        """
+                        SELECT c.id, c.name, m.name
+                        FROM connectors c
+                        JOIN modules m ON c.module_id = m.id AND m.project_id = %s
+                        WHERE c.project_id = %s AND c.module_id = %s
+                        ORDER BY m.name, c.name
+                        """,
+                        (project_id, project_id, mod_id),
+                    )
+                elif sub_id is not None:
+                    cur.execute(
+                        """
+                        SELECT c.id, c.name, m.name
+                        FROM connectors c
+                        JOIN modules m ON c.module_id = m.id AND m.project_id = %s
+                        WHERE c.project_id = %s AND m.subsystem_id = %s
+                        ORDER BY m.name, c.name
+                        """,
+                        (project_id, project_id, sub_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT c.id, c.name, m.name
+                        FROM connectors c
+                        JOIN modules m ON c.module_id = m.id AND m.project_id = %s
+                        WHERE c.project_id = %s
+                        ORDER BY m.name, c.name
+                        """,
+                        (project_id, project_id),
+                    )
+                for cid, cname, mname in cur.fetchall():
+                    combo.addItem(f"{mname} - {cname}", cid)
+            if keep is not None:
+                idx = combo.findData(keep)
+                if idx != -1:
+                    combo.setCurrentIndex(idx)
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", f"Error loading connectors: {str(e)}")
+        finally:
+            combo.blockSignals(False)
+
+    def _side_scope(self, side):
+        """
+        Resolve the deepest selected level of a filter chain.
+        Returns (level, id): ('all', None), ('subsystem', sid),
+        ('module', mid) or ('connector', cid).
+        """
+        sub, mod, con = self._side_combos(side)
+        cid = con.currentData()
+        if cid is not None:
+            return "connector", cid
+        mid = mod.currentData()
+        if mid is not None:
+            return "module", mid
+        sid = sub.currentData()
+        if sid is not None:
+            return "subsystem", sid
+        return "all", None
+
+    def _on_sub_changed(self, side):
+        """
+        Subsystem picked: repopulate the module + connector chains below it.
+        Deeper selections are kept when they still belong to the new scope.
+        """
+        sub, mod, con = self._side_combos(side)
+        old_mod_id = mod.currentData()
+        old_con_id = con.currentData()
+        sub_id = sub.currentData()
+
+        self._fill_modules(mod, sub_id, keep=old_mod_id)
+        new_mod_id = mod.currentData()
+        # Keep the connector only if its module selection survived.
+        keep_con = old_con_id if new_mod_id == old_mod_id else None
+        self._fill_connectors(con, new_mod_id, keep=keep_con, sub_id=sub_id)
+        self.load_matrix_data()
+
+    def _on_mod_changed(self, side):
+        """
+        Module picked: repopulate the connector chain below it. The connector
+        selection is kept when it still belongs to the new scope.
+        """
+        sub, mod, con = self._side_combos(side)
+        old_con_id = con.currentData()
+        mod_id = mod.currentData()
+
+        self._fill_connectors(con, mod_id, keep=old_con_id, sub_id=sub.currentData())
+        self.load_matrix_data()
+
+    def _on_con_changed(self, side):
+        """Connector picked: just reload the matrix."""
+        self.load_matrix_data()
+
+    def refresh_filter_options(self):
+        """
+        Re-populate both filter chains for the current project (called on tab
+        switches / project changes) while preserving selections that still
+        exist. Stale ids never leak across projects.
+        """
+        if not hasattr(self, "row_sub_combo"):
+            return
+        for side in ("row", "col"):
+            sub, mod, con = self._side_combos(side)
+            sub_id = sub.currentData()
+            mod_id = mod.currentData()
+            con_id = con.currentData()
+
+            self._fill_subsystems(sub, keep=sub_id)
+            new_sub_id = sub.currentData()
+
+            # Only keep the module selection if its subsystem is unchanged.
+            keep_mod = mod_id if new_sub_id == sub_id else None
+            self._fill_modules(mod, new_sub_id, keep=keep_mod)
+            new_mod_id = mod.currentData()
+
+            # Only keep the connector selection if its module is unchanged.
+            keep_con = con_id if new_mod_id == mod_id else None
+            self._fill_connectors(con, new_mod_id, keep=keep_con, sub_id=new_sub_id)
+
+    def clear_filter(self):
+        """Reset both filter chains back to 'All' and reload the matrix."""
+        for side in ("row", "col"):
+            sub, mod, con = self._side_combos(side)
+            for combo in (sub, mod, con):
+                combo.blockSignals(True)
+            sub.setCurrentIndex(0)
+            mod.clear()
+            mod.addItem("All modules", None)
+            con.clear()
+            con.addItem("All connectors", None)
+            for combo in (sub, mod, con):
+                combo.blockSignals(False)
+        self.load_matrix_data()
+
+    def _update_scope_label(self, n_rows, n_cols):
+        """Update the summary label describing the current matrix scope."""
+        row_desc = self._scope_description(*self._side_scope("row"))
+        col_desc = self._scope_description(*self._side_scope("col"))
+        self.scope_label.setText(
+            f"Showing {n_rows} row connector(s) × {n_cols} column connector(s)   "
+            f"(rows: {row_desc}  ·  columns: {col_desc})"
+        )
+
+    def _scope_description(self, level, sid):
+        """Human-readable description of a filter scope."""
+        if level == "all" or sid is None:
+            return "all connectors"
+        project_id = get_current_project_id()
+        if project_id is None:
+            return "..."
+        table = {"subsystem": "subsystems", "module": "modules", "connector": "connectors"}[level]
+        noun = {"subsystem": "subsystem", "module": "module", "connector": "connector"}[level]
+        try:
+            with get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    f"SELECT name FROM {table} WHERE id = %s AND project_id = %s",
+                    (sid, project_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    return f"{noun} '{row[0]}'"
+        except Exception:
+            pass
+        return "unknown"
+
+
     def create_matrix_table(self, layout):
         """ایجاد جدول ماتریس"""
         self.matrix_table = QTableWidget()
@@ -254,55 +638,98 @@ class MatrixPanel(QWidget):
         """هندل تغییر تم"""
         self.apply_main_panel_style()
         self.update_header_style()
+        if hasattr(self, "filter_widget"):
+            self.update_filter_style()
         self.update_matrix_table_style()
 
     def load_matrix_data(self):
         """
-        Load connector info and prepare matrix headers and size.
+        Load connector info for the row & column filter scopes and prepare
+        the matrix headers and size.
+
+        The matrix always represents relations BETWEEN the connectors of the
+        ROW scope and the connectors of the COLUMN scope — never inside a
+        single connector.
         """
         if not self._ensure_project_selected():
             self.matrix_table.setRowCount(0)
             self.matrix_table.setColumnCount(0)
             return
-            
+
         project_id = get_current_project_id()
-        
+
         try:
             with get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT DISTINCT m.name, c.name, c.id
-                    FROM connectors c
-                    JOIN modules m ON c.module_id = m.id AND m.project_id = %s
-                    WHERE c.project_id = %s
-                    ORDER BY m.name, c.name
-                """, (project_id, project_id))
-                self.connectors_for_matrix = cursor.fetchall()
+                row_connectors = self._fetch_scope_connectors(
+                    cursor, project_id, *self._side_scope("row")
+                )
+                col_connectors = self._fetch_scope_connectors(
+                    cursor, project_id, *self._side_scope("col")
+                )
         except Exception as e:
             QMessageBox.critical(self, "Database Error", f"Error loading connectors: {str(e)}")
-            self.connectors_for_matrix = []
+            row_connectors = []
+            col_connectors = []
 
-        self.connector_ids_for_matrix = [cid for _, _, cid in self.connectors_for_matrix]
-        headers = [f"{m_name} - {c_name}" for m_name, c_name, _ in self.connectors_for_matrix]
-        n = len(headers)
-        self.matrix_table.setRowCount(n)
-        self.matrix_table.setColumnCount(n)
-        self.matrix_table.setHorizontalHeaderLabels(headers)
-        self.matrix_table.setVerticalHeaderLabels(headers)
+        self.matrix_row_connectors = row_connectors
+        self.matrix_col_connectors = col_connectors
+        self.matrix_row_connector_ids = [cid for _, _, cid in row_connectors]
+        self.matrix_col_connector_ids = [cid for _, _, cid in col_connectors]
+        # Backwards-compatible aliases used by the refresh/edit paths
+        self.connectors_for_matrix = row_connectors
+        self.connector_ids_for_matrix = self.matrix_row_connector_ids
+
+        row_headers = [f"{m} - {c}" for m, c, _ in row_connectors]
+        col_headers = [f"{m} - {c}" for m, c, _ in col_connectors]
+        self.matrix_table.setRowCount(len(row_headers))
+        self.matrix_table.setColumnCount(len(col_headers))
+        self.matrix_table.setVerticalHeaderLabels(row_headers)
+        self.matrix_table.setHorizontalHeaderLabels(col_headers)
+
+        self._update_scope_label(len(row_headers), len(col_headers))
         self.refresh_matrix_display()
+
+    def _fetch_scope_connectors(self, cursor, project_id, level, sid):
+        """Fetch (module_name, connector_name, connector_id) rows for a scope."""
+        base = """
+            SELECT DISTINCT m.name, c.name, c.id
+            FROM connectors c
+            JOIN modules m ON c.module_id = m.id AND m.project_id = %s
+            WHERE c.project_id = %s
+        """
+        if level == "subsystem":
+            cursor.execute(
+                base + " AND m.subsystem_id = %s ORDER BY m.name, c.name",
+                (project_id, project_id, sid),
+            )
+        elif level == "module":
+            cursor.execute(
+                base + " AND c.module_id = %s ORDER BY m.name, c.name",
+                (project_id, project_id, sid),
+            )
+        elif level == "connector":
+            cursor.execute(
+                base + " AND c.id = %s ORDER BY m.name, c.name",
+                (project_id, project_id, sid),
+            )
+        else:
+            cursor.execute(base + " ORDER BY m.name, c.name", (project_id, project_id))
+        return cursor.fetchall()
 
     def refresh_matrix_display(self):
         """
-        Fill the matrix table with interface info between connectors.
+        Fill the matrix table with the interfaces that exist between the
+        ROW-scope connectors and the COLUMN-scope connectors.
         """
         if not self._ensure_project_selected():
             return
-            
+
         project_id = get_current_project_id()
-        
+
         try:
             all_pins_map = get_all_pins_with_full_numbered_name()
-            
+
             with get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -318,10 +745,16 @@ class MatrixPanel(QWidget):
             QMessageBox.critical(self, "Database Error", f"Error loading interfaces: {str(e)}")
             return
 
+        row_index = {cid: i for i, (_, _, cid) in enumerate(self.matrix_row_connectors)}
+        col_index = {cid: i for i, (_, _, cid) in enumerate(self.matrix_col_connectors)}
+
+        n_rows = self.matrix_table.rowCount()
+        n_cols = self.matrix_table.columnCount()
+
         # Clear all cells
-        for r in range(self.matrix_table.rowCount()):
+        for r in range(n_rows):
             self.matrix_table.setRowHeight(r, 40)
-            for c in range(self.matrix_table.columnCount()):
+            for c in range(n_cols):
                 item = self.matrix_table.item(r, c)
                 if not item:
                     item = QTableWidgetItem()
@@ -330,34 +763,41 @@ class MatrixPanel(QWidget):
                 item.setData(Qt.UserRole, [])
                 item.setBackground(QColor(Qt.transparent))
 
-        # Fill with interface lists and count
+        # Fill cells: an interface between connector A (row) and connector B
+        # (column) lands in cell (A, B) — and also in (B, A) when both
+        # endpoints appear in both scopes (identical scopes keep the classic
+        # symmetric view). Interfaces inside a single connector (c1 == c2)
+        # are never shown.
         for p1_id, p2_id, iface_id, c1_id, c2_id, color in all_ifaces:
-            if c1_id is None or c2_id is None:
-                continue  # Skip if connector lookup failed
-                
+            if c1_id is None or c2_id is None or c1_id == c2_id:
+                continue  # skip missing lookups and intra-connector relations
+
             p1_full_name = all_pins_map.get(p1_id, "N/A")
             p2_full_name = all_pins_map.get(p2_id, "N/A")
             p1_name = p1_full_name.split(': ')[-1]
             p2_name = p2_full_name.split(': ')[-1]
-            try:
-                idx1 = self.connector_ids_for_matrix.index(c1_id)
-                idx2 = self.connector_ids_for_matrix.index(c2_id)
-                for r, c in [(idx1, idx2), (idx2, idx1)]:
-                    item = self.matrix_table.item(r, c)
-                    conn_list = item.data(Qt.UserRole) or []
-                    entry = (p1_id, p1_name, p2_id, p2_name, iface_id, color or '#0000FF')
-                    if entry not in conn_list:
-                        conn_list.append(entry)
-                    item.setData(Qt.UserRole, conn_list)
-                    item.setText(f"{len(conn_list)} Interface(s)")
-                    item.setFont(QFont("Roboto Mono", 11))
-                    item.setTextAlignment(Qt.AlignCenter)
-            except ValueError:
-                continue
+            entry = (p1_id, p1_name, p2_id, p2_name, iface_id, color or '#0000FF')
+
+            r1 = row_index.get(c1_id)
+            c1c = col_index.get(c1_id)
+            r2 = row_index.get(c2_id)
+            c2c = col_index.get(c2_id)
+            for r, c in ((r1, c2c), (r2, c1c)):
+                if r is None or c is None:
+                    continue
+                item = self.matrix_table.item(r, c)
+                conn_list = item.data(Qt.UserRole) or []
+                if entry not in conn_list:
+                    conn_list.append(entry)
+                item.setData(Qt.UserRole, conn_list)
+                item.setText(f"{len(conn_list)} Interface(s)")
+                item.setFont(QFont("Roboto Mono", 11))
+                item.setTextAlignment(Qt.AlignCenter)
+
         self.matrix_table.resizeColumnsToContents()
         self.matrix_table.resizeRowsToContents()
         # تنظیم عرض ستون‌ها
-        for col in range(self.matrix_table.columnCount()):
+        for col in range(n_cols):
             self.matrix_table.setColumnWidth(col, 150)
 
     def edit_matrix_cell(self, row, column):
@@ -368,9 +808,17 @@ class MatrixPanel(QWidget):
             QMessageBox.warning(self, "Access denied", "Only 'system' can edit the wiring matrix.")
             return
 
-        connector1_id = self.connector_ids_for_matrix[row]
-        connector2_id = self.connector_ids_for_matrix[column]
-        connector1_name = self.matrix_table.horizontalHeaderItem(row).text()
+        connector1_id = self.matrix_row_connector_ids[row]
+        connector2_id = self.matrix_col_connector_ids[column]
+
+        if connector1_id == connector2_id:
+            QMessageBox.information(
+                self, "Info",
+                "Relations inside a single connector are not shown in the matrix.",
+            )
+            return
+
+        connector1_name = self.matrix_table.verticalHeaderItem(row).text()
         connector2_name = self.matrix_table.horizontalHeaderItem(column).text()
 
         # Fetch pins for both connectors
