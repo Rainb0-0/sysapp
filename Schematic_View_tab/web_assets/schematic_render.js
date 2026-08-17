@@ -770,7 +770,8 @@ function updateSubsystemHalosInPlace(scene) {
 // For a connector with N pins, the pin spread is (N-1)*PIN_HALF_STEP*2
 // centered on the connector's center along the edge.
 function connectorEdgeExtent(c, side) {
-    const count = c.pins.length;
+    // A collapsed connector takes the smallest possible footprint.
+    const count = c.collapsed ? 0 : c.pins.length;
     const pinSpan = Math.max(0, (count - 1)) * PIN_HALF_STEP + PIN_HALF_STEP;
     // Full extent = 2 * pinSpan (pins spread equally in both directions)
     return pinSpan * 2 + CONNECTOR_BBOX_PAD * 2;
@@ -931,6 +932,9 @@ function connectorBodyMidpoint(module, c) {
 function buildPinLookup(scene) {
     // pin_id -> absolute {x, y, side} in scene coordinates, used to draw interfaces.
     // Pins sit at the connector body midpoint, spread along the tangent direction.
+    // For a COLLAPSED connector, every pin maps to the same single point — the
+    // stub tip (c.x, c.y in module-local coords) — so all its wires converge
+    // there instead of spreading to the (hidden) pin positions.
     const lookup = {};
     scene.connectors.forEach(function (c) {
         const module = scene.modules.find(m => String(m.id) === String(c.module_id));
@@ -939,13 +943,18 @@ function buildPinLookup(scene) {
         const tangent = SIDE_AXIS[side].tangent;
         const count = c.pins.length;
         const mid = connectorBodyMidpoint(module, c);
+        const collapsed = !!c.collapsed;
+        const anchorX = module.x + ((typeof c.x === 'number' && !isNaN(c.x)) ? c.x : mid.x);
+        const anchorY = module.y + ((typeof c.y === 'number' && !isNaN(c.y)) ? c.y : mid.y);
         c.pins.forEach(function (p, i) {
             const offset = -(count - 1) * PIN_HALF_STEP + i * (PIN_HALF_STEP * 2);
-            lookup[p.id] = {
-                x: module.x + mid.x + tangent.x * offset,
-                y: module.y + mid.y + tangent.y * offset,
-                side: side,
-            };
+            lookup[p.id] = collapsed
+                ? { x: anchorX, y: anchorY, side: side }
+                : {
+                    x: module.x + mid.x + tangent.x * offset,
+                    y: module.y + mid.y + tangent.y * offset,
+                    side: side,
+                };
         });
     });
     return lookup;
@@ -1228,11 +1237,15 @@ function renderModules(scene) {
         // Use tree-view colors: orange for module fill, green for connector strokes, red for pins
         const connectorColor = c.color || '#27ae60';   // tree view connector color, fallback to green
 
+        // A collapsed connector hides its pins but keeps its wires (interfaces)
+        // and shrinks to the smallest size. Reversible from the context menu.
+        const collapsed = !!c.collapsed;
+
         // Connector interactive group — contains visible line, handle, hitbox
         var connPendingCls = (c.pending || c.pending_delete)
             ? (c.pending === 'delete' || c.pending_delete ? ' pending-delete' : ' pending')
             : '';
-        var connGroup = parent.append('g').attr('class', 'connector-interactive' + connPendingCls);
+        var connGroup = parent.append('g').attr('class', 'connector-interactive' + connPendingCls + (collapsed ? ' connector-collapsed' : ''));
 
         // --- Connector bounding box (visible background rect) ---
         const bbox = connectorBBox(module, c);
@@ -1265,7 +1278,7 @@ function renderModules(scene) {
             .attr('fill', connectorColor)
             .attr('stroke', connectorColor)
             .attr('stroke-width', 1.5);
-        connHandle.append('title').text(c.name + ' | Side: ' + c.side + ' | Pins: ' + (c.pins ? c.pins.length : 0));
+        connHandle.append('title').text(c.name + ' | Side: ' + c.side + ' | Pins: ' + (c.pins ? c.pins.length : 0) + (collapsed ? ' | collapsed (pins hidden, wires kept)' : ''));
 
         // Connector name label near the drag handle
         const isHorizSide = (side === 'top' || side === 'bottom');
@@ -1284,6 +1297,21 @@ function renderModules(scene) {
             .attr('font-family', '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif')
             .attr('pointer-events', 'none')
             .text(c.name);
+
+        // Small "collapsed" cue under the label so the hidden pins are obvious.
+        if (collapsed) {
+            connGroup.append('text')
+                .attr('class', 'connector-collapsed-badge')
+                .attr('data-connector-id', c.id)
+                .attr('x', c.x + labelOffset.x)
+                .attr('y', c.y + labelOffset.y + 11)
+                .attr('text-anchor', 'middle')
+                .attr('fill', connectorColor)
+                .attr('font-size', 9)
+                .attr('font-weight', '700')
+                .attr('pointer-events', 'none')
+                .text('\u22EF');  // '⋯'
+        }
 
         // Invisible wider hitbox ON TOP for easy connector interaction (covers bounding box area)
         connGroup.append('rect')
@@ -1309,6 +1337,9 @@ function renderModules(scene) {
             showConnectorContextMenu(event, c);
         });
 
+        // Pins are not drawn for a collapsed connector — the wires (interfaces)
+        // are rendered independently from the scene's pin data and stay visible.
+        if (!collapsed) {
         c.pins.forEach(function (p, i) {
             const offset = -(count - 1) * PIN_HALF_STEP + i * (PIN_HALF_STEP * 2);
             // Pins sit at the connector BODY MIDPOINT, spread along the tangent
@@ -1383,6 +1414,7 @@ function renderModules(scene) {
                     .text(p.pin_type);
             }
         });
+        } // !collapsed — pins hidden, wires kept
     });
 }
 
@@ -1395,7 +1427,8 @@ function connectorBBox(module, c) {
     const side = normalizeSide(c.side);
     const tangent = SIDE_AXIS[side].tangent;
     const normal = SIDE_AXIS[side].normal;
-    const count = c.pins.length;
+    // A collapsed connector has no visible pins, so its bbox is just the stub.
+    const count = c.collapsed ? 0 : c.pins.length;
     const w = Math.max(MODULE_MIN_WIDTH, module.width);
     const h = Math.max(MODULE_MIN_HEIGHT, module.height);
 
@@ -1878,9 +1911,15 @@ function showConnectorContextMenu(event, connectorDatum) {
     showContextMenu(event, [
         { icon: '\uD83D\uDD04', label: 'Reorder Pins', action: function () { openPinOrderDialog(connectorDatum); } },
         { icon: '\u2795', label: 'Add Pin', action: function () { addPinPrompt(connectorDatum); }, shortcut: 'N' },
+        { icon: connectorDatum.collapsed ? '\u2B06\uFE0F' : '\u2B07\uFE0F', label: connectorDatum.collapsed ? 'Expand (show pins)' : 'Collapse (hide pins)', action: function () { toggleConnectorCollapsed(connectorDatum); } },
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showConnectorEditDialog(connectorDatum); } },
         { icon: '\u274C', label: 'Delete', action: function () { deleteConnectorConfirm(connectorDatum); }, shortcut: 'Del' },
     ]);
+}
+
+function toggleConnectorCollapsed(connectorDatum) {
+    if (!bridge) return;
+    bridge.set_connector_collapsed(connectorDatum.id, !connectorDatum.collapsed);
 }
 
 function showPinContextMenu(event, pinDatum, connectorDatum) {
@@ -2473,6 +2512,12 @@ function snapRoutePointsToGrid(points) {
 }
 
 function computeRoutePoints(fromPin, toPin, obstacleRects) {
+    // Degenerate case: both endpoints at the same point (e.g. two pins of a
+    // single collapsed connector) — draw a zero-length wire; the router
+    // cannot produce a path between identical points.
+    if (fromPin && toPin && fromPin.x === toPin.x && fromPin.y === toPin.y) {
+        return [[fromPin.x, fromPin.y], [toPin.x, toPin.y]];
+    }
     if (window.SchematicRouting) {
         const routed = window.SchematicRouting.routeOrthogonal(
             fromPin, toPin, obstacleRects, ROUTE_MARGIN, ROUTE_LEAD

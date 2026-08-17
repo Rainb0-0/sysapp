@@ -498,6 +498,7 @@ def init_db():
                         width REAL DEFAULT 60,
                         height REAL DEFAULT 20,
                         side VARCHAR(10) DEFAULT 'top',
+                        collapsed BOOLEAN DEFAULT FALSE,
                         FOREIGN KEY(module_id) REFERENCES modules(id) ON DELETE CASCADE,
                         FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
                     )
@@ -654,6 +655,7 @@ def init_db():
             _add_column_if_not_exists(cur, 'connectors', 'width', 'REAL DEFAULT 60')
             _add_column_if_not_exists(cur, 'connectors', 'height', 'REAL DEFAULT 20')
             _add_column_if_not_exists(cur, 'connectors', 'side', "VARCHAR(10) DEFAULT 'top'")
+            _add_column_if_not_exists(cur, 'connectors', 'collapsed', 'BOOLEAN DEFAULT FALSE')
 
             _add_column_if_not_exists(cur, 'pins', 'project_id', 'INTEGER')
             _add_column_if_not_exists(cur, 'pins', 'pin_number', 'INTEGER')
@@ -2659,13 +2661,13 @@ def export_project_data(project_id: int) -> dict:
             # ── connectors ──
             cur.execute(
                 """SELECT id, name, module_id, project_id, number_of_pins,
-                           color, pos_x, pos_y, width, height, side
+                           color, pos_x, pos_y, width, height, side, collapsed
                     FROM connectors WHERE project_id = %s ORDER BY id""",
                 (project_id,),
             )
             cols = [
                 "id", "name", "module_id", "project_id", "number_of_pins",
-                "color", "pos_x", "pos_y", "width", "height", "side",
+                "color", "pos_x", "pos_y", "width", "height", "side", "collapsed",
             ]
             data["connectors"] = [dict(zip(cols, r)) for r in cur.fetchall()]
             connector_ids = [c["id"] for c in data["connectors"]]
@@ -2882,8 +2884,8 @@ def import_project_data(project_id: int, data: dict) -> tuple[bool, str]:
                 cur.execute(
                     """INSERT INTO connectors
                        (id, name, module_id, project_id, number_of_pins,
-                        color, pos_x, pos_y, width, height, side)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        color, pos_x, pos_y, width, height, side, collapsed)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT (id) DO UPDATE SET
                          name          = EXCLUDED.name,
                          module_id     = EXCLUDED.module_id,
@@ -2893,13 +2895,15 @@ def import_project_data(project_id: int, data: dict) -> tuple[bool, str]:
                          pos_y         = EXCLUDED.pos_y,
                          width         = EXCLUDED.width,
                          height        = EXCLUDED.height,
-                         side          = EXCLUDED.side""",
+                         side          = EXCLUDED.side,
+                         collapsed     = EXCLUDED.collapsed""",
                     (
                         c["id"], c["name"], c["module_id"], project_id,
                         c.get("number_of_pins", 0), c.get("color", "#C8C8FF"),
                         c.get("pos_x", 0), c.get("pos_y", 0),
                         c.get("width", 60), c.get("height", 20),
                         c.get("side", "top"),
+                        bool(c.get("collapsed", False)),
                     ),
                 )
 

@@ -708,6 +708,34 @@ class SchematicBridge(QObject):
         except Exception as e:
             self.save_finished.emit(False, f"Failed to update connector: {e}")
 
+    @pyqtSlot(int, bool)
+    def set_connector_collapsed(self, connector_id: int, collapsed: bool):
+        """
+        Collapse/expand a connector: a collapsed connector hides its pins but
+        keeps its wires (interfaces) visible and shrinks to the smallest
+        size. Reversible via the same call with collapsed=False.
+        """
+        try:
+            sid = get_connector_subsystem_id(connector_id)
+            if not self._check_perm("connector.edit", sid, "collapse connectors"):
+                return
+
+            def _direct():
+                persist_update_connector(connector_id, collapsed=bool(collapsed))
+                self.save_finished.emit(
+                    True, "Connector " + ("collapsed" if collapsed else "expanded")
+                )
+                self.get_scene_data()
+
+            self._route_edit(
+                "connector", "update", connector_id, sid,
+                {"id": connector_id, "fields": {"collapsed": bool(collapsed)}},
+                ("Collapse" if collapsed else "Expand") + f" connector #{connector_id}",
+                _direct,
+            )
+        except Exception as e:
+            self.save_finished.emit(False, f"Failed to update connector: {e}")
+
     @pyqtSlot(int, str, str, bool, float, float, str)
     def update_pin(self, pin_id: int, name: str = "",
                     pin_type: str = "", is_ground: bool = False,

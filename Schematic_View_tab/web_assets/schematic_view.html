@@ -139,6 +139,20 @@
     cursor: context-menu;
   }
 
+  /* A collapsed connector keeps its wires but hides its pins: the dashed
+     line and dashed bbox make the collapsed state obvious. */
+  .connector-collapsed .connector-line {
+    stroke-dasharray: 4 3;
+    opacity: 0.85;
+  }
+  .connector-collapsed .connector-bbox {
+    stroke-dasharray: 3 3;
+  }
+  .connector-collapsed-badge {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    opacity: 0.9;
+  }
+
   /* ========= Pin Styles ========= */
   /* Each pin is a <g.pin-circle> holding a type-specific symbol. The class
      name is kept so highlight / cursor / read-only behavior still applies. */

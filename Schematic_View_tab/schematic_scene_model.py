@@ -177,7 +177,7 @@ def load_schematic_scene(
         # ---------------- Connectors ---------------
         placeholders = ",".join(["%s"] * len(module_id_list))
         cur.execute(
-            f"SELECT id, module_id, name, color, side FROM connectors "
+            f"SELECT id, module_id, name, color, side, collapsed FROM connectors "
             f"WHERE module_id IN ({placeholders}) AND project_id = %s",
             (*module_id_list, project_id),
         )
@@ -311,7 +311,7 @@ def load_schematic_scene(
             })
 
         # ---------------- Assemble connectors + pins ----------------
-        for conn_id, mod_id, name, color, side in connector_rows:
+        for conn_id, mod_id, name, color, side, collapsed in connector_rows:
             pins = pin_data_by_connector.get(conn_id, [])
 
             saved = saved_connector_positions.get(conn_id) if saved_connector_positions else None
@@ -323,6 +323,7 @@ def load_schematic_scene(
                 "name": name,
                 "color": color,
                 "side": final_side,
+                "collapsed": bool(collapsed) if collapsed is not None else False,
                 "x": float(saved[0]) if saved else None,
                 "y": float(saved[1]) if saved else None,
                 "pins": pins,
@@ -822,8 +823,12 @@ def update_module(module_id: int, name: Optional[str] = None,
 def update_connector(connector_id: int, name: Optional[str] = None,
                      color: Optional[str] = None,
                      side: Optional[str] = None,
-                     number_of_pins: Optional[int] = None) -> None:
-    """Update a connector's fields. Only non-None values are updated."""
+                     number_of_pins: Optional[int] = None,
+                     collapsed: Any = NOT_SET) -> None:
+    """
+    Update a connector's fields. Only non-None values are updated.
+    collapsed uses the NOT_SET sentinel (True/False set it explicitly).
+    """
     project_id = get_current_project_id()
     if project_id is None:
         return
@@ -838,6 +843,8 @@ def update_connector(connector_id: int, name: Optional[str] = None,
         updates["side"] = side
     if number_of_pins is not None:
         updates["number_of_pins"] = number_of_pins
+    if collapsed is not NOT_SET:
+        updates["collapsed"] = bool(collapsed)
 
     if not updates:
         return

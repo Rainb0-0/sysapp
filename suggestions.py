@@ -742,6 +742,7 @@ def _apply_module(pid, action, payload) -> Tuple[bool, str]:
 
 def _apply_connector(pid, action, payload) -> Tuple[bool, str]:
     from Schematic_View_tab.schematic_scene_model import (
+        NOT_SET,
         create_connector, update_connector as _update_connector, delete_connector,
     )
 
@@ -772,6 +773,7 @@ def _apply_connector(pid, action, payload) -> Tuple[bool, str]:
         color=fields.get("color"),
         side=fields.get("side"),
         number_of_pins=fields.get("number_of_pins"),
+        collapsed=fields.get("collapsed", NOT_SET),
     )
     pos_updates = {k: fields[k] for k in ("pos_x", "pos_y")
                    if k in fields and fields[k] is not None}
@@ -1107,6 +1109,7 @@ def pending_preview_scene(scene: dict, user_id: Optional[int] = None) -> dict:
                 "name": payload.get("name", "Connector"),
                 "color": payload.get("color"),
                 "side": payload.get("side", "top"),
+                "collapsed": bool(payload.get("collapsed", False)),
                 "x": None,
                 "y": None,
                 "pins": [],
