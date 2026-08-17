@@ -1717,6 +1717,14 @@ function showToast(message, type) {
     var container = document.getElementById('toast-container');
     if (!container) return;
 
+    // Force the container above every overlay/dialog with inline styles so
+    // no stylesheet stacking quirk can hide the toast behind an open modal
+    // (the modal overlay uses z-index 20000; the CSS rule below is a backup).
+    container.style.cssText =
+        'position: fixed; bottom: 12px; right: 12px; z-index: 2147483647; ' +
+        'display: flex; flex-direction: column; gap: 6px; ' +
+        'pointer-events: none; max-width: 280px;';
+
     // Enforce max 2 visible toasts — remove oldest if at limit
     while (container.children.length >= 2) {
         var oldest = container.firstChild;
