@@ -228,6 +228,14 @@ class SchematicViewTab(QWidget):
         layout.addWidget(self.save_layout_btn)
         layout.addSpacing(8)
 
+        self.duplicate_btn = create_styled_button("📋 Duplicate Selected", "normal")
+        self.duplicate_btn.setToolTip(
+            "Duplicate the selected modules (with connectors, pins and optionally wires)"
+        )
+        self.duplicate_btn.clicked.connect(self.duplicate_selected)
+        layout.addWidget(self.duplicate_btn)
+        layout.addSpacing(8)
+
         # Modes toggle button
         self.modes_btn = create_styled_button("🗂️ Modes", "normal")
         self.modes_btn.setToolTip("Show/hide mode management panel")
@@ -253,6 +261,7 @@ class SchematicViewTab(QWidget):
             self.fit_view_btn,
             self.refresh_btn,
             self.save_layout_btn,
+            self.duplicate_btn,
             self.modes_btn,
             self.export_pdf_btn,
             self.export_png_btn,
@@ -328,6 +337,7 @@ class SchematicViewTab(QWidget):
             self.fit_view_btn,
             self.refresh_btn,
             self.save_layout_btn,
+            self.duplicate_btn,
             self.modes_btn,
             self.export_pdf_btn,
             self.export_png_btn,
@@ -353,6 +363,15 @@ class SchematicViewTab(QWidget):
                 "Read-only view — only the system admin can modify the schematic."
                 if readonly
                 else "Save current module/connector positions"
+            )
+        if hasattr(self, "duplicate_btn"):
+            self.duplicate_btn.setEnabled(
+                self.page_ready and not readonly
+            )
+            self.duplicate_btn.setToolTip(
+                "Read-only view — only the system admin can modify the schematic."
+                if readonly
+                else "Duplicate the selected modules (with connectors, pins and optionally wires)"
             )
 
         # Re-fetch the scene whenever the access policy *changes* (login,
@@ -447,6 +466,12 @@ class SchematicViewTab(QWidget):
         """Fit the schematic view to show all content."""
         self.web_view.page().runJavaScript(
             "if (typeof fitView === 'function') fitView();"
+        )
+
+    def duplicate_selected(self):
+        """Duplicate the currently selected modules (JS asks about wires)."""
+        self.web_view.page().runJavaScript(
+            "if (typeof duplicateSelected === 'function') duplicateSelected();"
         )
 
     def _get_timestamp(self):

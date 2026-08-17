@@ -1910,6 +1910,7 @@ function showModuleContextMenu(event, moduleDatum) {
     showContextMenu(event, [
         { icon: '\u2795', label: 'Add Connector', action: function () { addConnectorPrompt(moduleDatum); }, shortcut: 'N' },
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showModuleEditDialog(moduleDatum); } },
+        { icon: '\uD83D\uDCCB', label: 'Duplicate', action: function () { duplicateModuleContext(moduleDatum); } },
         { divider: true },
         { icon: '\uD83D\uDCCE', label: 'Attach File…', enabled: !hasDoc, action: function () { bridge.attach_file('module', moduleDatum.id); } },
         { icon: '\uD83D\uDCC2', label: 'Open Datasheet', enabled: hasDoc, action: function () { bridge.open_attachment('module', moduleDatum.id); } },
@@ -1933,6 +1934,7 @@ function showConnectorContextMenu(event, connectorDatum) {
         { icon: '\u2795', label: 'Add Pin', action: function () { addPinPrompt(connectorDatum); }, shortcut: 'N' },
         { icon: connectorDatum.collapsed ? '\u2B06\uFE0F' : '\u2B07\uFE0F', label: connectorDatum.collapsed ? 'Expand (show pins)' : 'Collapse (hide pins)', action: function () { toggleConnectorCollapsed(connectorDatum); } },
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showConnectorEditDialog(connectorDatum); } },
+        { icon: '\uD83D\uDCCB', label: 'Duplicate', action: function () { duplicateConnectorContext(connectorDatum); } },
         { divider: true },
         { icon: '\uD83D\uDCCE', label: 'Attach File…', enabled: !hasDoc, action: function () { bridge.attach_file('connector', connectorDatum.id); } },
         { icon: '\uD83D\uDCC2', label: 'Open Datasheet', enabled: hasDoc, action: function () { bridge.open_attachment('connector', connectorDatum.id); } },
@@ -1958,6 +1960,7 @@ function showPinContextMenu(event, pinDatum, connectorDatum) {
     var hasDoc = !!pinDatum.has_attachment;
     showContextMenu(event, [
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showPinEditDialog(pinDatum, connectorDatum); } },
+        { icon: '\uD83D\uDCCB', label: 'Duplicate', action: function () { duplicatePinContext(pinDatum); } },
         { divider: true },
         { icon: '\uD83D\uDCCE', label: 'Attach File…', enabled: !hasDoc, action: function () { bridge.attach_file('pin', pinDatum.id); } },
         { icon: '\uD83D\uDCC2', label: 'Open Datasheet', enabled: hasDoc, action: function () { bridge.open_attachment('pin', pinDatum.id); } },
@@ -2090,6 +2093,158 @@ function deletePinConfirm(pinDatum) {
     if (bridge && confirm(`Delete pin "${pinDatum.name}"?`)) {
         bridge.delete_pin(pinDatum.id);
     }
+}
+
+// ---------------------------------------------------------------------
+// Duplicate (modules / connectors / pins) — with the "copy wires?"
+// checkbox whenever the duplicated item has wires attached.
+// ---------------------------------------------------------------------
+function pinsForModule(moduleId) {
+    var ids = [];
+    sceneData.connectors.forEach(function (c) {
+        if (String(c.module_id) === String(moduleId)) {
+            c.pins.forEach(function (p) { ids.push(p.id); });
+        }
+    });
+    return ids;
+}
+
+function wiresForPinSet(pinSet) {
+    return sceneData.interfaces.filter(function (iface) {
+        return pinSet.has(iface.from_pin) || pinSet.has(iface.to_pin);
+    });
+}
+
+function showDuplicateWiresDialog(message, onConfirm) {
+    removeModal();
+
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    var dialog = document.createElement('div');
+    dialog.className = 'modal-dialog';
+
+    var title = document.createElement('h3');
+    title.textContent = 'Duplicate';
+    dialog.appendChild(title);
+
+    var msg = document.createElement('p');
+    msg.textContent = message;
+    msg.style.cssText = 'color:var(--text-primary);margin:0 0 12px;font-size:12px;line-height:1.5;';
+    dialog.appendChild(msg);
+
+    var label = document.createElement('label');
+    label.style.cssText = 'display:flex;align-items:center;gap:8px;color:var(--text-primary);font-size:12px;cursor:pointer;margin-bottom:14px;';
+    var checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = true;
+    label.appendChild(checkbox);
+    label.appendChild(document.createTextNode('Also duplicate the attached wires'));
+    dialog.appendChild(label);
+
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'modal-btn modal-btn-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', removeModal);
+    actions.appendChild(cancelBtn);
+
+    var dupBtn = document.createElement('button');
+    dupBtn.className = 'modal-btn modal-btn-primary';
+    dupBtn.textContent = 'Duplicate';
+    dupBtn.addEventListener('click', function () {
+        removeModal();
+        onConfirm(checkbox.checked);
+    });
+    actions.appendChild(dupBtn);
+
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    _modalEscHandler = function (e) { if (e.key === 'Escape') removeModal(); };
+    document.addEventListener('keydown', _modalEscHandler);
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) removeModal(); });
+    setTimeout(function () { checkbox.focus(); }, 100);
+}
+
+function promptDuplicateWithWires(pinIds, message, onConfirm) {
+    var pinSet = new Set(pinIds);
+    var wires = wiresForPinSet(pinSet);
+    if (!wires.length) {
+        onConfirm(false);
+        return;
+    }
+    showDuplicateWiresDialog(
+        message + ' ' + wires.length + ' wire(s) are attached. Copy them too?',
+        onConfirm
+    );
+}
+
+function duplicateSelected() {
+    if (!bridge) return;
+    if (IS_READONLY) {
+        showToast('The schematic view is read-only for your account.', 'error');
+        return;
+    }
+    if (selectedModuleIds.size === 0) {
+        showToast('Select at least one module to duplicate', 'error');
+        return;
+    }
+    var ids = Array.from(selectedModuleIds);
+    // Pending (not-yet-approved) items cannot be edited until approved.
+    var pending = ids.some(function (id) {
+        var m = sceneData.modules.find(function (mm) { return String(mm.id) === String(id); });
+        return m && (m.pending || m.pending_delete);
+    });
+    if (pending) {
+        showToast('Some selected modules are pending approval', 'error');
+        return;
+    }
+    var pinIds = [];
+    ids.forEach(function (id) { pinIds = pinIds.concat(pinsForModule(id)); });
+    promptDuplicateWithWires(
+        pinIds,
+        'Duplicate ' + ids.length + ' selected module(s)?',
+        function (copyWires) {
+            bridge.duplicate_modules(JSON.stringify(ids), copyWires);
+        }
+    );
+}
+
+function duplicateModuleContext(moduleDatum) {
+    if (!bridge || IS_READONLY) return;
+    promptDuplicateWithWires(
+        pinsForModule(moduleDatum.id),
+        'Duplicate module "' + moduleDatum.name + '"?',
+        function (copyWires) {
+            bridge.duplicate_modules(JSON.stringify([moduleDatum.id]), copyWires);
+        }
+    );
+}
+
+function duplicateConnectorContext(connectorDatum) {
+    if (!bridge || IS_READONLY) return;
+    var pinIds = connectorDatum.pins.map(function (p) { return p.id; });
+    promptDuplicateWithWires(
+        pinIds,
+        'Duplicate connector "' + connectorDatum.name + '"?',
+        function (copyWires) {
+            bridge.duplicate_connector(connectorDatum.id, copyWires);
+        }
+    );
+}
+
+function duplicatePinContext(pinDatum) {
+    if (!bridge || IS_READONLY) return;
+    promptDuplicateWithWires(
+        [pinDatum.id],
+        'Duplicate pin "' + pinDatum.name + '"?',
+        function (copyWires) {
+            bridge.duplicate_pin(pinDatum.id, copyWires);
+        }
+    );
 }
 
 // Opens the native PinOrderDialog (Qt) via the bridge -- this call blocks
@@ -3477,6 +3632,7 @@ window.setExportOverlayVisible = setExportOverlayVisible;
 window.triggerSaveLayout = triggerSaveLayout;
 window.getZoomState = getZoomState;
 window.setZoomState = setZoomState;
+window.duplicateSelected = duplicateSelected;
 
 // ---------------------------------------------------------------------
 // Modal dialogs for Connector & Pin creation with all DB fields

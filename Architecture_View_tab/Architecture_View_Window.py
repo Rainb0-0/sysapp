@@ -20,6 +20,8 @@ from PyQt5.QtWidgets import (
     QStyledItemDelegate,
     QStyle,
     QLabel,
+    QDialog,
+    QCheckBox,
 )
 from PyQt5.QtGui import QColor, QIcon, QPixmap, QFont, QDesktopServices
 from openpyxl import Workbook
@@ -40,10 +42,12 @@ from database import (
     list_entity_files,
     remove_entity_file,
     project_attachment_keys,
+    copy_entity_files,
 )
 from auth_manager import auth
 from access_control import can_edit_subsystem, guard_write
-from suggestions import suggest_change, pending_tree_rows
+from suggestions import suggest_change, pending_tree_rows, temp_id_for
+from Schematic_View_tab.schematic_scene_model import find_free_module_position
 from Architecture_View_tab.Module_Dialog import ModuleDialog
 from Architecture_View_tab.Connector_Dialog import ConnectorDialog
 from Architecture_View_tab.Pin_Dialog import PinDialog
@@ -469,10 +473,12 @@ class ArchitectureViewTab(QWidget):
 
         self.toggle_expand_btn = create_styled_button("📂 Expand All", "normal")
         self.select_toggle_btn = create_styled_button("✅ Select All", "normal")
+        self.duplicate_item_btn = create_styled_button("📋 Duplicate Selected", "normal")
         self.delete_item_btn = create_styled_button("🗑️ Delete Selected", "normal")
 
         controls_vbox.addWidget(self.toggle_expand_btn)
         controls_vbox.addWidget(self.select_toggle_btn)
+        controls_vbox.addWidget(self.duplicate_item_btn)
         controls_vbox.addWidget(self.delete_item_btn)
         controls_group.setLayout(controls_vbox)
         layout.addWidget(controls_group)
@@ -596,6 +602,7 @@ class ArchitectureViewTab(QWidget):
 
         # Control signals
         self.delete_item_btn.clicked.connect(self.handle_delete_item)
+        self.duplicate_item_btn.clicked.connect(self.handle_duplicate_item)
         self.select_toggle_btn.clicked.connect(self.handle_select_toggle)
         self.attach_file_btn.clicked.connect(self.handle_attach_file)
         self.open_datasheet_btn.clicked.connect(self.handle_open_datasheet)
@@ -1060,6 +1067,7 @@ class ArchitectureViewTab(QWidget):
         # delete enabled only if ALL checked items are within scope and user has proper delete perms
 
         self.delete_item_btn.setEnabled(self._can_delete_checked())
+        self.duplicate_item_btn.setEnabled(self._can_duplicate_checked())
 
         # datasheet buttons: attach only when none attached, open/remove only
         # when one exists; removing (like attaching) needs edit scope
@@ -1109,6 +1117,7 @@ class ArchitectureViewTab(QWidget):
         self.update_selection_button()
         self.resize_first_column()
         self.update_delete_button()
+        self.update_button_states()
 
     def _rebuild_checked_list(self):
         """Rebuild _checked list by scanning entire tree once (O(n))"""
@@ -1351,6 +1360,11 @@ class ArchitectureViewTab(QWidget):
         ITEM_TYPE_MODULE: "module",
         ITEM_TYPE_CONNECTOR: "connector",
         ITEM_TYPE_PIN: "pin",
+    }
+    _ENTITY_CREATE_PERM = {
+        ITEM_TYPE_MODULE: "module.create",
+        ITEM_TYPE_CONNECTOR: "connector.create",
+        ITEM_TYPE_PIN: "pin.create",
     }
 
     def handle_attach_file(self):
@@ -1621,6 +1635,582 @@ class ArchitectureViewTab(QWidget):
         self.update_delete_button()
         self.update_selection_button()
 
+    # ------------------------------------------------------------------
+    #   Duplicate selected modules / connectors / pins (subsystems excluded)
+    # ------------------------------------------------------------------
+    def _duplicable_checked_items(self):
+        """Checked items eligible for duplication.
+
+        Subsystems themselves are never duplicated, and any item whose
+        ancestor is also checked is skipped because the ancestor's copy
+        already includes it (module → connectors → pins).
+        """
+        checked = self.checked_items()
+        result = []
+        for item in checked:
+            try:
+                _ = item.text(0)
+            except RuntimeError:
+                continue
+            if item.data(0, Qt.UserRole + 1) == ITEM_TYPE_SUBSYSTEM:
+                continue
+            if self._has_checked_ancestor(item, checked):
+                continue
+            result.append(item)
+        return result
+
+    def _can_duplicate_checked(self):
+        items = self._duplicable_checked_items()
+        if not items:
+            return False
+
+        sids = []
+        types = []
+        for item in items:
+            t = item.data(0, Qt.UserRole + 1)
+            iid = item.data(0, Qt.UserRole)
+            sids.append(self._resolve_subsystem_id(t, iid))
+            types.append(t)
+
+        if not all(can_edit_subsystem(s) for s in sids):
+            return False
+
+        required = set(
+            self._ENTITY_CREATE_PERM.get(t, "") for t in types
+        ) - {""}
+        return all(auth.has_perm(p) for p in required)
+
+    def handle_duplicate_item(self):
+        """Duplicate the checked modules / connectors / pins.
+
+        A module is copied together with its connectors and pins; a
+        connector together with its pins; a pin is copied on its own.
+        Subsystems are never duplicated. Copied modules are placed at a
+        position that does not collide with anything on the schematic.
+        If any of the duplicated items has wires attached, the user is
+        asked whether the wires should be duplicated as well.
+        """
+        checked = self._duplicable_checked_items()
+        if not checked:
+            QMessageBox.information(
+                self, "Duplicate",
+                "Check at least one module, connector or pin to duplicate.\n"
+                "(Subsystems themselves cannot be duplicated.)",
+            )
+            return
+
+        # scope + permission validation
+        invalid = []
+        for it in checked:
+            t = it.data(0, Qt.UserRole + 1)
+            iid = it.data(0, Qt.UserRole)
+            sid = self._resolve_subsystem_id(t, iid)
+            perm = self._ENTITY_CREATE_PERM.get(t, "")
+            if not (
+                auth.is_system()
+                or (can_edit_subsystem(sid) and auth.has_perm(perm))
+            ):
+                invalid.append(it.text(0))
+        if invalid:
+            QMessageBox.warning(
+                self,
+                "Access denied",
+                "You cannot duplicate items outside your subsystem.\n"
+                "Invalid selection(s):\n- " + "\n- ".join(invalid),
+            )
+            return
+
+        if (
+            QMessageBox.question(
+                self,
+                "Confirm Duplicate",
+                f"Duplicate {len(checked)} item(s)?\n"
+                "Modules are copied with their connectors and pins;\n"
+                "connectors with their pins.",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+
+        pid = get_current_project_id()
+        if pid is None:
+            QMessageBox.warning(
+                self, "No Project", "Please open or create a project first."
+            )
+            return
+
+        # If anything being duplicated has wires attached, ask whether the
+        # wires should come along (checkbox, default on).
+        copy_wires = False
+        pin_ids = self._duplicated_pin_ids(pid, checked)
+        wire_count = self._count_wires(pid, pin_ids)
+        if wire_count:
+            ok, copy_wires = self._prompt_copy_wires(wire_count)
+            if not ok:
+                return
+
+        try:
+            if auth.is_system():
+                self._duplicate_system(pid, checked, copy_wires)
+            else:
+                self._duplicate_suggestion(pid, checked, copy_wires)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error", f"Failed to duplicate items:\n{e}"
+            )
+            return
+
+        self.load_data_tree()
+        self.update_button_states()
+
+    def _duplicated_pin_ids(self, pid, roots):
+        """All pin ids inside the duplicated items (subtree pins for
+        modules/connectors, the pin itself for pins)."""
+        pin_ids = set()
+        mod_ids = [
+            it.data(0, Qt.UserRole) for it in roots
+            if it.data(0, Qt.UserRole + 1) == ITEM_TYPE_MODULE
+        ]
+        conn_ids = [
+            it.data(0, Qt.UserRole) for it in roots
+            if it.data(0, Qt.UserRole + 1) == ITEM_TYPE_CONNECTOR
+        ]
+        with get_connection() as conn:
+            cur = conn.cursor()
+            if mod_ids:
+                ph = ",".join(["%s"] * len(mod_ids))
+                cur.execute(
+                    f"SELECT p.id FROM pins p JOIN connectors c "
+                    f"ON p.connector_id = c.id "
+                    f"WHERE c.module_id IN ({ph}) AND p.project_id = %s",
+                    (*mod_ids, pid),
+                )
+                pin_ids.update(r[0] for r in cur.fetchall())
+            if conn_ids:
+                ph = ",".join(["%s"] * len(conn_ids))
+                cur.execute(
+                    f"SELECT id FROM pins WHERE connector_id IN ({ph}) "
+                    f"AND project_id = %s",
+                    (*conn_ids, pid),
+                )
+                pin_ids.update(r[0] for r in cur.fetchall())
+        for it in roots:
+            if it.data(0, Qt.UserRole + 1) == ITEM_TYPE_PIN:
+                pin_ids.add(it.data(0, Qt.UserRole))
+        return pin_ids
+
+    def _count_wires(self, pid, pin_ids):
+        """Number of interfaces touching any of the given pins."""
+        if not pin_ids:
+            return 0
+        ph = ",".join(["%s"] * len(pin_ids))
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT COUNT(*) FROM interfaces WHERE project_id = %s "
+                f"AND (pin1_id IN ({ph}) OR pin2_id IN ({ph}))",
+                (pid, *pin_ids, *pin_ids),
+            )
+            return cur.fetchone()[0] or 0
+
+    def _prompt_copy_wires(self, wire_count):
+        """Ask whether attached wires should be duplicated too.
+        Returns (ok, copy_wires)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Duplicate")
+        auto_style_widget(dlg)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+        layout.addWidget(
+            QLabel(
+                f"{wire_count} wire(s) are attached to the item(s) being "
+                "duplicated."
+            )
+        )
+        cb = QCheckBox("Also duplicate the attached wires")
+        cb.setChecked(True)
+        layout.addWidget(cb)
+        btn_row = QHBoxLayout()
+        cancel_btn = create_styled_button("Cancel", "normal")
+        ok_btn = create_styled_button("Duplicate", "normal")
+        cancel_btn.clicked.connect(dlg.reject)
+        ok_btn.clicked.connect(dlg.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
+        if dlg.exec_() != QDialog.Accepted:
+            return False, False
+        return True, cb.isChecked()
+
+    def _next_copy_name(self, cur, table, parent_col, parent_id, base_name):
+        """Pick an unused 'X (Copy)' / 'X (Copy 2)' name in the parent scope."""
+        cur.execute(f"SELECT name FROM {table} WHERE {parent_col} = %s", (parent_id,))
+        existing = {r[0] for r in cur.fetchall()}
+        name = f"{base_name} (Copy)"
+        i = 2
+        while name in existing:
+            name = f"{base_name} (Copy {i})"
+            i += 1
+        return name
+
+    # ----- system-user path: direct DB copies in one transaction -----
+    def _duplicate_system(self, pid, roots, copy_wires):
+        pin_map = {}        # old pin id -> new pin id
+        module_map = {}     # old module id -> new module id
+        connector_map = {}  # old connector id -> new connector id
+        placed = []         # (id, x, y, w, h) rects of copies placed so far
+        with get_connection() as conn:
+            cur = conn.cursor()
+            for it in roots:
+                t = it.data(0, Qt.UserRole + 1)
+                iid = it.data(0, Qt.UserRole)
+                if t == ITEM_TYPE_MODULE:
+                    self._copy_module_db(
+                        cur, pid, iid, pin_map, module_map, connector_map,
+                        placed,
+                    )
+                elif t == ITEM_TYPE_CONNECTOR:
+                    self._copy_connector_db(
+                        cur, pid, iid, pin_map, connector_map
+                    )
+                elif t == ITEM_TYPE_PIN:
+                    self._copy_pin_db(cur, pid, iid, pin_map)
+            if copy_wires and pin_map:
+                self._duplicate_wires_db(cur, pid, pin_map)
+            conn.commit()
+
+        # Datasheets ride along: copy attached files onto the new entities
+        # (runs after commit so the rows exist for the attachment records).
+        for old_id, new_id in module_map.items():
+            copy_entity_files(pid, "module", old_id, new_id)
+        for old_id, new_id in connector_map.items():
+            copy_entity_files(pid, "connector", old_id, new_id)
+        for old_id, new_id in pin_map.items():
+            copy_entity_files(pid, "pin", old_id, new_id)
+
+    def _copy_module_db(self, cur, pid, mid, pin_map, module_map,
+                        connector_map, placed=None):
+        cur.execute(
+            "SELECT name, subsystem_id, mass, power, min_temp, max_temp, "
+            "num_connectors, color, photo, pos_x, pos_y, width, height "
+            "FROM modules WHERE id=%s AND project_id=%s",
+            (mid, pid),
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        (name, sid, mass, power, min_temp, max_temp, num_conn,
+         color, photo, px, py, w, h) = row
+        new_name = self._next_copy_name(
+            cur, "modules", "subsystem_id", sid, name
+        )
+        placed = placed if placed is not None else []
+        mw = float(w or 160.0)
+        mh = float(h or 100.0)
+        free_x, free_y = find_free_module_position(
+            pid, float(px or 0.0), float(py or 0.0), mw, mh,
+            occupied_extra=placed,
+        )
+        cur.execute(
+            "INSERT INTO modules (name, subsystem_id, project_id, mass, power, "
+            "min_temp, max_temp, num_connectors, color, photo, pos_x, pos_y, "
+            "width, height) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "RETURNING id",
+            (new_name, sid, pid, mass, power, min_temp, max_temp, num_conn,
+             color, photo, free_x, free_y, w, h),
+        )
+        new_mid = cur.fetchone()[0]
+        module_map[mid] = new_mid
+        placed.append((new_mid, free_x, free_y, mw, mh))
+        cur.execute(
+            "SELECT id FROM connectors WHERE module_id=%s AND project_id=%s "
+            "ORDER BY id",
+            (mid, pid),
+        )
+        for (cid,) in cur.fetchall():
+            self._copy_connector_db(
+                cur, pid, cid, pin_map, connector_map, new_module_id=new_mid
+            )
+
+    def _copy_connector_db(self, cur, pid, cid, pin_map, connector_map=None,
+                           new_module_id=None):
+        cur.execute(
+            "SELECT name, module_id, number_of_pins, color, pos_x, pos_y, "
+            "width, height, side, collapsed "
+            "FROM connectors WHERE id=%s AND project_id=%s",
+            (cid, pid),
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        (name, mid, num_pins, color, px, py, w, h, side, collapsed) = row
+        target_mid = new_module_id if new_module_id is not None else mid
+        new_name = self._next_copy_name(
+            cur, "connectors", "module_id", target_mid, name
+        )
+        cur.execute(
+            "INSERT INTO connectors (name, module_id, project_id, number_of_pins, "
+            "color, pos_x, pos_y, width, height, side, collapsed) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (new_name, target_mid, pid, num_pins, color,
+             (px or 0) + 20, (py or 0) + 20, w, h, side, collapsed),
+        )
+        new_cid = cur.fetchone()[0]
+        if connector_map is not None:
+            connector_map[cid] = new_cid
+        cur.execute(
+            "SELECT id FROM pins WHERE connector_id=%s AND project_id=%s "
+            "ORDER BY pin_number, id",
+            (cid, pid),
+        )
+        for (pin_id,) in cur.fetchall():
+            self._copy_pin_db(cur, pid, pin_id, pin_map, new_connector_id=new_cid)
+
+    def _copy_pin_db(self, cur, pid, pin_id, pin_map, new_connector_id=None):
+        cur.execute(
+            "SELECT name, connector_id, pin_number, pin_type, is_ground, value, "
+            "current, description FROM pins WHERE id=%s AND project_id=%s",
+            (pin_id, pid),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        (name, cid, pnum, ptype, isg, val, current, desc) = row
+        target_cid = new_connector_id if new_connector_id is not None else cid
+        new_name = self._next_copy_name(
+            cur, "pins", "connector_id", target_cid, name
+        )
+        cur.execute(
+            "INSERT INTO pins (name, connector_id, project_id, pin_number, "
+            "pin_type, is_ground, value, current, description) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (new_name, target_cid, pid, pnum, ptype, isg, val, current, desc),
+        )
+        new_pin_id = cur.fetchone()[0]
+        pin_map[pin_id] = new_pin_id
+        return new_pin_id
+
+    def _duplicate_wires_db(self, cur, pid, pin_map):
+        """Copy interfaces touching duplicated pins. Endpoints that were
+        duplicated map to their copies; external endpoints stay as-is (so a
+        copied pin keeps its connections to the rest of the schematic)."""
+        ph = ",".join(["%s"] * len(pin_map))
+        cur.execute(
+            f"SELECT pin1_id, pin2_id, color, current FROM interfaces "
+            f"WHERE project_id = %s AND (pin1_id IN ({ph}) OR pin2_id IN ({ph}))",
+            (pid, *pin_map.keys(), *pin_map.keys()),
+        )
+        rows = cur.fetchall()
+        for pin1, pin2, color, current in rows:
+            new1 = pin_map.get(pin1, pin1)
+            new2 = pin_map.get(pin2, pin2)
+            if new1 == new2:
+                continue
+            cur.execute(
+                "SELECT id FROM interfaces WHERE project_id = %s "
+                "AND ((pin1_id = %s AND pin2_id = %s) "
+                "OR (pin1_id = %s AND pin2_id = %s))",
+                (pid, new1, new2, new2, new1),
+            )
+            if cur.fetchone():
+                continue
+            cur.execute(
+                "INSERT INTO interfaces (project_id, pin1_id, pin2_id, color, "
+                "current) VALUES (%s, %s, %s, %s, %s)",
+                (pid, new1, new2, color, current),
+            )
+
+    # ----- non-system path: duplicates become pending suggestions -----
+    def _duplicate_suggestion(self, pid, roots, copy_wires):
+        used = {}    # (table, parent_col, parent_id) -> names already claimed
+        pin_map = {}  # old pin id -> temp pin id of the copy suggestion
+        placed = []   # (id, x, y, w, h) rects of copies placed so far
+        for it in roots:
+            t = it.data(0, Qt.UserRole + 1)
+            iid = it.data(0, Qt.UserRole)
+            if t == ITEM_TYPE_MODULE:
+                self._copy_module_sugg(pid, iid, used, pin_map, placed)
+            elif t == ITEM_TYPE_CONNECTOR:
+                self._copy_connector_sugg(pid, iid, used, pin_map)
+            elif t == ITEM_TYPE_PIN:
+                self._copy_pin_sugg(pid, iid, used, pin_map)
+        if copy_wires and pin_map:
+            self._duplicate_wires_sugg(pid, pin_map)
+        QMessageBox.information(
+            self, "Submitted",
+            "Duplicate(s) submitted for system-admin approval.\n"
+            "They will be applied once approved.",
+        )
+
+    def _suggestion_copy_name(self, pid, table, parent_col, parent_id,
+                              base_name, used):
+        """Like _next_copy_name but for suggestions: seed from the DB and
+        also avoid names already claimed elsewhere in this batch."""
+        key = (table, parent_col, parent_id)
+        if key not in used:
+            with get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    f"SELECT name FROM {table} WHERE {parent_col} = %s "
+                    "AND project_id = %s",
+                    (parent_id, pid),
+                )
+                used[key] = {r[0] for r in cur.fetchall()}
+        existing = used[key]
+        name = f"{base_name} (Copy)"
+        i = 2
+        while name in existing:
+            name = f"{base_name} (Copy {i})"
+            i += 1
+        existing.add(name)
+        return name
+
+    def _copy_module_sugg(self, pid, mid, used, pin_map, placed=None):
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name, subsystem_id, mass, power, min_temp, max_temp, "
+                "num_connectors, color, photo, pos_x, pos_y, width, height "
+                "FROM modules WHERE id=%s AND project_id=%s",
+                (mid, pid),
+            )
+            row = cur.fetchone()
+        if not row:
+            return
+        (name, sid, mass, power, min_temp, max_temp, num_conn,
+         color, photo, px, py, w, h) = row
+        new_name = self._suggestion_copy_name(
+            pid, "modules", "subsystem_id", sid, name, used
+        )
+        placed = placed if placed is not None else []
+        mw = float(w or 160.0)
+        mh = float(h or 100.0)
+        free_x, free_y = find_free_module_position(
+            pid, float(px or 0.0), float(py or 0.0), mw, mh,
+            occupied_extra=placed,
+        )
+        change_id = suggest_change(
+            "module", "create", None, sid,
+            {"name": new_name, "subsystem_id": sid,
+             "mass": mass or 0.0, "power": power or 0.0,
+             "min_temp": min_temp, "max_temp": max_temp,
+             "num_connectors": num_conn, "color": color,
+             "photo": photo, "x": free_x, "y": free_y,
+             "copy_attachments_from": mid},
+            f"Duplicate module '{name}'", dedupe=False,
+        )
+        if change_id is None:
+            return
+        temp_mid = temp_id_for(change_id, "module")
+        placed.append((temp_mid, free_x, free_y, mw, mh))
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id FROM connectors WHERE module_id=%s AND project_id=%s "
+                "ORDER BY id",
+                (mid, pid),
+            )
+            conn_ids = [r[0] for r in cur.fetchall()]
+        for cid in conn_ids:
+            self._copy_connector_sugg(pid, cid, used, pin_map,
+                                      new_module_id=temp_mid)
+
+    def _copy_connector_sugg(self, pid, cid, used, pin_map, new_module_id=None):
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name, module_id, number_of_pins, color, side "
+                "FROM connectors WHERE id=%s AND project_id=%s",
+                (cid, pid),
+            )
+            row = cur.fetchone()
+        if not row:
+            return
+        name, mid, num_pins, color, side = row
+        target_mid = new_module_id if new_module_id is not None else mid
+        new_name = self._suggestion_copy_name(
+            pid, "connectors", "module_id", target_mid, name, used
+        )
+        change_id = suggest_change(
+            "connector", "create", None, get_connector_subsystem_id(cid),
+            {"module_id": target_mid, "name": new_name,
+             "side": side or "top", "color": color,
+             "number_of_pins": num_pins or 0,
+             "copy_attachments_from": cid},
+            f"Duplicate connector '{name}'", dedupe=False,
+        )
+        if change_id is None:
+            return
+        temp_cid = temp_id_for(change_id, "connector")
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id FROM pins WHERE connector_id=%s AND project_id=%s "
+                "ORDER BY pin_number, id",
+                (cid, pid),
+            )
+            pin_ids = [r[0] for r in cur.fetchall()]
+        for p_id in pin_ids:
+            self._copy_pin_sugg(pid, p_id, used, pin_map,
+                                new_connector_id=temp_cid)
+
+    def _copy_pin_sugg(self, pid, pin_id, used, pin_map, new_connector_id=None):
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name, connector_id, pin_number, pin_type, is_ground, "
+                "value, description FROM pins WHERE id=%s AND project_id=%s",
+                (pin_id, pid),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        name, cid, pnum, ptype, isg, val, desc = row
+        target_cid = new_connector_id if new_connector_id is not None else cid
+        new_name = self._suggestion_copy_name(
+            pid, "pins", "connector_id", target_cid, name, used
+        )
+        change_id = suggest_change(
+            "pin", "create", None, get_pin_subsystem_id(pin_id),
+            {"connector_id": target_cid, "name": new_name,
+             "pin_type": ptype, "is_ground": bool(isg), "value": val,
+             "description": desc,
+             "copy_attachments_from": pin_id},
+            f"Duplicate pin '{name}'", dedupe=False,
+        )
+        if change_id is None:
+            return None
+        temp_pin_id = temp_id_for(change_id, "pin")
+        pin_map[pin_id] = temp_pin_id
+        return temp_pin_id
+
+    def _duplicate_wires_sugg(self, pid, pin_map):
+        """Suggest interface creates for wires touching duplicated pins
+        (endpoints mapped to the copies' temp ids, external endpoints kept)."""
+        ph = ",".join(["%s"] * len(pin_map))
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT pin1_id, pin2_id, color, current FROM interfaces "
+                f"WHERE project_id = %s AND (pin1_id IN ({ph}) OR pin2_id IN ({ph}))",
+                (pid, *pin_map.keys(), *pin_map.keys()),
+            )
+            rows = cur.fetchall()
+        for pin1, pin2, color, current in rows:
+            new1 = pin_map.get(pin1, pin1)
+            new2 = pin_map.get(pin2, pin2)
+            if new1 == new2:
+                continue
+            suggest_change(
+                "interface", "create", None, get_pin_subsystem_id(pin1),
+                {"pin1_id": new1, "pin2_id": new2,
+                 "color": color, "current": current},
+                f"Duplicate connection between pins {new1} ↔ {new2}",
+                dedupe=False,
+            )
+
     def handle_item_double_clicked(self, item, column):
         t = item.data(0, Qt.UserRole + 1)
         iid = item.data(0, Qt.UserRole)
@@ -1667,6 +2257,7 @@ class ArchitectureViewTab(QWidget):
         self.update_selection_button()
         self.resize_first_column()
         self.update_delete_button()
+        self.update_button_states()
 
     def handle_export_csv(self):
         """صادرات به CSV"""

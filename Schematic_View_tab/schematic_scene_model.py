@@ -95,6 +95,75 @@ def _grid_fallback_position(index: int) -> Tuple[float, float]:
     return GRID_MARGIN + col * GRID_CELL_W, GRID_MARGIN + row * GRID_CELL_H
 
 
+def _rects_overlap(ax: float, ay: float, aw: float, ah: float,
+                   bx: float, by: float, bw: float, bh: float,
+                   margin: float = 0.0) -> bool:
+    """True when two axis-aligned rects touch/overlap (with optional margin)."""
+    return not (
+        ax + aw + margin <= bx or bx + bw + margin <= ax
+        or ay + ah + margin <= by or by + bh + margin <= ay
+    )
+
+
+def find_free_module_position(project_id: int, x: float, y: float,
+                              width: float, height: float,
+                              margin: float = 40.0,
+                              max_attempts: int = 5000,
+                              occupied_extra=()) -> Tuple[float, float]:
+    """
+    Find a position near (x, y) where a module rect of the given size does
+    not overlap ANY module rect in the project (the original included — a
+    duplicated copy must never stack on top of its source). ``occupied_extra``
+    accepts additional (id, x, y, w, h) rects — e.g. copies already placed
+    earlier in the same batch, which are not yet visible to the DB query.
+
+    Starts at (x, y) and spirals outward in fixed steps until a free spot is
+    found, so duplicated copies land close to their source without stacking
+    on top of anything.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, pos_x, pos_y, width, height FROM modules "
+            "WHERE project_id = %s",
+            (project_id,),
+        )
+        occupied = [
+            (mid, float(px or 0.0), float(py or 0.0),
+             float(w or DEFAULT_MODULE_WIDTH), float(h or DEFAULT_MODULE_HEIGHT))
+            for mid, px, py, w, h in cur.fetchall()
+        ]
+        occupied.extend(tuple(r) for r in (occupied_extra or ()))
+
+    def collides(nx: float, ny: float) -> bool:
+        for _mid, ox, oy, ow, oh in occupied:
+            if _rects_overlap(nx, ny, width, height, ox, oy, ow, oh, margin):
+                return True
+        return False
+
+    if not collides(x, y):
+        return x, y
+
+    # Square spiral outward from (x, y): 1 right, 1 up, 2 left, 2 down,
+    # 3 right, 3 up, … until a non-colliding spot is found.
+    step = 60.0
+    dx, dy = step, 0.0
+    nx, ny = x, y
+    segment = 1
+    attempts = 0
+    while attempts < max_attempts:
+        for _ in range(2):
+            for _ in range(segment):
+                nx += dx
+                ny += dy
+                attempts += 1
+                if not collides(nx, ny):
+                    return nx, ny
+            dx, dy = -dy, dx
+        segment += 1
+    return x + step * 10, y  # final fallback
+
+
 def load_schematic_scene(
     module_ids: Optional[List[int]] = None,
     connector_ids: Optional[Set[int]] = None,

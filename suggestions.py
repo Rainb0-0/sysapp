@@ -36,6 +36,7 @@ from database import (
     pins_connectable,
     check_pin_change_interfaces,
     save_interface_points,
+    copy_entity_files,
 )
 from auth_manager import auth
 
@@ -704,6 +705,10 @@ def _apply_module(pid, action, payload) -> Tuple[bool, str]:
             min_temp=payload.get("min_temp"),
             max_temp=payload.get("max_temp"),
         )
+        if new_id:
+            src = payload.get("copy_attachments_from")
+            if src:
+                copy_entity_files(pid, "module", src, new_id)
         return (True, new_id) if new_id else (False, "Could not create module.")
     if action == "delete":
         eid = payload.get("id")
@@ -756,6 +761,10 @@ def _apply_connector(pid, action, payload) -> Tuple[bool, str]:
             color=payload.get("color"),
             number_of_pins=int(payload.get("number_of_pins", 0) or 0),
         )
+        if new_id:
+            src = payload.get("copy_attachments_from")
+            if src:
+                copy_entity_files(pid, "connector", src, new_id)
         return (True, new_id) if new_id else (False, "Could not create connector.")
     if action == "delete":
         eid = payload.get("id")
@@ -805,6 +814,10 @@ def _apply_pin(pid, action, payload) -> Tuple[bool, str]:
             value=payload.get("value"),
             description=payload.get("description"),
         )
+        if new_id:
+            src = payload.get("copy_attachments_from")
+            if src:
+                copy_entity_files(pid, "pin", src, new_id)
         return (True, new_id) if new_id else (False, "Could not create pin.")
     if action == "delete":
         eid = payload.get("id")

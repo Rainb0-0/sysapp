@@ -34,6 +34,7 @@ from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import QFileDialog
 
 from database import (
+    get_connection,
     get_current_project_id,
     get_module_subsystem_id,
     get_connector_subsystem_id,
@@ -44,6 +45,7 @@ from database import (
     attach_entity_file,
     list_entity_files,
     remove_entity_file,
+    copy_entity_files,
 )
 from auth_manager import auth
 from access_control import can_edit_subsystem
@@ -54,6 +56,9 @@ from suggestions import suggest_change, pending_preview_scene
 
 from Schematic_View_tab.schematic_scene_model import (
     NOT_SET,
+    DEFAULT_MODULE_WIDTH,
+    DEFAULT_MODULE_HEIGHT,
+    find_free_module_position,
     load_schematic_scene,
     save_module_positions as persist_module_positions,
     save_connector_positions as persist_connector_positions,
@@ -1103,6 +1108,299 @@ class SchematicBridge(QObject):
                              _direct)
         except Exception as e:
             self.save_finished.emit(False, f"Failed to delete pin: {e}")
+
+    # ------------------------------------------------------------------
+    # Duplicate (modules / connectors / pins) — system admin only,
+    # matching the schematic view's read-only policy.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _next_copy_name(table: str, parent_col: str, parent_id: int,
+                        base_name: str) -> str:
+        """Pick an unused 'X (Copy)' / 'X (Copy 2)' name among siblings."""
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT name FROM {table} WHERE {parent_col} = %s",
+                (parent_id,),
+            )
+            existing = {r[0] for r in cur.fetchall()}
+        name = f"{base_name} (Copy)"
+        i = 2
+        while name in existing:
+            name = f"{base_name} (Copy {i})"
+            i += 1
+        return name
+
+    @staticmethod
+    def _duplicate_wires(project_id: int, pin_map: Dict[int, int]) -> int:
+        """
+        Copy interfaces touching duplicated pins. Duplicated endpoints map
+        to their copies; external endpoints stay as-is, so a copied pin
+        keeps its connections to the rest of the schematic. Returns the
+        number of wires created.
+        """
+        if not pin_map:
+            return 0
+        ph = ",".join(["%s"] * len(pin_map))
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT pin1_id, pin2_id, color, current FROM interfaces "
+                f"WHERE project_id = %s AND (pin1_id IN ({ph}) OR pin2_id IN ({ph}))",
+                (project_id, *pin_map.keys(), *pin_map.keys()),
+            )
+            rows = cur.fetchall()
+        created = 0
+        for pin1, pin2, color, current in rows:
+            new1 = pin_map.get(pin1, pin1)
+            new2 = pin_map.get(pin2, pin2)
+            if new1 == new2:
+                continue
+            new_id = persist_create_interface(new1, new2, color, current)
+            if new_id is not None:
+                created += 1
+        return created
+
+    def _duplicate_module_db(self, project_id: int, mid: int,
+                             pin_map: Dict[int, int]):
+        """Copy a module (with connectors + pins) at a collision-free
+        position near the original; record old→new pin ids in pin_map."""
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name, subsystem_id, mass, power, min_temp, max_temp, "
+                "num_connectors, color, photo, pos_x, pos_y, width, height "
+                "FROM modules WHERE id=%s AND project_id=%s",
+                (mid, project_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            (name, sid, mass, power, min_temp, max_temp, _num_conn,
+             color, _photo, px, py, w, h) = row
+            cur.execute(
+                "SELECT id FROM connectors WHERE module_id=%s AND project_id=%s "
+                "ORDER BY id",
+                (mid, project_id),
+            )
+            conn_ids = [r[0] for r in cur.fetchall()]
+
+        mw = float(w or DEFAULT_MODULE_WIDTH)
+        mh = float(h or DEFAULT_MODULE_HEIGHT)
+        free_x, free_y = find_free_module_position(
+            project_id, float(px or 0.0), float(py or 0.0), mw, mh,
+        )
+        new_name = self._next_copy_name(
+            "modules", "subsystem_id", sid, name
+        )
+        new_mid = persist_create_module(
+            new_name,
+            x=free_x, y=free_y, width=mw, height=mh,
+            color=color, subsystem_id=sid,
+            mass=float(mass or 0.0), power=float(power or 0.0),
+            min_temp=min_temp, max_temp=max_temp,
+        )
+        if new_mid is None:
+            return None
+        # Datasheet rides along: copy the attached file onto the new module.
+        copy_entity_files(project_id, "module", mid, new_mid)
+        for cid in conn_ids:
+            self._duplicate_connector_db(project_id, cid, pin_map,
+                                         new_module_id=new_mid)
+        return new_mid
+
+    def _duplicate_connector_db(self, project_id: int, cid: int,
+                                pin_map: Dict[int, int], new_module_id=None):
+        """Copy a connector (with its pins); record old→new pin ids."""
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name, module_id, number_of_pins, color, side, collapsed "
+                "FROM connectors WHERE id=%s AND project_id=%s",
+                (cid, project_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            name, mid, num_pins, color, side, collapsed = row
+            cur.execute(
+                "SELECT id FROM pins WHERE connector_id=%s AND project_id=%s "
+                "ORDER BY pin_number, id",
+                (cid, project_id),
+            )
+            pin_ids = [r[0] for r in cur.fetchall()]
+
+        target_mid = new_module_id if new_module_id is not None else mid
+        new_name = self._next_copy_name(
+            "connectors", "module_id", target_mid, name
+        )
+        new_cid = persist_create_connector(
+            target_mid, new_name, side or "top", color=color,
+            number_of_pins=int(num_pins or 0),
+        )
+        if new_cid is None:
+            return None
+        if collapsed:
+            persist_update_connector(new_cid, collapsed=True)
+        # Datasheet rides along: copy the attached file onto the new connector.
+        copy_entity_files(project_id, "connector", cid, new_cid)
+        for p_id in pin_ids:
+            self._duplicate_pin_db(project_id, p_id, pin_map,
+                                   new_connector_id=new_cid)
+        return new_cid
+
+    def _duplicate_pin_db(self, project_id: int, pin_id: int,
+                          pin_map: Dict[int, int], new_connector_id=None):
+        """Copy a single pin; record old→new pin id in pin_map."""
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name, connector_id, pin_number, pin_type, is_ground, "
+                "value, current, description FROM pins "
+                "WHERE id=%s AND project_id=%s",
+                (pin_id, project_id),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        name, cid, _pnum, ptype, isg, val, current, desc = row
+        target_cid = new_connector_id if new_connector_id is not None else cid
+        new_name = self._next_copy_name(
+            "pins", "connector_id", target_cid, name
+        )
+        new_pin_id = persist_create_pin(
+            target_cid, new_name,
+            pin_type=ptype, is_ground=bool(isg),
+            value=val, current=current, description=desc,
+        )
+        if new_pin_id is not None:
+            pin_map[pin_id] = new_pin_id
+            # Datasheet rides along: copy the attached file onto the new pin.
+            copy_entity_files(project_id, "pin", pin_id, new_pin_id)
+        return new_pin_id
+
+    @pyqtSlot(str, bool, result=int)
+    def duplicate_modules(self, module_ids_json: str, copy_wires: bool = False):
+        """
+        Duplicate the given modules (with connectors and pins). Copies are
+        placed at a collision-free position near the original. If
+        ``copy_wires``, interfaces touching the duplicated pins are
+        duplicated too. Returns the number of modules duplicated, or -1 on
+        failure.
+        """
+        try:
+            ids = [int(i) for i in (json.loads(module_ids_json) if module_ids_json else [])]
+        except (ValueError, TypeError):
+            self.save_finished.emit(False, "Could not read the selection.")
+            return -1
+        if not ids:
+            self.save_finished.emit(
+                False, "Select at least one module to duplicate."
+            )
+            return -1
+        project_id = get_current_project_id()
+        if project_id is None:
+            self.save_finished.emit(False, "No project selected.")
+            return -1
+
+        try:
+            sids = set()
+            for mid in ids:
+                sid = get_module_subsystem_id(mid)
+                if sid is None:
+                    self.save_finished.emit(
+                        False, f"Module #{mid} no longer exists."
+                    )
+                    return -1
+                sids.add(sid)
+            if not self._check_all_subsystems(
+                "module.create", sids, "duplicate modules"
+            ):
+                return -1
+            if copy_wires and not self._check_all_subsystems(
+                "interface.create", sids, "duplicate wires"
+            ):
+                return -1
+
+            pin_map: Dict[int, int] = {}
+            duplicated = 0
+            for mid in ids:
+                if self._duplicate_module_db(project_id, mid, pin_map) is not None:
+                    duplicated += 1
+            wires = self._duplicate_wires(project_id, pin_map) if copy_wires else 0
+            msg = f"{duplicated} module(s) duplicated"
+            if copy_wires:
+                msg += f" ({wires} wire(s) copied)"
+            self.save_finished.emit(True, msg)
+            self.get_scene_data()
+            return duplicated
+        except Exception as e:
+            self.save_finished.emit(False, f"Failed to duplicate modules: {e}")
+            return -1
+
+    @pyqtSlot(int, bool, result=int)
+    def duplicate_connector(self, connector_id: int, copy_wires: bool = False):
+        """Duplicate a connector (with its pins) inside its module."""
+        try:
+            sid = get_connector_subsystem_id(connector_id)
+            if not self._check_perm("connector.create", sid, "duplicate connectors"):
+                return -1
+            if copy_wires and not self._check_perm(
+                "interface.create", sid, "duplicate wires"
+            ):
+                return -1
+            project_id = get_current_project_id()
+            if project_id is None:
+                self.save_finished.emit(False, "No project selected.")
+                return -1
+            pin_map: Dict[int, int] = {}
+            new_cid = self._duplicate_connector_db(
+                project_id, connector_id, pin_map
+            )
+            if new_cid is None:
+                self.save_finished.emit(False, "Could not duplicate connector.")
+                return -1
+            wires = self._duplicate_wires(project_id, pin_map) if copy_wires else 0
+            msg = "Connector duplicated"
+            if copy_wires:
+                msg += f" ({wires} wire(s) copied)"
+            self.save_finished.emit(True, msg)
+            self.get_scene_data()
+            return 1
+        except Exception as e:
+            self.save_finished.emit(False, f"Failed to duplicate connector: {e}")
+            return -1
+
+    @pyqtSlot(int, bool, result=int)
+    def duplicate_pin(self, pin_id: int, copy_wires: bool = False):
+        """Duplicate a single pin inside its connector."""
+        try:
+            sid = get_pin_subsystem_id(pin_id)
+            if not self._check_perm("pin.create", sid, "duplicate pins"):
+                return -1
+            if copy_wires and not self._check_perm(
+                "interface.create", sid, "duplicate wires"
+            ):
+                return -1
+            project_id = get_current_project_id()
+            if project_id is None:
+                self.save_finished.emit(False, "No project selected.")
+                return -1
+            pin_map: Dict[int, int] = {}
+            new_pin_id = self._duplicate_pin_db(project_id, pin_id, pin_map)
+            if new_pin_id is None:
+                self.save_finished.emit(False, "Could not duplicate pin.")
+                return -1
+            wires = self._duplicate_wires(project_id, pin_map) if copy_wires else 0
+            msg = "Pin duplicated"
+            if copy_wires:
+                msg += f" ({wires} wire(s) copied)"
+            self.save_finished.emit(True, msg)
+            self.get_scene_data()
+            return 1
+        except Exception as e:
+            self.save_finished.emit(False, f"Failed to duplicate pin: {e}")
+            return -1
 
     # ------------------------------------------------------------------
     # Pin reordering: opens the existing native PinOrderDialog.

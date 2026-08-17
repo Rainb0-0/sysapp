@@ -3186,6 +3186,25 @@ def remove_entity_file(attachment_id: int) -> bool:
     return True
 
 
+def copy_entity_files(project_id: int, entity_type: str,
+                      src_entity_id: int, dst_entity_id: int) -> int:
+    """
+    Copy every attached file (datasheet) from one entity to another:
+    the file is copied into the destination's managed folder and a new
+    entity_attachments row is recorded. Returns the number of files copied
+    (0 when the source has none).
+    """
+    entity_type = str(entity_type or "").strip().lower()
+    copied = 0
+    for f in list_entity_files(project_id, entity_type, src_entity_id):
+        new_id = attach_entity_file(
+            project_id, entity_type, dst_entity_id, f["file_path"]
+        )
+        if new_id is not None:
+            copied += 1
+    return copied
+
+
 def project_attachment_keys(project_id: int) -> set:
     """
     Return {(entity_type, entity_id)} for every entity in the project that
