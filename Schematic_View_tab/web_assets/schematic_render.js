@@ -2484,11 +2484,9 @@ function computeRoutePoints(fromPin, toPin, obstacleRects) {
 }
 
 // A module can be dragged/resized when it is editable and not a pending
-// create or pending delete. Pending *update* modules stay draggable: the
-// optimistic preview shows the proposed position, and a new drag simply
-// refreshes the pending suggestion (the bridge dedupes per module), so a
-// subsystem admin can keep arranging their own modules without waiting for
-// approval between every move.
+// create or pending delete. The schematic view is read-only for everyone
+// except the system admin (subsystem admins included), so `IS_READONLY`
+// short-circuits before any of the pending-state checks.
 function isDraggableModule(d) {
     if (IS_READONLY || d == null || d.editable === false) return false;
     if (d.pending_delete || d.pending === 'create' || d.pending === 'delete') return false;

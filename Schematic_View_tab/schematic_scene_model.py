@@ -281,14 +281,13 @@ def load_schematic_scene(
             else:
                 module_color = SUBSYSTEM_COLORS[idx % len(SUBSYSTEM_COLORS)]
 
-            # Any logged-in user may interact with the schematic: the system
-            # admin's edits hit the DB directly, everyone else's become
-            # pending suggestions (approved later). `editable` drives every
+            # The schematic view is read-only for everyone except the system
+            # admin (subsystem admins included). `editable` drives every
             # interaction guard on the JS side (context menus, drag, resize,
             # re-routing), and the bridge re-checks auth on each write.
             # Pending-created entities are marked editable=False by the
             # suggestions overlay so they can't be dragged before approval.
-            can_edit = auth.is_logged_in()
+            can_edit = auth.is_system()
 
             scene["modules"].append({
                 "id": mod_id,
@@ -337,9 +336,9 @@ def load_schematic_scene(
                 else:
                     points, meta = [], {}
 
-                # See the module `editable` comment: any logged-in user may
-                # interact; non-admin changes become pending suggestions.
-                iface_can_edit = auth.is_logged_in()
+                # Read-only for everyone except the system admin (see the
+                # module `editable` comment above).
+                iface_can_edit = auth.is_system()
 
                 scene["interfaces"].append({
                     "id": iface_id,

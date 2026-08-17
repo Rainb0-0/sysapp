@@ -17,11 +17,12 @@ On the JS side, after `new QWebChannel(qt.webChannelTransport, ...)`,
 `window.bridge` exposes every @pyqtSlot below, and the page listens to
 `bridge.scene_data_ready.connect(json => ...)` etc.
 
-Approval workflow: the SYSTEM ADMIN applies changes directly to the DB.
-Every other logged-in user *proposes* — their edits are recorded as pending
-changes (see suggestions.py) and applied only after the admin approves them.
-The proposer immediately sees their own pending changes on the canvas
-(optimistic preview, marked as pending) via pending_preview_scene().
+Read-only policy: the schematic view is read-only for everyone except the
+SYSTEM ADMIN (subsystem admins included). The admin's edits hit the DB
+directly; everyone else sees the scene with `readonly` set and all edit
+affordances disabled (the bridge also rejects their write calls). Pending
+changes they created from other tabs (see suggestions.py) are still shown
+on the canvas as an optimistic preview via pending_preview_scene().
 """
 
 import json
@@ -103,24 +104,33 @@ class SchematicBridge(QObject):
     # Permission helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _deny_read_only() -> bool:
+    def _require_system_admin() -> bool:
+        """
+        The schematic view is read-only for everyone except the system
+        admin (subsystem admins included). Returns True only for a logged-in
+        system admin.
+        """
+        return auth.is_logged_in() and auth.is_system()
+
+    def _deny_read_only(self) -> bool:
         """Emit the read-only denial toast and return False."""
         if not auth.is_logged_in():
-            # not used anymore (any logged-in user may propose), kept for
-            # safety if something calls it directly
-            pass
+            self.save_finished.emit(False, "You must sign in first to edit.")
+        else:
+            self.save_finished.emit(
+                False, "The schematic view is read-only for your account."
+            )
         return False
 
     def _check_perm(self, perm_code: str, subsystem_id: int | None, action_desc: str) -> bool:
         """
-        Check the caller may *propose* the operation: any logged-in user with
-        the permission and subsystem scope may edit (system admin applies
-        directly; everyone else's edit becomes a suggestion). Emits
-        save_finished on failure. Returns True if the operation is allowed.
+        Check the caller may edit the schematic view (system admin only),
+        then the permission code + subsystem scope. Emits save_finished on
+        failure so the JS front-end sees a toast / status message.
+        Returns True if the operation is allowed.
         """
-        if not auth.is_logged_in():
-            self.save_finished.emit(False, "You must sign in first to edit.")
-            return False
+        if not self._require_system_admin():
+            return self._deny_read_only()
         if not auth.has_perm(perm_code):
             self.save_finished.emit(False, f"You don't have permission to {action_desc}.")
             return False
@@ -134,16 +144,16 @@ class SchematicBridge(QObject):
 
     def _check_all_subsystems(self, perm_code: str, subsystem_ids: Set[int], action_desc: str) -> bool:
         """
-        Check the caller may propose an operation spanning ALL given
-        subsystems. Returns True when allowed.
+        Check the caller may edit the schematic view (system admin only),
+        then permission + ALL subsystems in the set.
         """
-        if not auth.is_logged_in():
-            self.save_finished.emit(False, "You must sign in first to edit.")
-            return False
+        if not self._require_system_admin():
+            return self._deny_read_only()
         if not auth.has_perm(perm_code):
             self.save_finished.emit(False, f"You don't have permission to {action_desc}.")
             return False
         if not subsystem_ids:
+            # No subsystem scope to check — could be unassigned items
             return True
         for sid in subsystem_ids:
             if not can_edit_subsystem(sid):
@@ -183,9 +193,11 @@ class SchematicBridge(QObject):
     @pyqtSlot()
     def get_scene_data(self):
         """Send the current schematic scene (plus the user's pending preview) to JS."""
-        # Any logged-in user can interact; only the system admin's edits
-        # hit the DB directly (everyone else's become suggestions).
-        readonly = not auth.is_logged_in()
+        # The schematic view is read-only for everyone except the system
+        # admin (subsystem admins included): the `readonly` flag makes the
+        # JS renderer disable every edit affordance, and `editable` flags on
+        # modules/interfaces back that up per item.
+        readonly = not self._require_system_admin()
         if get_current_project_id() is None:
             empty_scene = {
                 "subsystems": [],
@@ -276,10 +288,12 @@ class SchematicBridge(QObject):
         positions_json example:
           '{"1": {"x": 120.0, "y": 80.0}, "2": {"x": 340.0, "y": 80.0}}'
 
-        System admin: persisted directly. Others: each module position
-        becomes (or replaces) a pending 'edit module position' suggestion —
-        the optimistic preview keeps the modules where the user dragged them.
+        System admin only — the schematic view is read-only for everyone
+        else (subsystem admins included).
         """
+        if not self._require_system_admin():
+            self._deny_read_only()
+            return
         try:
             raw: Dict[str, Any] = json.loads(positions_json)
             all_positions = {int(mod_id): pos for mod_id, pos in raw.items()}
@@ -338,9 +352,12 @@ class SchematicBridge(QObject):
         """Save connector positions. Each entry can include x, y, and optionally side.
         Example: '{"1": {"x": 100, "y": 50, "side": "right"}}'
 
-        System admin: persisted directly. Others: recorded as pending edits
-        (optimistic preview keeps the connectors where they were dragged).
+        System admin only — the schematic view is read-only for everyone
+        else (subsystem admins included).
         """
+        if not self._require_system_admin():
+            self._deny_read_only()
+            return
         try:
             raw: Dict[str, Any] = json.loads(positions_json)
             all_positions = {int(conn_id): pos for conn_id, pos in raw.items()}
@@ -399,9 +416,12 @@ class SchematicBridge(QObject):
           '{"12": {"points": [[x,y], [x,y]], "manual_override": true,
                     "edit_count": 3, "locked": false}}'
 
-        System admin: persisted directly. Others: recorded as pending routing
-        edits (the preview shows the proposed route on the wire).
+        System admin only — the schematic view is read-only for everyone
+        else (subsystem admins included).
         """
+        if not self._require_system_admin():
+            self._deny_read_only()
+            return
         try:
             raw: Dict[str, Any] = json.loads(routing_json)
             all_interface_data: Dict[int, Any] = {}
