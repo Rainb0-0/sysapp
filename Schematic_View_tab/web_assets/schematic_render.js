@@ -1173,7 +1173,7 @@ function renderModules(scene) {
         .attr('class', 'module-label')
         .attr('x', d => Math.max(MODULE_MIN_WIDTH, d.width) / 2)
         .attr('y', d => Math.max(MODULE_MIN_HEIGHT, d.height) / 2 - 6)
-        .text(d => d.name);
+        .text(d => d.name + (d.has_attachment ? '  📎' : ''));
 
     // Power info label: standalone module power (P) and connected pin power
     moduleSel.append('text')
@@ -1296,7 +1296,7 @@ function renderModules(scene) {
             .attr('font-weight', '600')
             .attr('font-family', '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif')
             .attr('pointer-events', 'none')
-            .text(c.name);
+            .text(c.name + (c.has_attachment ? '  📎' : ''));
 
         // Small "collapsed" cue under the label so the hidden pins are obvious.
         if (collapsed) {
@@ -1361,7 +1361,7 @@ function renderModules(scene) {
             appendPinSymbol(pinG, pcls);
             // Invisible hit area so grabbing the exact symbol is easy
             pinG.append('circle').attr('class', 'pin-hit').attr('r', PIN_RADIUS);
-            pinG.append('title').text(p.name + ' | Connector: ' + c.name);
+            pinG.append('title').text(p.name + ' | Connector: ' + c.name + (p.has_attachment ? ' | 📎 datasheet attached' : ''));
             pinG.on('mousedown', function (event) {
                     event.stopPropagation();
                     if (event.button !== 0) return;  // left button only (right-click = context menu)
@@ -1853,6 +1853,9 @@ function showContextMenu(event, items) {
 
         const el = document.createElement('div');
         el.className = 'menu-item';
+        if (item.enabled === false) {
+            el.classList.add('menu-item-disabled');
+        }
 
         if (item.icon) {
             const iconSpan = document.createElement('span');
@@ -1876,6 +1879,8 @@ function showContextMenu(event, items) {
             // Absorb a stray click that lands on an item under the cursor
             // within the grace window (Windows right-click drivers).
             if (Date.now() - openedAt < CONTEXT_MENU_GRACE_MS) return;
+            // Disabled items are inert — the menu stays open.
+            if (item.enabled === false) return;
             item.action();
             removeContextMenu();
         });
@@ -1901,9 +1906,15 @@ function showModuleContextMenu(event, moduleDatum) {
         showToast('This item is pending approval', 'error');
         return;
     }
+    var hasDoc = !!moduleDatum.has_attachment;
     showContextMenu(event, [
         { icon: '\u2795', label: 'Add Connector', action: function () { addConnectorPrompt(moduleDatum); }, shortcut: 'N' },
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showModuleEditDialog(moduleDatum); } },
+        { divider: true },
+        { icon: '\uD83D\uDCCE', label: 'Attach File…', enabled: !hasDoc, action: function () { bridge.attach_file('module', moduleDatum.id); } },
+        { icon: '\uD83D\uDCC2', label: 'Open Datasheet', enabled: hasDoc, action: function () { bridge.open_attachment('module', moduleDatum.id); } },
+        { icon: '\uD83D\uDDD1\uFE0F', label: 'Remove Datasheet', enabled: hasDoc, action: function () { bridge.remove_attachment('module', moduleDatum.id); } },
+        { divider: true },
         { icon: '\u274C', label: 'Delete', action: function () { deleteModuleConfirm(moduleDatum); }, shortcut: 'Del' },
     ]);
 }
@@ -1916,11 +1927,17 @@ function showConnectorContextMenu(event, connectorDatum) {
         showToast('This item is pending approval', 'error');
         return;
     }
+    var hasDoc = !!connectorDatum.has_attachment;
     showContextMenu(event, [
         { icon: '\uD83D\uDD04', label: 'Reorder Pins', action: function () { openPinOrderDialog(connectorDatum); } },
         { icon: '\u2795', label: 'Add Pin', action: function () { addPinPrompt(connectorDatum); }, shortcut: 'N' },
         { icon: connectorDatum.collapsed ? '\u2B06\uFE0F' : '\u2B07\uFE0F', label: connectorDatum.collapsed ? 'Expand (show pins)' : 'Collapse (hide pins)', action: function () { toggleConnectorCollapsed(connectorDatum); } },
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showConnectorEditDialog(connectorDatum); } },
+        { divider: true },
+        { icon: '\uD83D\uDCCE', label: 'Attach File…', enabled: !hasDoc, action: function () { bridge.attach_file('connector', connectorDatum.id); } },
+        { icon: '\uD83D\uDCC2', label: 'Open Datasheet', enabled: hasDoc, action: function () { bridge.open_attachment('connector', connectorDatum.id); } },
+        { icon: '\uD83D\uDDD1\uFE0F', label: 'Remove Datasheet', enabled: hasDoc, action: function () { bridge.remove_attachment('connector', connectorDatum.id); } },
+        { divider: true },
         { icon: '\u274C', label: 'Delete', action: function () { deleteConnectorConfirm(connectorDatum); }, shortcut: 'Del' },
     ]);
 }
@@ -1938,8 +1955,14 @@ function showPinContextMenu(event, pinDatum, connectorDatum) {
         showToast('This item is pending approval', 'error');
         return;
     }
+    var hasDoc = !!pinDatum.has_attachment;
     showContextMenu(event, [
         { icon: '\u2699\uFE0F', label: 'Edit Properties', action: function () { showPinEditDialog(pinDatum, connectorDatum); } },
+        { divider: true },
+        { icon: '\uD83D\uDCCE', label: 'Attach File…', enabled: !hasDoc, action: function () { bridge.attach_file('pin', pinDatum.id); } },
+        { icon: '\uD83D\uDCC2', label: 'Open Datasheet', enabled: hasDoc, action: function () { bridge.open_attachment('pin', pinDatum.id); } },
+        { icon: '\uD83D\uDDD1\uFE0F', label: 'Remove Datasheet', enabled: hasDoc, action: function () { bridge.remove_attachment('pin', pinDatum.id); } },
+        { divider: true },
         { icon: '\u274C', label: 'Delete', action: function () { deletePinConfirm(pinDatum); }, shortcut: 'Del' },
     ]);
 }

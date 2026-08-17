@@ -36,6 +36,7 @@ from database import (
     get_current_project_id,
     get_complete_layout,
     pins_connectable,
+    project_attachment_keys,
 )
 from auth_manager import auth
 
@@ -136,6 +137,9 @@ def load_schematic_scene(
     with get_connection() as conn:
         cur = conn.cursor()
 
+        # Entities with attached datasheets, so the renderer can badge them.
+        attached = project_attachment_keys(project_id)
+
         # ---------------- Managed data pin types ----------------
         cur.execute("SELECT name FROM pin_types ORDER BY name")
         scene["pin_types"] = [r[0] for r in cur.fetchall()]
@@ -212,6 +216,7 @@ def load_schematic_scene(
                     # wiring rule sees the real stored value.
                     "pin_type": pin_type,
                     "is_ground": bool(is_ground) if is_ground is not None else False,
+                    "has_attachment": ("pin", pin_id) in attached,
                 })
 
         # Compute hidden_pins: if pin_ids is specified, pins NOT in it have wiring hidden
@@ -307,6 +312,7 @@ def load_schematic_scene(
                 "power": power,
                 "min_temp": min_temp,
                 "max_temp": max_temp,
+                "has_attachment": ("module", mod_id) in attached,
                 "editable": can_edit,
             })
 
@@ -324,6 +330,7 @@ def load_schematic_scene(
                 "color": color,
                 "side": final_side,
                 "collapsed": bool(collapsed) if collapsed is not None else False,
+                "has_attachment": ("connector", conn_id) in attached,
                 "x": float(saved[0]) if saved else None,
                 "y": float(saved[1]) if saved else None,
                 "pins": pins,

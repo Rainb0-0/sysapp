@@ -26,9 +26,12 @@ on the canvas as an optimistic preview via pending_preview_scene().
 """
 
 import json
+import os
 from typing import Any, Dict, Set
 
-from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot, QUrl
+from PyQt5.QtGui import QDesktopServices
+from PyQt5.QtWidgets import QFileDialog
 
 from database import (
     get_current_project_id,
@@ -38,6 +41,9 @@ from database import (
     get_interface_subsystem_ids,
     pins_connectable,
     check_pin_change_interfaces,
+    attach_entity_file,
+    list_entity_files,
+    remove_entity_file,
 )
 from auth_manager import auth
 from access_control import can_edit_subsystem
@@ -735,6 +741,145 @@ class SchematicBridge(QObject):
             )
         except Exception as e:
             self.save_finished.emit(False, f"Failed to update connector: {e}")
+
+    # ------------------------------------------------------------------
+    # File attachments (datasheets) for modules / connectors / pins
+    # ------------------------------------------------------------------
+    _ENTITY_PERM = {
+        "module": "module.edit",
+        "connector": "connector.edit",
+        "pin": "pin.edit",
+    }
+
+    @staticmethod
+    def _entity_subsystem_id(entity_type: str, entity_id: int) -> int | None:
+        if entity_type == "module":
+            return get_module_subsystem_id(entity_id)
+        if entity_type == "connector":
+            return get_connector_subsystem_id(entity_id)
+        if entity_type == "pin":
+            return get_pin_subsystem_id(entity_id)
+        return None
+
+    @pyqtSlot(str, int, result=bool)
+    def attach_file(self, entity_type: str, entity_id: int):
+        """
+        Attach a datasheet/file to a module, connector or pin. The file is
+        copied into the project's managed attachments folder (system admin
+        only, matching the schematic's read-only policy).
+        """
+        try:
+            entity_type = str(entity_type or "").strip().lower()
+            if entity_type not in self._ENTITY_PERM:
+                self.save_finished.emit(False, f"Unknown entity type: {entity_type}")
+                return False
+            if not self._require_system_admin():
+                self._deny_read_only()
+                return False
+            sid = self._entity_subsystem_id(entity_type, entity_id)
+            if not self._check_perm(self._ENTITY_PERM[entity_type], sid, "attach files"):
+                return False
+            project_id = get_current_project_id()
+            if project_id is None:
+                self.save_finished.emit(False, "No project selected.")
+                return False
+
+            host = getattr(self, "_host_widget", None)
+            path, _ = QFileDialog.getOpenFileName(
+                host,
+                f"Attach file to {entity_type}…",
+                "",
+                "All Files (*);;PDF Files (*.pdf);;Documents (*.pdf *.doc *.docx *.txt *.xlsx *.csv)",
+            )
+            if not path:
+                return False
+            new_id = attach_entity_file(project_id, entity_type, entity_id, path)
+            if new_id is None:
+                self.save_finished.emit(False, "Could not attach the file.")
+                return False
+            self.save_finished.emit(True, "File attached.")
+            self.get_scene_data()  # refresh the paperclip badges
+            return True
+        except Exception as e:
+            self.save_finished.emit(False, f"Failed to attach file: {e}")
+            return False
+
+    @pyqtSlot(str, int, result=bool)
+    def open_attachment(self, entity_type: str, entity_id: int):
+        """
+        Open the most recently attached file for a module/connector/pin in
+        the OS's preferred application (any signed-in user may view).
+        """
+        try:
+            entity_type = str(entity_type or "").strip().lower()
+            if entity_type not in self._ENTITY_PERM:
+                self.save_finished.emit(False, f"Unknown entity type: {entity_type}")
+                return False
+            if not auth.is_logged_in():
+                self.save_finished.emit(False, "You must sign in first.")
+                return False
+            project_id = get_current_project_id()
+            if project_id is None:
+                self.save_finished.emit(False, "No project selected.")
+                return False
+            files = list_entity_files(project_id, entity_type, entity_id)
+            if not files:
+                self.save_finished.emit(
+                    False, f"No file attached to this {entity_type}."
+                )
+                return False
+            f = files[-1]  # most recently attached
+            if not os.path.isfile(f["file_path"]):
+                self.save_finished.emit(
+                    False, f"File not found on disk: {f['file_name']}"
+                )
+                return False
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(f["file_path"]))
+            if opened:
+                self.save_finished.emit(True, f"Opening {f['file_name']}…")
+            else:
+                self.save_finished.emit(False, f"Could not open {f['file_name']}.")
+            return bool(opened)
+        except Exception as e:
+            self.save_finished.emit(False, f"Failed to open attachment: {e}")
+            return False
+
+    @pyqtSlot(str, int, result=bool)
+    def remove_attachment(self, entity_type: str, entity_id: int):
+        """
+        Remove the attached datasheet from a module/connector/pin (system
+        admin only, matching the schematic's read-only policy).
+        """
+        try:
+            entity_type = str(entity_type or "").strip().lower()
+            if entity_type not in self._ENTITY_PERM:
+                self.save_finished.emit(False, f"Unknown entity type: {entity_type}")
+                return False
+            if not self._require_system_admin():
+                self._deny_read_only()
+                return False
+            sid = self._entity_subsystem_id(entity_type, entity_id)
+            if not self._check_perm(self._ENTITY_PERM[entity_type], sid, "remove files"):
+                return False
+            project_id = get_current_project_id()
+            if project_id is None:
+                self.save_finished.emit(False, "No project selected.")
+                return False
+            files = list_entity_files(project_id, entity_type, entity_id)
+            if not files:
+                self.save_finished.emit(
+                    False, f"No file attached to this {entity_type}."
+                )
+                return False
+            removed = all(remove_entity_file(f["id"]) for f in files)
+            self.save_finished.emit(
+                removed, "Datasheet removed." if removed else "Failed to remove datasheet."
+            )
+            self.get_scene_data()  # refresh the paperclip badges
+            return removed
+        except Exception as e:
+            self.save_finished.emit(False, f"Failed to remove file: {e}")
+            return False
 
     @pyqtSlot(int, str, str, bool, float, float, str)
     def update_pin(self, pin_id: int, name: str = "",

@@ -2,7 +2,7 @@
 import os
 import sys
 import csv
-from PyQt5.QtCore import QTimer, Qt, QSize, QRect
+from PyQt5.QtCore import QTimer, Qt, QSize, QRect, QUrl
 from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QStyle,
     QLabel,
 )
-from PyQt5.QtGui import QColor, QIcon, QPixmap, QFont
+from PyQt5.QtGui import QColor, QIcon, QPixmap, QFont, QDesktopServices
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment
@@ -36,9 +36,13 @@ from database import (
     get_pin_subsystem_id,
     delete_subsystem_guarded,
     UnauthorizedError,
+    attach_entity_file,
+    list_entity_files,
+    remove_entity_file,
+    project_attachment_keys,
 )
 from auth_manager import auth
-from access_control import can_edit_subsystem
+from access_control import can_edit_subsystem, guard_write
 from suggestions import suggest_change, pending_tree_rows
 from Architecture_View_tab.Module_Dialog import ModuleDialog
 from Architecture_View_tab.Connector_Dialog import ConnectorDialog
@@ -242,6 +246,7 @@ class ArchitectureViewTab(QWidget):
         super().__init__(parent)
         self._checked = []  # List of checked items
         self._color_icon_cache = {}
+        self._attachment_keys = set()  # {(entity_type, entity_id)} with a datasheet
         self.setObjectName("ArchitectureViewTab")
         self.setAttribute(Qt.WA_StyledBackground, True)
 
@@ -472,6 +477,20 @@ class ArchitectureViewTab(QWidget):
         controls_group.setLayout(controls_vbox)
         layout.addWidget(controls_group)
 
+        # Datasheets group (file attachments for the selected entity)
+        datasheet_group = QGroupBox("")
+        datasheet_vbox = QVBoxLayout()
+
+        self.attach_file_btn = create_styled_button("📎 Attach Datasheet…", "normal")
+        self.open_datasheet_btn = create_styled_button("📂 Open Datasheet", "normal")
+        self.remove_datasheet_btn = create_styled_button("🗑️ Remove Datasheet", "normal")
+
+        datasheet_vbox.addWidget(self.attach_file_btn)
+        datasheet_vbox.addWidget(self.open_datasheet_btn)
+        datasheet_vbox.addWidget(self.remove_datasheet_btn)
+        datasheet_group.setLayout(datasheet_vbox)
+        layout.addWidget(datasheet_group)
+
         # اعمال استایل گروه‌ها
         self.update_group_styles()
 
@@ -578,6 +597,9 @@ class ArchitectureViewTab(QWidget):
         # Control signals
         self.delete_item_btn.clicked.connect(self.handle_delete_item)
         self.select_toggle_btn.clicked.connect(self.handle_select_toggle)
+        self.attach_file_btn.clicked.connect(self.handle_attach_file)
+        self.open_datasheet_btn.clicked.connect(self.handle_open_datasheet)
+        self.remove_datasheet_btn.clicked.connect(self.handle_remove_datasheet)
 
         # Export signals
         self.export_csv_btn.clicked.connect(self.handle_export_csv)
@@ -738,6 +760,10 @@ class ArchitectureViewTab(QWidget):
                     pin_pending.update({p: "update" for p in pending_overlay["pin"]["updates"]})
                     pin_pending.update({p: "delete" for p in pin_deleted})
 
+                # entities with attached files (datasheets) → 📎 badge
+                attachment_keys = project_attachment_keys(pid)
+                self._attachment_keys = attachment_keys
+
                 modules_by_subsystem = {}
                 for row in module_rows:
                     mod_id, _, subsystem_id, *_ = row
@@ -780,7 +806,8 @@ class ArchitectureViewTab(QWidget):
                             "⏳ " if pstate in ("create", "update")
                             else ("🗑️ " if pstate == "delete" else "")
                         )
-                        display_name = f"{mod_index}. {marker}{name}"
+                        paperclip = " 📎" if ("module", mod_id) in attachment_keys else ""
+                        display_name = f"{mod_index}. {marker}{name}{paperclip}"
                         mod_item = QTreeWidgetItem(
                             sub_item,
                             [
@@ -828,7 +855,8 @@ class ArchitectureViewTab(QWidget):
                                 "⏳ " if cstate in ("create", "update")
                                 else ("🗑️ " if cstate == "delete" else "")
                             )
-                            display_cname = f"{conn_index}. {cmarker}{cname}"
+                            cpaperclip = " 📎" if ("connector", cid) in attachment_keys else ""
+                            display_cname = f"{conn_index}. {cmarker}{cname}{cpaperclip}"
                             conn_item = QTreeWidgetItem(
                                 mod_item,
                                 [
@@ -882,7 +910,8 @@ class ArchitectureViewTab(QWidget):
                                     "⏳ " if pstate2 in ("create", "update")
                                     else ("🗑️ " if pstate2 == "delete" else "")
                                 )
-                                display_pname = f"{pin_index}. {pmarker}{pname}"
+                                ppaperclip = " 📎" if ("pin", pid_row) in attachment_keys else ""
+                                display_pname = f"{pin_index}. {pmarker}{pname}{ppaperclip}"
                                 pin_item = QTreeWidgetItem(
                                     conn_item,
                                     [
@@ -1031,6 +1060,18 @@ class ArchitectureViewTab(QWidget):
         # delete enabled only if ALL checked items are within scope and user has proper delete perms
 
         self.delete_item_btn.setEnabled(self._can_delete_checked())
+
+        # datasheet buttons: attach only when none attached, open/remove only
+        # when one exists; removing (like attaching) needs edit scope
+        is_entity = item_type in (ITEM_TYPE_MODULE, ITEM_TYPE_CONNECTOR, ITEM_TYPE_PIN)
+        entity_name = self._ENTITY_NAME.get(item_type) if is_entity else None
+        has_doc = is_entity and entity_name and (entity_name, item_id) in self._attachment_keys
+        can_edit_scope = is_entity and (
+            (selected_sid is not None and can_edit_subsystem(selected_sid)) or auth.is_system()
+        )
+        self.attach_file_btn.setEnabled(can_edit_scope and not has_doc)
+        self.open_datasheet_btn.setEnabled(has_doc)
+        self.remove_datasheet_btn.setEnabled(can_edit_scope and has_doc)
 
         # export/expand/select are always allowed
         self.export_excel_btn.setEnabled(True)
@@ -1297,6 +1338,129 @@ class ArchitectureViewTab(QWidget):
         auto_style_widget(dlg)
         dlg.pins_updated.connect(self.load_data_tree)
         dlg.exec_()
+
+    # ------------------------------------------------------------------
+    #   File attachments (datasheets) for modules / connectors / pins
+    # ------------------------------------------------------------------
+    _ENTITY_PERM = {
+        ITEM_TYPE_MODULE: "module.edit",
+        ITEM_TYPE_CONNECTOR: "connector.edit",
+        ITEM_TYPE_PIN: "pin.edit",
+    }
+    _ENTITY_NAME = {
+        ITEM_TYPE_MODULE: "module",
+        ITEM_TYPE_CONNECTOR: "connector",
+        ITEM_TYPE_PIN: "pin",
+    }
+
+    def handle_attach_file(self):
+        iid, t = self.get_selected_item()
+        if t not in self._ENTITY_PERM:
+            QMessageBox.information(
+                self, "Attach File", "Select a module, connector or pin first."
+            )
+            return
+        pid = get_current_project_id()
+        if pid is None:
+            QMessageBox.warning(
+                self, "No Project", "Please open or create a project first."
+            )
+            return
+        if not guard_write(self._ENTITY_PERM[t], self._resolve_subsystem_id(t, iid), parent=self):
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Attach file to {self._ENTITY_NAME[t]}…",
+            "",
+            "All Files (*);;PDF Files (*.pdf);;Documents (*.pdf *.doc *.docx *.txt *.xlsx *.csv)",
+        )
+        if not path:
+            return
+        new_id = attach_entity_file(pid, self._ENTITY_NAME[t], iid, path)
+        if new_id is None:
+            QMessageBox.critical(
+                self, "Attach File",
+                "Could not attach the file (a datasheet may already be attached).",
+            )
+            return
+        self.load_data_tree()  # refresh the 📎 markers
+        self.update_button_states()
+        QMessageBox.information(self, "Attach File", "File attached.")
+
+    def handle_remove_datasheet(self):
+        iid, t = self.get_selected_item()
+        if t not in self._ENTITY_PERM:
+            QMessageBox.information(
+                self, "Remove Datasheet", "Select a module, connector or pin first."
+            )
+            return
+        pid = get_current_project_id()
+        if pid is None:
+            QMessageBox.warning(
+                self, "No Project", "Please open or create a project first."
+            )
+            return
+        if not guard_write(
+            self._ENTITY_PERM[t], self._resolve_subsystem_id(t, iid), parent=self
+        ):
+            return
+        files = list_entity_files(pid, self._ENTITY_NAME[t], iid)
+        if not files:
+            QMessageBox.information(
+                self, "Remove Datasheet",
+                f"No file attached to this {self._ENTITY_NAME[t]}.",
+            )
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Remove Datasheet",
+                f"Remove the attached datasheet ({files[-1]['file_name']})?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        removed = all(remove_entity_file(f["id"]) for f in files)
+        if not removed:
+            QMessageBox.critical(
+                self, "Remove Datasheet", "Failed to remove the datasheet."
+            )
+            return
+        self.load_data_tree()  # refresh 📎 markers + button states
+        self.update_button_states()
+
+    def handle_open_datasheet(self):
+        iid, t = self.get_selected_item()
+        if t not in self._ENTITY_PERM:
+            QMessageBox.information(
+                self, "Open Datasheet", "Select a module, connector or pin first."
+            )
+            return
+        pid = get_current_project_id()
+        if pid is None:
+            QMessageBox.warning(
+                self, "No Project", "Please open or create a project first."
+            )
+            return
+        files = list_entity_files(pid, self._ENTITY_NAME[t], iid)
+        if not files:
+            QMessageBox.information(
+                self, "Open Datasheet",
+                f"No file attached to this {self._ENTITY_NAME[t]}.",
+            )
+            return
+        f = files[-1]  # most recently attached
+        if not os.path.isfile(f["file_path"]):
+            QMessageBox.warning(
+                self, "Open Datasheet",
+                f"File not found on disk: {f['file_name']}",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(f["file_path"])):
+            QMessageBox.warning(
+                self, "Open Datasheet", f"Could not open {f['file_name']}."
+            )
 
     def handle_delete_item(self):
         checked = self.checked_items()

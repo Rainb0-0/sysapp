@@ -3,6 +3,7 @@ from psycopg2 import pool
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 from contextlib import contextmanager
@@ -522,6 +523,26 @@ def init_db():
                         FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
                     )
                 """)
+
+            # --- entity_attachments (datasheets / files attached to a
+            # module, connector or pin; files are copied into the project's
+            # managed attachments folder) ---
+            if not _table_exists(cur, 'entity_attachments'):
+                cur.execute("""
+                    CREATE TABLE entity_attachments (
+                        id SERIAL PRIMARY KEY,
+                        project_id INTEGER NOT NULL,
+                        entity_type VARCHAR(16) NOT NULL,  -- module | connector | pin
+                        entity_id INTEGER NOT NULL,
+                        file_path TEXT NOT NULL,
+                        file_name TEXT NOT NULL,
+                        uploaded_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_attachments_entity "
+                    "ON entity_attachments(project_id, entity_type, entity_id)"
+                )
 
             # --- interfaces ---
             if not _table_exists(cur, 'interfaces'):
@@ -3041,3 +3062,143 @@ def import_project_data(project_id: int, data: dict) -> tuple[bool, str]:
         except Exception:
             pass
         return False, f"Failed to import project data: {e}"
+
+
+# -----------------------------------------------------------------------------
+# File attachments (datasheets) for modules / connectors / pins
+# -----------------------------------------------------------------------------
+# Attached files are copied into a managed per-project folder so they survive
+# the original file being moved/deleted. The DB stores the copied path.
+
+
+def _attachments_base_dir() -> str:
+    """Root folder for copied attachment files (per-project subfolders)."""
+    return os.path.join(get_app_data_dir(), "attachments")
+
+
+def attach_entity_file(project_id: int, entity_type: str, entity_id: int,
+                       src_path: str) -> int | None:
+    """
+    Copy a file into the project's managed attachments folder and record it.
+    Returns the new attachment id, or None on failure.
+    """
+    entity_type = str(entity_type or "").strip().lower()
+    if entity_type not in ("module", "connector", "pin"):
+        return None
+    if not src_path or not os.path.isfile(src_path):
+        return None
+    # One datasheet per entity: refuse if a file is already attached so the
+    # UIs can rely on the invariant (attach disabled once one exists).
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM entity_attachments WHERE project_id = %s "
+                "AND entity_type = %s AND entity_id = %s LIMIT 1",
+                (project_id, entity_type, entity_id),
+            )
+            if cur.fetchone() is not None:
+                return None
+    except Exception:
+        return None
+    file_name = os.path.basename(src_path)
+    dest_dir = os.path.join(
+        _attachments_base_dir(), str(project_id), f"{entity_type}_{entity_id}"
+    )
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except Exception:
+        return None
+    dest = os.path.join(dest_dir, file_name)
+    if os.path.exists(dest):
+        stem, ext = os.path.splitext(file_name)
+        n = 1
+        while os.path.exists(dest):
+            dest = os.path.join(dest_dir, f"{stem}_{n}{ext}")
+            n += 1
+    try:
+        shutil.copy2(src_path, dest)
+    except Exception:
+        return None
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO entity_attachments "
+                "(project_id, entity_type, entity_id, file_path, file_name) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (project_id, entity_type, entity_id, dest, file_name),
+            )
+            new_id = cur.fetchone()[0]
+            conn.commit()
+            return new_id
+    except Exception:
+        return None
+
+
+def list_entity_files(project_id: int, entity_type: str, entity_id: int) -> list[dict]:
+    """
+    Return attachment records for an entity:
+    [{"id", "file_name", "file_path", "uploaded_at"}, ...] (empty on error).
+    """
+    entity_type = str(entity_type or "").strip().lower()
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, file_name, file_path, uploaded_at FROM entity_attachments "
+                "WHERE project_id = %s AND entity_type = %s AND entity_id = %s ORDER BY id",
+                (project_id, entity_type, entity_id),
+            )
+            return [
+                {"id": r[0], "file_name": r[1], "file_path": r[2], "uploaded_at": r[3]}
+                for r in cur.fetchall()
+            ]
+    except Exception:
+        return []
+
+
+def remove_entity_file(attachment_id: int) -> bool:
+    """Delete an attachment record and its copied file. Returns True on success."""
+    path = None
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT file_path FROM entity_attachments WHERE id = %s",
+                (attachment_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            path = row[0]
+            cur.execute(
+                "DELETE FROM entity_attachments WHERE id = %s", (attachment_id,)
+            )
+            conn.commit()
+    except Exception:
+        return False
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    return True
+
+
+def project_attachment_keys(project_id: int) -> set:
+    """
+    Return {(entity_type, entity_id)} for every entity in the project that
+    has at least one attachment (used to badge items in the UIs).
+    """
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT DISTINCT entity_type, entity_id FROM entity_attachments "
+                "WHERE project_id = %s",
+                (project_id,),
+            )
+            return {(r[0], r[1]) for r in cur.fetchall()}
+    except Exception:
+        return set()
