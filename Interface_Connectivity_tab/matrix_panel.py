@@ -20,7 +20,7 @@ from suggestions import propose_interface_change
 
 from Interface_Connectivity_tab.wiring_utils import (
     get_all_pins_with_full_numbered_name, PREDEFINED_COLORS, AddInterfaceDialog,
-    _pin_label,
+    _pin_label, pin_type_label,
 )
 
 # Import new style system
@@ -654,12 +654,18 @@ class MatrixPanel(QWidget):
 
         The matrix always represents relations BETWEEN the connectors of the
         ROW scope and the connectors of the COLUMN scope — never inside a
-        single connector.
+        single connector. Each row/column header shows the connector's pins
+        (name + type) instead of the connector name; the connector itself is
+        identified by the filters.
         """
         if not self._ensure_project_selected():
             self.matrix_table.setRowCount(0)
             self.matrix_table.setColumnCount(0)
             return
+
+        # Pins may have changed in other tabs — re-fetch so the headers
+        # always reflect the current pin set.
+        self.connector_data_cache = {}
 
         project_id = get_current_project_id()
 
@@ -685,41 +691,78 @@ class MatrixPanel(QWidget):
         self.connectors_for_matrix = row_connectors
         self.connector_ids_for_matrix = self.matrix_row_connector_ids
 
-        row_headers = [f"{m} - {c}" for m, c, _ in row_connectors]
-        col_headers = [f"{m} - {c}" for m, c, _ in col_connectors]
+        row_headers = [self._pin_header(cid) for _, _, cid in row_connectors]
+        col_headers = [self._pin_header(cid) for _, _, cid in col_connectors]
         self.matrix_table.setRowCount(len(row_headers))
         self.matrix_table.setColumnCount(len(col_headers))
         self.matrix_table.setVerticalHeaderLabels(row_headers)
         self.matrix_table.setHorizontalHeaderLabels(col_headers)
 
+        # Multi-line headers: let the vertical header fit the longest pin line
+        # and give the horizontal header enough height for all pin lines.
+        self.matrix_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        max_lines = max((h.count("\n") + 1 for h in col_headers), default=1)
+        self.matrix_table.horizontalHeader().setMinimumHeight(14 * max_lines + 16)
+
         self._update_scope_label(len(row_headers), len(col_headers))
         self.refresh_matrix_display()
 
+    def _pin_header(self, conn_id):
+        """
+        Header text for a connector row/column: each pin on its own lines,
+        with the pin name on one line and its type on the next (e.g.
+        'Pin 3: RX' / 'Data') so nothing clips in the narrow header columns.
+        The connector/module names are intentionally omitted — the filters
+        identify the scope.
+        """
+        pins = self._get_pins_for_connector(conn_id)
+        lines = []
+        for _pid, _pname, info in pins:
+            num = info.get("pin_number")
+            name = info.get("name")
+            lines.append(f"Pin {num}: {name}" if name else f"Pin {num}")
+            lines.append(pin_type_label(
+                info.get("pin_type"), info.get("is_ground"), info.get("value")
+            ))
+        if not lines:
+            return "—"
+        return "\n".join(lines)
+
     def _fetch_scope_connectors(self, cursor, project_id, level, sid):
-        """Fetch (module_name, connector_name, connector_id) rows for a scope."""
+        """
+        Fetch (module_name, connector_name, connector_id) rows for a scope,
+        excluding connectors that have no pins.
+        """
         base = """
             SELECT DISTINCT m.name, c.name, c.id
             FROM connectors c
             JOIN modules m ON c.module_id = m.id AND m.project_id = %s
             WHERE c.project_id = %s
+              AND EXISTS (
+                  SELECT 1 FROM pins p
+                  WHERE p.connector_id = c.id AND p.project_id = %s
+              )
         """
         if level == "subsystem":
             cursor.execute(
                 base + " AND m.subsystem_id = %s ORDER BY m.name, c.name",
-                (project_id, project_id, sid),
+                (project_id, project_id, project_id, sid),
             )
         elif level == "module":
             cursor.execute(
                 base + " AND c.module_id = %s ORDER BY m.name, c.name",
-                (project_id, project_id, sid),
+                (project_id, project_id, project_id, sid),
             )
         elif level == "connector":
             cursor.execute(
                 base + " AND c.id = %s ORDER BY m.name, c.name",
-                (project_id, project_id, sid),
+                (project_id, project_id, project_id, sid),
             )
         else:
-            cursor.execute(base + " ORDER BY m.name, c.name", (project_id, project_id))
+            cursor.execute(
+                base + " ORDER BY m.name, c.name",
+                (project_id, project_id, project_id),
+            )
         return cursor.fetchall()
 
     def refresh_matrix_display(self):
@@ -756,9 +799,10 @@ class MatrixPanel(QWidget):
         n_rows = self.matrix_table.rowCount()
         n_cols = self.matrix_table.columnCount()
 
-        # Clear all cells
+        # Clear all cells. Row heights follow the (multi-line) pin header:
+        # the vertical header is in ResizeToContents mode (set in
+        # load_matrix_data), so the pin name/type lines never clip.
         for r in range(n_rows):
-            self.matrix_table.setRowHeight(r, 40)
             for c in range(n_cols):
                 item = self.matrix_table.item(r, c)
                 if not item:
@@ -821,8 +865,10 @@ class MatrixPanel(QWidget):
             )
             return
 
-        connector1_name = self.matrix_table.verticalHeaderItem(row).text()
-        connector2_name = self.matrix_table.horizontalHeaderItem(column).text()
+        # The header now shows pins, not the connector name — pull the name
+        # from the connector data for the dialog title / pin labels.
+        connector1_name = self.matrix_row_connectors[row][1]
+        connector2_name = self.matrix_col_connectors[column][1]
 
         # Fetch pins for both connectors
         pins1 = self._get_pins_for_connector(connector1_id)
