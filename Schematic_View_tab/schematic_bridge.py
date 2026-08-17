@@ -47,6 +47,7 @@ from styles.theme_manager import theme_manager
 from suggestions import suggest_change, pending_preview_scene
 
 from Schematic_View_tab.schematic_scene_model import (
+    NOT_SET,
     load_schematic_scene,
     save_module_positions as persist_module_positions,
     save_connector_positions as persist_connector_positions,
@@ -572,9 +573,23 @@ class SchematicBridge(QObject):
         except Exception as e:
             self.save_finished.emit(False, f"Failed to rename module: {e}")
 
-    @pyqtSlot(str, int, float, float, str, result=int)
+    @staticmethod
+    def _parse_temp(value) -> float | None:
+        """Parse a temperature sent from JS ('' = unset -> None)."""
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    @pyqtSlot(str, int, float, float, str, str, str, result=int)
     def create_module(self, name: str, subsystem_id: int = -1,
-                       mass: float = 0.0, power: float = 0.0, color: str = ""):
+                       mass: float = 0.0, power: float = 0.0, color: str = "",
+                       min_temp: str = "", max_temp: str = ""):
         try:
             if subsystem_id < 0 or subsystem_id is None:
                 self.save_finished.emit(False, "A subsystem must be selected to create a module.")
@@ -582,9 +597,13 @@ class SchematicBridge(QObject):
             if not self._check_perm("module.create", subsystem_id, "create modules"):
                 return -1
 
+            mt = self._parse_temp(min_temp)
+            xt = self._parse_temp(max_temp)
+
             def _direct():
                 c = color if color else None
-                new_id = persist_create_module(name, subsystem_id=subsystem_id, mass=mass, power=power, color=c)
+                new_id = persist_create_module(name, subsystem_id=subsystem_id, mass=mass,
+                                               power=power, color=c, min_temp=mt, max_temp=xt)
                 if new_id is None:
                     self.save_finished.emit(False, "Could not create module")
                     return -1
@@ -595,7 +614,8 @@ class SchematicBridge(QObject):
             result = self._route_edit(
                 "module", "create", None, subsystem_id,
                 {"name": name, "subsystem_id": subsystem_id, "mass": mass,
-                 "power": power, "color": color or None},
+                 "power": power, "color": color or None,
+                 "min_temp": mt, "max_temp": xt},
                 f"Add module \"{name}\"",
                 _direct,
             )
@@ -604,10 +624,11 @@ class SchematicBridge(QObject):
             self.save_finished.emit(False, f"Failed to create module: {e}")
             return -1
 
-    @pyqtSlot(int, str, float, float, str, int)
+    @pyqtSlot(int, str, float, float, str, int, str, str)
     def update_module(self, module_id: int, name: str = "",
                        mass: float = -1, power: float = -1,
-                       color: str = "", subsystem_id: int = -1):
+                       color: str = "", subsystem_id: int = -1,
+                       min_temp: str = "", max_temp: str = ""):
         """Update module fields from JS."""
         try:
             sid = get_module_subsystem_id(module_id)
@@ -625,6 +646,9 @@ class SchematicBridge(QObject):
                 fields["color"] = color
             if subsystem_id >= 0:
                 fields["subsystem_id"] = subsystem_id
+            # Temps are always sent ('' = clear to NULL, number = set).
+            fields["min_temp"] = self._parse_temp(min_temp)
+            fields["max_temp"] = self._parse_temp(max_temp)
 
             def _direct():
                 persist_update_module(
@@ -634,6 +658,8 @@ class SchematicBridge(QObject):
                     power=fields.get("power"),
                     color=fields.get("color"),
                     subsystem_id=fields.get("subsystem_id"),
+                    min_temp=fields.get("min_temp", NOT_SET),
+                    max_temp=fields.get("max_temp", NOT_SET),
                 )
                 self.save_finished.emit(True, "Module updated")
                 self.get_scene_data()

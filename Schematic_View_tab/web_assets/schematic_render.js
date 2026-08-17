@@ -3816,6 +3816,17 @@ function showModuleDialog() {
     powerI.type = 'number'; powerI.value = '0'; powerI.min = '0'; powerI.step = '0.1';
     powerF.appendChild(powerI);
 
+    // Min / Max operating temperature (optional)
+    var minTempF = createModalField(dialog, 'Min Operating Temp (°C)');
+    var minTempI = document.createElement('input');
+    minTempI.type = 'number'; minTempI.value = ''; minTempI.placeholder = 'e.g. -40'; minTempI.step = '0.1';
+    minTempF.appendChild(minTempI);
+
+    var maxTempF = createModalField(dialog, 'Max Operating Temp (°C)');
+    var maxTempI = document.createElement('input');
+    maxTempI.type = 'number'; maxTempI.value = ''; maxTempI.placeholder = 'e.g. 85'; maxTempI.step = '0.1';
+    maxTempF.appendChild(maxTempI);
+
     // Subsystem (required)
     var hasSubsystems = sceneData.subsystems && sceneData.subsystems.length > 0;
     var subSelect = null;
@@ -3891,11 +3902,16 @@ function showModuleDialog() {
         if (!hasSubsystems) { showToast('You need to create a subsystem first', 'error'); return; }
         var mass = parseFloat(massI.value) || 0;
         var power = parseFloat(powerI.value) || 0;
+        var minTemp = minTempI.value.trim();
+        var maxTemp = maxTempI.value.trim();
+        if (minTemp !== '' && maxTemp !== '' && parseFloat(minTemp) > parseFloat(maxTemp)) {
+            showToast('Min operating temp cannot exceed max operating temp', 'error'); return;
+        }
         var subId = subSelect ? parseInt(subSelect.value) : -1;
         if (!subSelect || subId < 0) { showToast('A subsystem must be selected', 'error'); return; }
         var color = colorI.value || '';
         removeModal();
-        bridge.create_module(name, subId, mass, power, color);
+        bridge.create_module(name, subId, mass, power, color, minTemp, maxTemp);
     });
     actions.appendChild(createBtn);
     dialog.appendChild(actions);
@@ -3935,6 +3951,17 @@ function showModuleEditDialog(moduleDatum) {
     var powerI = document.createElement('input');
     powerI.type = 'number'; powerI.value = moduleDatum.power || 0; powerI.min = '0'; powerI.step = '0.1';
     powerF.appendChild(powerI);
+
+    // Min / Max operating temperature (optional)
+    var minTempF = createModalField(dialog, 'Min Operating Temp (°C)');
+    var minTempI = document.createElement('input');
+    minTempI.type = 'number'; minTempI.value = (moduleDatum.min_temp != null ? moduleDatum.min_temp : ''); minTempI.placeholder = 'e.g. -40'; minTempI.step = '0.1';
+    minTempF.appendChild(minTempI);
+
+    var maxTempF = createModalField(dialog, 'Max Operating Temp (°C)');
+    var maxTempI = document.createElement('input');
+    maxTempI.type = 'number'; maxTempI.value = (moduleDatum.max_temp != null ? moduleDatum.max_temp : ''); maxTempI.placeholder = 'e.g. 85'; maxTempI.step = '0.1';
+    maxTempF.appendChild(maxTempI);
 
     // Subsystem (required)
     var hasSubsystems = sceneData.subsystems && sceneData.subsystems.length > 0;
@@ -4008,10 +4035,15 @@ function showModuleEditDialog(moduleDatum) {
         if (!name) { showToast('Module name is required', 'error'); return; }
         var mass = parseFloat(massI.value) || 0;
         var power = parseFloat(powerI.value) || 0;
+        var minTemp = minTempI.value.trim();
+        var maxTemp = maxTempI.value.trim();
+        if (minTemp !== '' && maxTemp !== '' && parseFloat(minTemp) > parseFloat(maxTemp)) {
+            showToast('Min operating temp cannot exceed max operating temp', 'error'); return;
+        }
         var color = colorI.value || '';
         var subId = subSelect ? parseInt(subSelect.value) : (moduleDatum.subsystem_id != null ? moduleDatum.subsystem_id : -1);
         removeModal();
-        bridge.update_module(moduleDatum.id, name, mass, power, color, subId);
+        bridge.update_module(moduleDatum.id, name, mass, power, color, subId, minTemp, maxTemp);
     });
     actions.appendChild(saveBtn);
     dialog.appendChild(actions);

@@ -684,6 +684,7 @@ def reject_change(change_id: int, reviewer_id: int, note: str = "") -> bool:
 # ---------------------------------------------------------------------------
 def _apply_module(pid, action, payload) -> Tuple[bool, str]:
     from Schematic_View_tab.schematic_scene_model import (
+        NOT_SET,
         create_module, update_module as _update_module, delete_module,
     )
 
@@ -700,6 +701,8 @@ def _apply_module(pid, action, payload) -> Tuple[bool, str]:
             subsystem_id=payload.get("subsystem_id"),
             mass=float(payload.get("mass", 0.0) or 0.0),
             power=float(payload.get("power", 0.0) or 0.0),
+            min_temp=payload.get("min_temp"),
+            max_temp=payload.get("max_temp"),
         )
         return (True, new_id) if new_id else (False, "Could not create module.")
     if action == "delete":
@@ -720,6 +723,8 @@ def _apply_module(pid, action, payload) -> Tuple[bool, str]:
         power=fields.get("power"),
         color=fields.get("color"),
         subsystem_id=fields.get("subsystem_id"),
+        min_temp=fields.get("min_temp", NOT_SET),
+        max_temp=fields.get("max_temp", NOT_SET),
     )
     pos_updates = {k: fields[k] for k in ("pos_x", "pos_y", "width", "height")
                    if k in fields and fields[k] is not None}
@@ -1083,6 +1088,8 @@ def pending_preview_scene(scene: dict, user_id: Optional[int] = None) -> dict:
                 "subsystem_id": payload.get("subsystem_id"),
                 "mass": payload.get("mass", 0.0),
                 "power": payload.get("power", 0.0),
+                "min_temp": payload.get("min_temp"),
+                "max_temp": payload.get("max_temp"),
                 "editable": False,
                 "pending": "create",
                 "pending_suggestion_id": ch["id"],

@@ -125,17 +125,21 @@ class ModuleTableModel(QAbstractTableModel):
     COL_NAME = 1
     COL_MASS = 2
     COL_POWER = 3
-    COL_NUM_CONN = 4
-    COL_COLOR = 5
-    COL_IMAGE = 6
-    COL_SAVE = 7
-    COL_REMOVE = 8
+    COL_MIN_TEMP = 4
+    COL_MAX_TEMP = 5
+    COL_NUM_CONN = 6
+    COL_COLOR = 7
+    COL_IMAGE = 8
+    COL_SAVE = 9
+    COL_REMOVE = 10
 
     headers = [
         "ID",
         "Module Name",
         "Mass (kg)",
         "Power (mW)",
+        "Min Temp",
+        "Max Temp",
         "Num Connectors",
         "Color",
         "Image",
@@ -168,6 +172,10 @@ class ModuleTableModel(QAbstractTableModel):
                 return str(item.get("mass", ""))
             if col == self.COL_POWER:
                 return str(item.get("power", ""))
+            if col == self.COL_MIN_TEMP:
+                return "" if item.get("min_temp") is None else str(item.get("min_temp", ""))
+            if col == self.COL_MAX_TEMP:
+                return "" if item.get("max_temp") is None else str(item.get("max_temp", ""))
             if col == self.COL_NUM_CONN:
                 return item.get("num_connectors", 0)
             if col == self.COL_COLOR:
@@ -191,6 +199,8 @@ class ModuleTableModel(QAbstractTableModel):
             self.COL_NAME,
             self.COL_MASS,
             self.COL_POWER,
+            self.COL_MIN_TEMP,
+            self.COL_MAX_TEMP,
             self.COL_NUM_CONN,
             self.COL_COLOR,
         ):
@@ -218,6 +228,16 @@ class ModuleTableModel(QAbstractTableModel):
                     self._data[row]["power"] = float(value)
                 except Exception:
                     self._data[row]["power"] = value
+            elif col == self.COL_MIN_TEMP:
+                try:
+                    self._data[row]["min_temp"] = float(value)
+                except Exception:
+                    self._data[row]["min_temp"] = value
+            elif col == self.COL_MAX_TEMP:
+                try:
+                    self._data[row]["max_temp"] = float(value)
+                except Exception:
+                    self._data[row]["max_temp"] = value
             elif col == self.COL_NUM_CONN:
                 self._data[row]["num_connectors"] = int(value)
             elif col == self.COL_COLOR:
@@ -457,6 +477,40 @@ class FloatDelegate(QStyledItemDelegate):
 
     def setModelData(self, editor, model, index):
         model.setData(index, editor.value(), Qt.EditRole)
+
+
+class TempFloatDelegate(QStyledItemDelegate):
+    """Numeric editor for operating temperatures (may be negative)."""
+
+    def createEditor(self, parent, option, index):
+        editor = QDoubleSpinBox(parent)
+        editor.setRange(-273.15, 9999.0)
+        editor.setDecimals(3)
+        editor.setSingleStep(1.0)
+        return editor
+
+    def setEditorData(self, editor, index):
+        val = index.model().data(index, Qt.EditRole)
+        try:
+            editor.setValue(float(val))
+        except Exception:
+            editor.setValue(0.0)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.value(), Qt.EditRole)
+
+
+def parse_temp_value(value):
+    """
+    Normalise a temperature cell value to a float, or None when unset.
+    Raises ValueError for non-numeric input.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    return float(s)
 
 
 class IntDelegate(QStyledItemDelegate):
@@ -763,15 +817,19 @@ class ModuleDialog(QDialog):
         hdr.setSectionResizeMode(6, QHeaderView.Fixed)
         hdr.setSectionResizeMode(7, QHeaderView.Fixed)
         hdr.setSectionResizeMode(8, QHeaderView.Fixed)
+        hdr.setSectionResizeMode(9, QHeaderView.Fixed)
+        hdr.setSectionResizeMode(10, QHeaderView.Fixed)
 
         self.table.setColumnHidden(0, True)
         self.table.setColumnWidth(2, 100)
         self.table.setColumnWidth(3, 100)
-        self.table.setColumnWidth(4, 120)
-        self.table.setColumnWidth(5, 100)
-        self.table.setColumnWidth(6, 200)
-        self.table.setColumnWidth(7, 80)
-        self.table.setColumnWidth(8, 80)
+        self.table.setColumnWidth(4, 110)
+        self.table.setColumnWidth(5, 110)
+        self.table.setColumnWidth(6, 120)
+        self.table.setColumnWidth(7, 100)
+        self.table.setColumnWidth(8, 200)
+        self.table.setColumnWidth(9, 80)
+        self.table.setColumnWidth(10, 80)
         hdr.setMinimumSectionSize(150)
 
         # Delegates
@@ -787,6 +845,12 @@ class ModuleDialog(QDialog):
         )
         self.table.setItemDelegateForColumn(
             ModuleTableModel.COL_POWER, FloatDelegate(self)
+        )
+        self.table.setItemDelegateForColumn(
+            ModuleTableModel.COL_MIN_TEMP, TempFloatDelegate(self)
+        )
+        self.table.setItemDelegateForColumn(
+            ModuleTableModel.COL_MAX_TEMP, TempFloatDelegate(self)
         )
         self.table.setItemDelegateForColumn(
             ModuleTableModel.COL_NUM_CONN, IntDelegate(self)
@@ -956,18 +1020,20 @@ class ModuleDialog(QDialog):
             with get_connection() as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT id,name,mass,power,num_connectors,color,photo "
+                    "SELECT id,name,mass,power,min_temp,max_temp,num_connectors,color,photo "
                     "FROM modules WHERE subsystem_id=%s AND project_id=%s ORDER BY id",
                     (sid, project_id),
                 )
                 rows = cur.fetchall()
-                for mid, name, mass, power, num_conn, color, photo in rows:
+                for mid, name, mass, power, min_temp, max_temp, num_conn, color, photo in rows:
                     items.append(
                         {
                             "id": mid,
                             "name": name,
                             "mass": mass,
                             "power": power,
+                            "min_temp": min_temp,
+                            "max_temp": max_temp,
                             "num_connectors": num_conn,
                             "color": color,
                             "photo": photo or "",
@@ -993,13 +1059,16 @@ class ModuleDialog(QDialog):
     # ------------------------------------------------------------------
     #   Table Row Creation & Change Tracking
     # ------------------------------------------------------------------
-    def _append_row(self, mid, name, mass, power, num_conn, color, photo):
+    def _append_row(self, mid, name, mass, power, num_conn, color, photo,
+                    min_temp=None, max_temp=None):
         # Add data row to model (no heavy widgets created)
         item = {
             "id": mid,
             "name": name,
             "mass": mass,
             "power": power,
+            "min_temp": min_temp,
+            "max_temp": max_temp,
             "num_connectors": num_conn,
             "color": color,
             "photo": photo or "",
@@ -1065,8 +1134,19 @@ class ModuleDialog(QDialog):
         try:
             mass = float(item.get("mass", 0) or 0)
             power = float(item.get("power", 0) or 0)
+            min_temp = parse_temp_value(item.get("min_temp"))
+            max_temp = parse_temp_value(item.get("max_temp"))
         except ValueError:
-            QMessageBox.warning(self, "Validation", "Mass and Power must be numbers.")
+            QMessageBox.warning(
+                self, "Validation",
+                "Mass, Power and operating temperatures must be numbers.",
+            )
+            return
+        if min_temp is not None and max_temp is not None and min_temp > max_temp:
+            QMessageBox.warning(
+                self, "Validation",
+                "Min operating temp cannot exceed max operating temp.",
+            )
             return
 
         num_conn = int(item.get("num_connectors", 0) or 0)
@@ -1079,6 +1159,7 @@ class ModuleDialog(QDialog):
             # Non-admin: record the change as a suggestion instead of writing.
             fields = {
                 "name": name, "mass": mass, "power": power,
+                "min_temp": min_temp, "max_temp": max_temp,
                 "num_connectors": num_conn, "color": color, "photo": photo,
             }
             if is_existing:
@@ -1134,12 +1215,14 @@ class ModuleDialog(QDialog):
 
                 if is_existing:
                     cur.execute(
-                        "UPDATE modules SET name=%s, subsystem_id=%s, mass=%s, power=%s, num_connectors=%s, color=%s, photo=%s WHERE id=%s AND project_id=%s",
+                        "UPDATE modules SET name=%s, subsystem_id=%s, mass=%s, power=%s, min_temp=%s, max_temp=%s, num_connectors=%s, color=%s, photo=%s WHERE id=%s AND project_id=%s",
                         (
                             name,
                             sid,
                             mass,
                             power,
+                            min_temp,
+                            max_temp,
                             num_conn,
                             color,
                             photo,
@@ -1149,8 +1232,8 @@ class ModuleDialog(QDialog):
                     )
                 else:
                     cur.execute(
-                        "INSERT INTO modules(name, subsystem_id, project_id, mass, power, num_connectors, color, photo) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                        (name, sid, project_id, mass, power, num_conn, color, photo),
+                        "INSERT INTO modules(name, subsystem_id, project_id, mass, power, min_temp, max_temp, num_connectors, color, photo) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                        (name, sid, project_id, mass, power, min_temp, max_temp, num_conn, color, photo),
                     )
                     new_mid = cur.fetchone()[0]
                     # set id back into model
@@ -1196,13 +1279,22 @@ class ModuleDialog(QDialog):
                 try:
                     mass = float(item.get("mass", 0) or 0)
                     power = float(item.get("power", 0) or 0)
+                    min_temp = parse_temp_value(item.get("min_temp"))
+                    max_temp = parse_temp_value(item.get("max_temp"))
                 except Exception:
-                    mass, power = 0.0, 0.0
+                    mass, power, min_temp, max_temp = 0.0, 0.0, None, None
+                if min_temp is not None and max_temp is not None and min_temp > max_temp:
+                    QMessageBox.warning(
+                        self, "Validation",
+                        "Min operating temp cannot exceed max operating temp.",
+                    )
+                    return False
                 num_conn = int(item.get("num_connectors", 0) or 0)
                 color = item.get("color", "")
                 photo = item.get("photo", "")
                 mid = item.get("id")
                 fields = {"name": name, "mass": mass, "power": power,
+                          "min_temp": min_temp, "max_temp": max_temp,
                           "num_connectors": num_conn, "color": color,
                           "photo": photo}
                 if mid:
@@ -1238,21 +1330,30 @@ class ModuleDialog(QDialog):
                     try:
                         mass = float(item.get("mass", 0) or 0)
                         power = float(item.get("power", 0) or 0)
+                        min_temp = parse_temp_value(item.get("min_temp"))
+                        max_temp = parse_temp_value(item.get("max_temp"))
                     except Exception:
-                        mass = 0.0
-                        power = 0.0
+                        mass, power, min_temp, max_temp = 0.0, 0.0, None, None
+                    if min_temp is not None and max_temp is not None and min_temp > max_temp:
+                        QMessageBox.warning(
+                            self, "Validation",
+                            "Min operating temp cannot exceed max operating temp.",
+                        )
+                        return False
                     num_conn = int(item.get("num_connectors", 0) or 0)
                     color = item.get("color", "")
                     photo = item.get("photo", "")
                     mid = item.get("id")
                     if mid:
                         cur.execute(
-                            "UPDATE modules SET name=%s, subsystem_id=%s, mass=%s, power=%s, num_connectors=%s, color=%s, photo=%s WHERE id=%s AND project_id=%s",
+                            "UPDATE modules SET name=%s, subsystem_id=%s, mass=%s, power=%s, min_temp=%s, max_temp=%s, num_connectors=%s, color=%s, photo=%s WHERE id=%s AND project_id=%s",
                             (
                                 name,
                                 sid,
                                 mass,
                                 power,
+                                min_temp,
+                                max_temp,
                                 num_conn,
                                 color,
                                 photo,
@@ -1262,13 +1363,15 @@ class ModuleDialog(QDialog):
                         )
                     else:
                         cur.execute(
-                            "INSERT INTO modules(name, subsystem_id, project_id, mass, power, num_connectors, color, photo) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                            "INSERT INTO modules(name, subsystem_id, project_id, mass, power, min_temp, max_temp, num_connectors, color, photo) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                             (
                                 name,
                                 sid,
                                 project_id,
                                 mass,
                                 power,
+                                min_temp,
+                                max_temp,
                                 num_conn,
                                 color,
                                 photo,

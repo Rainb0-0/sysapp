@@ -11,8 +11,8 @@ interfaces) back.
 Schema below is verified against the real queries used in
 schematic_graphics.py (not guessed):
 
-    modules(id, project_id, name, photo, mass, power, color,
-            pos_x, pos_y, width, height)
+    modules(id, project_id, name, photo, mass, power, min_temp, max_temp,
+            color, pos_x, pos_y, width, height)
     connectors(id, project_id, module_id, name, color, side)
     pins(id, project_id, connector_id, name, pin_number)
     Interfaces(id, project_id, pin1_id, pin2_id, color)
@@ -46,6 +46,11 @@ GRID_MARGIN = 40.0
 GRID_CELL_W = 380.0
 GRID_CELL_H = 280.0
 GRID_COLUMNS = 4
+
+# Sentinel for update_module(): distinguishes "field not passed" (leave the
+# stored value alone) from "explicitly set to None" (clear to NULL). Used
+# for min_temp/max_temp where NULL is a legitimate stored value.
+NOT_SET = object()
 
 
 
@@ -154,7 +159,7 @@ def load_schematic_scene(
 
         # ---------------- Modules ----------------
         query = (
-            "SELECT id, name, color, mass, power, pos_x, pos_y, width, height, subsystem_id "
+            "SELECT id, name, color, mass, power, min_temp, max_temp, pos_x, pos_y, width, height, subsystem_id "
             "FROM modules WHERE project_id = %s"
         )
         params: tuple = (project_id,)
@@ -243,7 +248,7 @@ def load_schematic_scene(
 
         # ---------------- Assemble modules ----------------
         for idx, row in enumerate(module_rows):
-            mod_id, name, color, mass, power, pos_x, pos_y, width, height, subsystem_id = row
+            mod_id, name, color, mass, power, min_temp, max_temp, pos_x, pos_y, width, height, subsystem_id = row
 
             # Use DB width/height directly — no auto-sizing from connectors.
             # Connector sizes are determined purely by pin count in the JS renderer.
@@ -300,6 +305,8 @@ def load_schematic_scene(
                 "subsystem_id": subsystem_id,
                 "mass": mass,
                 "power": power,
+                "min_temp": min_temp,
+                "max_temp": max_temp,
                 "editable": can_edit,
             })
 
@@ -550,18 +557,22 @@ def create_module(name: str, x: float = 40.0, y: float = 40.0,
                    color: Optional[str] = None,
                    subsystem_id: Optional[int] = None,
                    mass: float = 0.0,
-                   power: float = 0.0) -> Optional[int]:
+                   power: float = 0.0,
+                   min_temp: Optional[float] = None,
+                   max_temp: Optional[float] = None) -> Optional[int]:
     """Insert a new module and return its id."""
     project_id = get_current_project_id()
     if project_id is None or not name.strip():
         return None
+    if min_temp is not None and max_temp is not None and min_temp > max_temp:
+        raise ValueError("Min operating temp cannot exceed max operating temp.")
 
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO modules (project_id, name, color, pos_x, pos_y, width, height, mass, power, subsystem_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-            (project_id, name.strip(), color, x, y, width, height, mass, power, subsystem_id),
+            "INSERT INTO modules (project_id, name, color, pos_x, pos_y, width, height, mass, power, min_temp, max_temp, subsystem_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (project_id, name.strip(), color, x, y, width, height, mass, power, min_temp, max_temp, subsystem_id),
         )
         new_id = cur.fetchone()[0]
         conn.commit()
@@ -748,8 +759,14 @@ def update_module(module_id: int, name: Optional[str] = None,
                    mass: Optional[float] = None,
                    power: Optional[float] = None,
                    color: Optional[str] = None,
-                   subsystem_id: Optional[int] = None) -> None:
-    """Update a module's fields. Only non-None values are updated."""
+                   subsystem_id: Optional[int] = None,
+                   min_temp: Any = NOT_SET,
+                   max_temp: Any = NOT_SET) -> None:
+    """
+    Update a module's fields. Only non-None values are updated for the
+    regular fields. min_temp/max_temp use the NOT_SET sentinel: pass a float
+    to set, None to clear (NULL), or omit to leave unchanged.
+    """
     project_id = get_current_project_id()
     if project_id is None:
         return
@@ -765,9 +782,30 @@ def update_module(module_id: int, name: Optional[str] = None,
         updates["color"] = color if color else None
     if subsystem_id is not None:
         updates["subsystem_id"] = subsystem_id
+    if min_temp is not NOT_SET:
+        updates["min_temp"] = min_temp
+    if max_temp is not NOT_SET:
+        updates["max_temp"] = max_temp
 
     if not updates:
         return
+
+    # Enforce min operating temp <= max operating temp (only when both are
+    # set). If just one side is being updated, validate against the stored
+    # value of the other.
+    if "min_temp" in updates or "max_temp" in updates:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT min_temp, max_temp FROM modules WHERE id=%s AND project_id=%s",
+                (module_id, project_id),
+            )
+            row = cur.fetchone()
+        stored_min, stored_max = (row if row else (None, None))
+        new_min = updates.get("min_temp", stored_min)
+        new_max = updates.get("max_temp", stored_max)
+        if new_min is not None and new_max is not None and new_min > new_max:
+            raise ValueError("Min operating temp cannot exceed max operating temp.")
 
     set_clause = ", ".join(f"{k} = %s" for k in updates)
     values = list(updates.values()) + [module_id, project_id]

@@ -469,6 +469,8 @@ def init_db():
                         project_id INTEGER NOT NULL,
                         mass REAL DEFAULT 0.0,
                         power REAL DEFAULT 0.0,
+                        min_temp REAL,
+                        max_temp REAL,
                         num_connectors INTEGER DEFAULT 0,
                         color VARCHAR(7) DEFAULT '#C8C8FF',
                         photo TEXT,
@@ -622,6 +624,28 @@ def init_db():
             _add_column_if_not_exists(cur, 'modules', 'pos_y', 'REAL DEFAULT 0')
             _add_column_if_not_exists(cur, 'modules', 'width', 'REAL DEFAULT 120')
             _add_column_if_not_exists(cur, 'modules', 'height', 'REAL DEFAULT 80')
+            _add_column_if_not_exists(cur, 'modules', 'min_temp', 'REAL')
+            _add_column_if_not_exists(cur, 'modules', 'max_temp', 'REAL')
+
+            # Enforce min operating temp <= max operating temp at the DB level
+            # (belt-and-braces on top of the UI/persistence checks). Repair any
+            # pre-existing inconsistent rows first so the constraint can apply.
+            try:
+                cur.execute("""
+                    UPDATE modules
+                    SET max_temp = min_temp
+                    WHERE min_temp IS NOT NULL AND max_temp IS NOT NULL
+                      AND min_temp > max_temp
+                """)
+                cur.execute(
+                    "ALTER TABLE modules DROP CONSTRAINT IF EXISTS chk_module_temp_range"
+                )
+                cur.execute("""
+                    ALTER TABLE modules ADD CONSTRAINT chk_module_temp_range
+                    CHECK (min_temp IS NULL OR max_temp IS NULL OR min_temp <= max_temp)
+                """)
+            except Exception as e:
+                print(f"Warning: Could not add module temperature range constraint: {e}")
 
             _add_column_if_not_exists(cur, 'connectors', 'project_id', 'INTEGER')
             _add_column_if_not_exists(cur, 'connectors', 'color', "VARCHAR(7) DEFAULT '#C8C8FF'")
@@ -2619,15 +2643,15 @@ def export_project_data(project_id: int) -> dict:
             # ── modules ──
             cur.execute(
                 """SELECT id, name, subsystem_id, project_id, mass, power,
-                           num_connectors, color, photo, pos_x, pos_y,
-                           width, height
+                           min_temp, max_temp, num_connectors, color, photo,
+                           pos_x, pos_y, width, height
                     FROM modules WHERE project_id = %s ORDER BY id""",
                 (project_id,),
             )
             cols = [
                 "id", "name", "subsystem_id", "project_id", "mass", "power",
-                "num_connectors", "color", "photo", "pos_x", "pos_y",
-                "width", "height",
+                "min_temp", "max_temp", "num_connectors", "color", "photo",
+                "pos_x", "pos_y", "width", "height",
             ]
             data["modules"] = [dict(zip(cols, r)) for r in cur.fetchall()]
             module_ids = [m["id"] for m in data["modules"]]
@@ -2826,13 +2850,16 @@ def import_project_data(project_id: int, data: dict) -> tuple[bool, str]:
                 cur.execute(
                     """INSERT INTO modules
                        (id, name, subsystem_id, project_id, mass, power,
-                        num_connectors, color, photo, pos_x, pos_y, width, height)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        min_temp, max_temp, num_connectors, color, photo,
+                        pos_x, pos_y, width, height)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT (id) DO UPDATE SET
                          name        = EXCLUDED.name,
                          subsystem_id = EXCLUDED.subsystem_id,
                          mass        = EXCLUDED.mass,
                          power       = EXCLUDED.power,
+                         min_temp    = EXCLUDED.min_temp,
+                         max_temp    = EXCLUDED.max_temp,
                          num_connectors = EXCLUDED.num_connectors,
                          color       = EXCLUDED.color,
                          photo       = EXCLUDED.photo,
@@ -2843,6 +2870,7 @@ def import_project_data(project_id: int, data: dict) -> tuple[bool, str]:
                     (
                         m["id"], m["name"], m["subsystem_id"], project_id,
                         m.get("mass", 0.0), m.get("power", 0.0),
+                        m.get("min_temp"), m.get("max_temp"),
                         m.get("num_connectors", 0), m.get("color", "#C8C8FF"),
                         m.get("photo"), m.get("pos_x", 0), m.get("pos_y", 0),
                         m.get("width", 120), m.get("height", 80),
